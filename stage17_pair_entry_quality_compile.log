@@ -1,0 +1,42 @@
+============================================================
+STAGE17 PAIR ENTRY QUALITY FIX — LOG DE COMPILACAO
+Data: 2026-07-05
+Arquivo: HORSE_EA_V10_STAGE17_PAIR_ENTRY_QUALITY_FIXED.mq5
+============================================================
+
+STATUS: COMPILACAO NAO EXECUTADA NESTE AMBIENTE.
+
+Motivo (declarado honestamente, sem inventar resultado):
+Este patch foi produzido em um container Linux remoto sem MetaTrader 5 /
+MetaEditor / Wine instalados. Nao existe compilador MQL5 disponivel aqui,
+portanto:
+
+  - NAO foi gerado o arquivo .ex5;
+  - NAO existe log real "0 errors / 0 warnings" para anexar;
+  - NAO foi executado backtest de validacao.
+
+Verificacoes estaticas realizadas em substituicao (todas OK):
+
+  1. Balanceamento de chaves e parenteses do arquivo inteiro
+     (apos remocao de strings e comentarios): braces=0, parens=0  -> OK
+  2. Contagem de argumentos de todos os StringFormat novos:
+     - Stage17_PairEntryQualityGate: 17 especificadores / 17 argumentos -> OK
+     - Stage17_NoWinnerFastAbort:    21 especificadores / 21 argumentos -> OK
+  3. Todas as funcoes/globais referenciadas pelo patch existem no arquivo:
+     HorseDetectMarketRegime, HorseMarketRegimeToText, HorseCalculateBuyScore,
+     HorseCalculateSellScore, V32GetADX, GetCurrentSpreadPoints,
+     MarketModeToText, CurrentPositionProfitMoneyV4, GetTicketExitPeakMoneyV4,
+     Stage17_CloseBothNoWinner, BoolToText, g_atrM1Points, g_momentumScore,
+     g_buyStrengthScore, g_sellStrengthScore, g_flow, g_flowDirectionText,
+     g_market, AdaptiveDirectionMinValidScoreV4, Stage17_StrongSideMinProfitMoney.
+  4. Forward declarations adicionadas (linhas 201-202) coerentes com as
+     definicoes (linhas 22106 e 22252).
+  5. Nenhum tipo novo, nenhum include novo, nenhuma macro nova.
+
+ACAO NECESSARIA DO USUARIO:
+  1. Abrir HORSE_EA_V10_STAGE17_PAIR_ENTRY_QUALITY_FIXED.mq5 no MetaEditor.
+  2. Compilar (F7). Resultado esperado: 0 errors / 0 warnings.
+  3. O .ex5 sera gerado pelo MetaEditor.
+  4. Se aparecer qualquer erro, ele estara restrito as linhas do patch
+     (ver stage17_pair_entry_quality_diff.txt).
+============================================================

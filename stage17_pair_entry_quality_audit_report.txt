@@ -1,0 +1,303 @@
+============================================================
+STAGE17 — PAIR ENTRY QUALITY FIX
+RELATORIO DE AUDITORIA FORENSE + PATCH MINIMO
+Data: 2026-07-05
+Base auditada: HORSE_EA_V10_STAGE17_DUAL_SIDE_CONFIRMATION_EXTRACTION_FIXED.mq5 (25.467 linhas)
+Reports: ReportTesterEXTRAA.html (Stage17) vs COMPILE24A254.html (FIXED3)
+============================================================
+
+------------------------------------------------------------
+ETAPA 1 — AUDITORIA (PROVA DA CAUSA RAIZ)
+------------------------------------------------------------
+
+1) ONDE A STAGE17 DECIDE ABRIR O PAR
+   Stage17_DualSideOnTick() (linha original 22083):
+      if(Stage17_CanOpenPair()) Stage17_OpenPair();
+   Chamado 2x por tick no OnTick (linhas 25329 e 25357), depois de
+   UpdateMarketData()/UpdateFlowData() — ou seja, g_market/g_flow estao
+   frescos quando a Stage17 roda.
+
+2) FILTROS QUE EXISTIAM ANTES DE Stage17_OpenPair()
+   Stage17_CanOpenPair() (linhas originais 20602-20705) verificava SOMENTE:
+      - Stage17 habilitada / MaxActivePairs >= 1
+      - par ativo existente / cooldown 180s / posicao comum aberta
+      - core/security/trade permission / risk locked
+      - dailyDD <= 0.50%
+      - spread <= 45 pontos
+      - g_market.mode != MARKET_SIDEWAYS (range)
+      - g_market.mode != MARKET_ERRATIC/MARKET_SPREAD_DANGER (choppy)
+      - conta hedging / limite de exposicao
+
+3) O QUE NAO EXISTIA (comprovado por leitura integral da funcao):
+      - NENHUM check de ADX
+      - NENHUM check de directionalStrength (g_buy/sellStrengthScore)
+      - NENHUM check de momentum (g_momentumScore)
+      - NENHUM check de flow (FLOW_BALANCED/FLOW_DANGEROUS passavam)
+      - NENHUM check de ATR (MARKET_DEAD e MARKET_UNKNOWN passavam!)
+      - NENHUM check de buyScore/sellScore/directionGap
+      - NENHUM conceito de runner potential
+   Os bloqueios de RANGE/CHOPPY eram reais (bloqueavam mesmo, nao eram so
+   log), MAS a classificacao g_market.mode e grosseira: todo mercado
+   "morno" que nao e formalmente SIDEWAYS/ERRATIC passava. O EA possui um
+   classificador muito mais fino (HorseDetectMarketRegime: CHOPPY, RANGE,
+   COMPRESSION, WEAK_TREND, NEUTRAL, REVERSAL_RISK, ADX, ATR) que a
+   Stage17 simplesmente NAO consultava.
+
+4) PROVA NOS REPORTS (2025.09.24-2025.09.25, XAUUSD M1)
+   STAGE17 (ReportTesterEXTRAA):
+      - 101 pares abertos (101 "HORSE DUAL BUY" + 101 "HORSE DUAL SELL")
+      - gap mediano entre aberturas de par: 300s (= cooldown+ciclo) ->
+        metralhadora de pares o dia inteiro (05h as 21h)
+      - probes 0.05: net TOTAL -341.51 USD (media -1.69/probe),
+        134 perdedores vs 68 vencedores
+      - vida mediana do probe: 97s (o trailing SL da Stage15 corta rapido,
+        mas o custo de abrir 2 lados ja foi pago)
+      - comissao total: -73.60 (+ spread embutido) — o custo por si so
+        e da ordem do prejuizo liquido (-102.62)
+      - layers do winner: +219.12 em 16 posicoes (15 positivas, 1 de -2.82)
+   CONCLUSAO DA PROVA: o mecanismo winner/layer FUNCIONA (+219); quem
+   destroi o resultado e a abertura indiscriminada de pares 0.05 (-341).
+   FIXED3 (COMPILE24A254): 152 entradas, net -121.56 — a Stage17 nao e
+   estruturalmente pior que a FIXED3; ela perde menos, com DD tao baixo
+   quanto (0.42% vs 0.35%), mas sangra em custo por excesso de pares.
+
+5) FAST ABORT EXISTENTE ERA LENTO?  SIM.
+   Stage17_CompareSides() so fechava ambos quando:
+      - age >= 420s E basket <= -12.00 (NO_WINNER_TIMEOUT), ou
+      - age >= 300s E ambos MFE < 3 E ambos WEAK/MODERATE, ou
+      - mercado virava RANGE/CHOPPY/spread/risk block.
+   Um par sangrando -5.99 sem winner podia ficar 420s vivo. Com 101 pares,
+   esse atraso vira custo sistemico.
+
+6) PROTECOES ANTERIORES (verificadas INTACTAS antes e depois do patch):
+   - survivor externo => survivorUnconfirmed=true (Stage17_UpdatePairState)
+   - survivorUnconfirmed nao recebe layer (Stage17_CanOpenWinnerLayer)
+   - winner so confirma por qualidade real (Stage17_ConfirmWinnerQuality)
+   - Layer2 bloqueia com Layer1 falho/negativo/morto (linhas de
+     LAYER1_FAILED_BLOCK_LAYER2 etc.)
+   - Stage17_ProfitExtractionManager chamado em todo tick com par decidido
+   - Stage12_UseHedgeAirbag = false (linha 23984+, input intocado)
+
+CAUSA RAIZ COMPROVADA:
+   (a) Stage17_CanOpenPair() sem nenhum filtro positivo de qualidade =>
+       abre par BUY+SELL 0.05 em qualquer mercado nao-formalmente-range,
+       a cada ~300s, pagando 2x spread + 2x comissao;
+   (b) ausencia de aborto rapido do par sem winner => sangria adicional
+       ate 300-420s nos pares que o SL da Stage15 nao corta antes.
+
+------------------------------------------------------------
+ETAPA 2 — PATCH MINIMO APLICADO
+------------------------------------------------------------
+
+BLOCO FINAL DE CONTROLE (respondido ANTES do patch):
+   1. Causa raiz comprovada no codigo?................ SIM
+   2. Causa raiz comprovada nos reports?.............. SIM
+   3. Problema e CanOpenPair/OpenPair permissivo?..... SIM
+   4. Problema inclui falta de NoWinnerFastAbort?..... SIM (secundario)
+   5. Patch 100% restrito a Stage17?.................. SIM
+   6. Stage15 intocado?............................... SIM
+   7. RiskGovernor intocado?.......................... SIM
+   8. ExecuteRealOrder intocado?...................... SIM
+   9. BuildV4RealExecutionOrderData intocado?......... SIM
+  10. V4CloseOppositePositions intocado?.............. SIM
+  11. Stage12_UseHedgeAirbag continua false?.......... SIM
+   => Todas SIM: patch autorizado e aplicado.
+
+O QUE FOI ALTERADO (arquivo novo:
+HORSE_EA_V10_STAGE17_PAIR_ENTRY_QUALITY_FIXED.mq5):
+
+   A) Forward declarations (linhas 201-202):
+        bool Stage17_PairEntryQualityGate();
+        bool Stage17_NoWinnerFastAbort();
+
+   B) Inputs novos Stage17 (apos Stage17_DebugLogs, linhas 249-269):
+        Stage17_EnablePairEntryQualityGate      = true
+        Stage17_MinADXForPair                   = 18.0
+        Stage17_MinDirectionalStrengthForPair   = 55.0
+        Stage17_MinMomentumForPair              = 35.0
+        Stage17_MinDirectionGapForPair          = 7.0
+        Stage17_MinATRForPair                   = 120.0
+        Stage17_MaxATRForPair                   = 450.0
+        Stage17_MaxSpreadForPair                = 35
+        Stage17_BlockPairInChoppy               = true
+        Stage17_BlockPairInRange                = true
+        Stage17_RequireRunnerPotentialForPair   = true
+        Stage17_EnableNoWinnerFastAbort         = true
+        Stage17_NoWinnerFastAbortSeconds        = 150
+        Stage17_NoWinnerFastAbortMaxBasketLoss  = -6.0
+        Stage17_NoWinnerFastAbortMinMFE         = 3.0
+      Calibracao ancorada em thresholds JA existentes no EA
+      (HealthyATRMin/MaxPoints=120/450, MinMomentumScore=35,
+      AdaptiveDirectionNeutralThresholdV4=7, ADX moderado=18 do
+      HorseDetectMarketRegime, MinFlowStrengthForLayer=58) — nada
+      inventado, nada endurecido a ponto de matar todo trade bom.
+
+   C) Nova funcao Stage17_PairEntryQualityGate() (linha 22106):
+      Retorna false (BLOQUEIA o par) quando:
+        - spread > 35 pontos ..................... SPREAD_TOO_HIGH_FOR_PAIR
+        - ATR M1 sem dado ........................ ATR_DATA_NOT_READY
+        - ATR < 120 pontos ....................... ATR_TOO_LOW
+        - ATR > 450 pontos ....................... ATR_TOO_HIGH
+        - HORSE_CHOPPY ou MARKET_ERRATIC ......... CHOPPY_MARKET_BLOCK
+        - HORSE_RANGE ou MARKET_SIDEWAYS ......... RANGE_MARKET_BLOCK
+        - MARKET_DEAD/UNKNOWN/SPREAD_DANGER ...... MARKET_MODE_DEAD_OR_DANGER
+        - HORSE_TREND_WEAK_BULL/BEAR ............. WEAK_TREND_BLOCK
+        - COMPRESSION/REVERSAL_RISK/NEUTRAL ...... NO_EXPANSION_REGIME
+        - ADX < 18 ............................... ADX_TOO_WEAK
+        - momentum < 35 .......................... MOMENTUM_TOO_WEAK
+        - max(buyStr,sellStr) < 55 ............... DIRECTIONAL_STRENGTH_TOO_LOW
+        - FLOW_BALANCED .......................... FLOW_BALANCED_NO_DOMINANCE
+        - FLOW_DANGEROUS ......................... FLOW_DANGEROUS
+        - |buyScore-sellScore| < 7 ............... DIRECTION_GAP_TOO_SMALL
+        - score dominante < 30 ................... DOMINANT_SCORE_TOO_LOW
+        - sem runner potential ................... NO_RUNNER_POTENTIAL
+      Retorna true somente com: ATR saudavel + spread ok + regime de
+      tendencia moderada/forte ou expansao + ADX>=18 + momentum>=35 +
+      dominancia direcional clara + fluxo nao balanceado/nao perigoso +
+      gap de score >= 7 + runner potential.
+      runnerPotential := regime (trend forte/moderada OU expansao)
+        E scoreDominante >= AdaptiveDirectionMinValidScoreV4 (30)
+        E gap >= 7 E ADX >= 18 E momentum >= 35.
+      Se Stage17_EnablePairEntryQualityGate=false, o gate devolve true
+      (comportamento antigo preservavel por input).
+
+   D) Nova funcao Stage17_NoWinnerFastAbort() (linha 22252):
+      So age quando: par ATIVO, ambos os lados abertos, weakClosed=false,
+      winnerConfirmed=false, decisionMade=false.
+      NUNCA aborta se algum lado tem MFE >= 3.00 (NoWinnerFastAbortMinMFE)
+      ou profit >= Stage17_StrongSideMinProfitMoney (3.00) — protege
+      winner nascendo e runner real.
+      Aborta (via Stage17_CloseBothNoWinner ja existente, que fecha pelo
+      ClosePositionV4 padrao) quando nenhum lado progrediu E:
+        - basket <= -6.00 (BASKET_COST_BLEED, imediato), OU
+        - elapsed >= 150s com basket < 0 (NO_WINNER_TIMEOUT_FAST).
+      Nao toca SL/trailing, nao toca Stage15, nao abre nada.
+
+   E) Integracao em Stage17_DualSideOnTick():
+        - apos Stage17_CompareSides()/Stage17_UpdatePairState(), se o par
+          continua ACTIVE sem weakClosed/winnerConfirmed:
+             if(Stage17_NoWinnerFastAbort()) Stage17_UpdatePairState();
+        - abertura: if(Stage17_CanOpenPair() && Stage17_PairEntryQualityGate())
+             Stage17_OpenPair();
+          (gate chamado ANTES de Stage17_OpenPair, como exigido)
+
+O QUE NAO FOI ALTERADO:
+   - Stage15_ModifySL, Stage15_ManageTicket, Stage15_* (nenhuma linha)
+   - RiskGovernor (UpdateRiskData, RiskGov_*)
+   - ExecuteRealOrder, BuildV4RealExecutionOrderData
+   - V4CloseOppositePositionsForAggressiveReverse
+   - Stage12 / HedgeAirbag (Stage12_UseHedgeAirbag segue false)
+   - lotes (probe 0.05, Layer1 0.25, Layer2 0.40 inalterados)
+   - trailing/SL global, OrderSend principal
+   - nenhum martingale, grid, recovery, aumento de lote
+   - todos os inputs Stage17 antigos mantidos com os mesmos defaults
+
+------------------------------------------------------------
+LOGS NOVOS (todos com pairId, time, regime, adx, atr, spread, buyScore,
+sellScore, directionGap, flowState, momentum, directionalStrength,
+runnerPotential, basketProfit, elapsedSeconds, buyMFE, sellMFE,
+winnerConfirmed, survivorUnconfirmed, pairAllowed, reason):
+   [STAGE17_PAIR_ENTRY_QUALITY_CHECK]                (toda avaliacao do gate)
+   [STAGE17_PAIR_ENTRY_ALLOWED]                      (gate aprovou)
+   [STAGE17_PAIR_ENTRY_BLOCKED_BAD_MARKET]           (gate bloqueou por mercado)
+   [STAGE17_PAIR_ENTRY_BLOCKED_NO_RUNNER_POTENTIAL]  (bloqueio especifico)
+   [STAGE17_NO_WINNER_FAST_ABORT_CHECK]              (toda avaliacao do abort)
+   [STAGE17_PAIR_COST_BLEED_DETECTED]                (gatilho de sangria -6)
+   [STAGE17_NO_WINNER_FAST_ABORT_CLOSE]              (fechamento do par)
+   Obs.: no gate (par ainda nao aberto) basketProfit/elapsed/MFE saem 0.
+
+------------------------------------------------------------
+VALIDACAO DE SEGURANCA — HASH DAS FUNCOES PROTEGIDAS
+(sha256 do corpo completo, ANTES == DEPOIS => MATCH=true)
+   Stage15_ModifySL ................................ 4ecb26bd...a8936ec  MATCH=true
+   Stage15_ManageTicket ............................ bebe9747...67be08c  MATCH=true
+   ExecuteRealOrder ................................ bcf9510c...5f20346  MATCH=true
+   BuildV4RealExecutionOrderData ................... e6619896...ae2ee9c27 MATCH=true
+   V4CloseOppositePositionsForAggressiveReverse .... fb6bfc5c...21e0990a MATCH=true
+   UpdateRiskData .................................. 2bad03f9...23d73c58 MATCH=true
+   RiskGov_CurrentDDPercent ........................ 1dd0e18a...b9cf8976 MATCH=true
+   RiskGov_IsEmergencyStopActive ................... 0195cbea...e99a39f  MATCH=true
+   Stage12_UseHedgeAirbag = false .................. CONFIRMADO (input intocado)
+
+PROVA DE ESCOPO (diff completo em stage17_pair_entry_quality_diff.txt):
+   Hunks: linhas 198 (fwd decl), 245 (inputs), 22080 (2 funcoes novas),
+   22095/22104 (integracao no Stage17_DualSideOnTick), 25463 (2 linhas em
+   branco finais, apenas normalizacao CRLF->LF, sem codigo).
+   249 linhas adicionadas; unica linha de codigo removida:
+   "if(Stage17_CanOpenPair())" substituida pela versao com o gate.
+   100% dentro da Stage17.
+
+------------------------------------------------------------
+COMPILACAO E BACKTEST — LIMITACAO DECLARADA
+------------------------------------------------------------
+Este ambiente (Linux remoto) NAO possui MetaEditor/MT5/Wine.
+   - .ex5 NAO foi gerado; compile 0/0 NAO pode ser confirmado aqui.
+   - Backtest de validacao NAO foi executado. NENHUM resultado inventado.
+Verificacao estatica feita (chaves/parenteses balanceados, argumentos de
+StringFormat conferidos, todos os simbolos referenciados existem) — ver
+stage17_pair_entry_quality_compile.log. Erros de compilacao, se surgirem,
+estarao restritos as linhas do diff.
+
+BACKTEST RECOMENDADO (a executar pelo usuario):
+   XAUUSD M1, every tick real, visual OFF, 2025.09.24-2025.09.25, mesmo
+   deposito. Baseline Stage17: net -102.62 / PF 0.87 / DD 0.42% /
+   227 trades / maior loss -80.41. Criterios de aprovacao: menos pares
+   ruins, menos sangria 0.05, PF melhor, DD nao pior, maior loss nao
+   pior, e o EA ainda operando em dia bom (o gate aprova tendencia
+   moderada/forte e expansao com dominancia — os 16 layers vencedores do
+   report vieram exatamente desses contextos).
+
+------------------------------------------------------------
+RESPOSTAS FINAIS (1-15)
+------------------------------------------------------------
+ 1. Causa raiz: Stage17_CanOpenPair sem filtro positivo de qualidade →
+    101 pares 0.05 em 2 dias, probes -341.51 vs layers +219.12; custo
+    (comissao -73.60 + spread) domina o prejuizo. Secundaria: aborto de
+    par sem winner so em 300-420s.
+ 2. Linhas/funcoes: Stage17_CanOpenPair (20602-20705 original),
+    Stage17_DualSideOnTick (22083-22109 original), thresholds
+    CloseBoth 420s/-12 (inputs 215-216).
+ 3. Alterado: 2 funcoes novas + 15 inputs novos + 2 fwd decls + 2 pontos
+    de integracao no Stage17_DualSideOnTick. Nada mais.
+ 4. Nao alterado: Stage15, RiskGovernor, ExecuteRealOrder,
+    BuildV4RealExecutionOrderData, V4CloseOpposite..., Stage12/HedgeAirbag,
+    lotes, trailing, OrderSend, SET.
+ 5. Gate chamado em Stage17_DualSideOnTick, linha 22352:
+    if(Stage17_CanOpenPair() && Stage17_PairEntryQualityGate()) Stage17_OpenPair();
+ 6. FastAbort chamado em Stage17_DualSideOnTick, linha 22340, somente com
+    par ATIVO, ambos lados abertos, sem weakClosed e sem winnerConfirmed.
+ 7. Logs novos: os 7 listados acima.
+ 8. Compile 0/0: NAO CONFIRMAVEL AQUI (sem MetaEditor). Verificacao
+    estatica OK; compilar no MetaEditor do usuario.
+ 9. Hash das protegidas: MATCH=true (todas, tabela acima).
+10. Stage12_UseHedgeAirbag: continua false.
+11. Diff restrito a Stage17: SIM (prova de escopo acima).
+12. Inputs novos: os 15 listados no item B.
+13. Bloqueiam par: spread>35, ATR<120 ou >450, CHOPPY, RANGE,
+    DEAD/UNKNOWN/SPREAD_DANGER, tendencia fraca, COMPRESSION/NEUTRAL/
+    REVERSAL_RISK, ADX<18, momentum<35, forca direcional<55,
+    FLOW_BALANCED/DANGEROUS, gap<7, score dominante<30, sem runner
+    potential.
+14. Abortam par sem winner: nenhum lado com MFE>=3 nem profit>=3 E
+    (basket<=-6 imediato OU 150s+ com basket negativo). Nunca contra
+    winner confirmado ou lado com progresso real.
+15. Riscos restantes: (a) gate pode reduzir demais a frequencia em dias
+    mistos — se o backtest mostrar bloqueio excessivo, afrouxar
+    Stage17_MinDirectionalStrengthForPair (55->45) e/ou
+    Stage17_MinMomentumForPair (35->30) antes de mexer em regime/ADX;
+    (b) fast abort de 150s pode cortar par que viraria winner apos 3-4
+    min em mercado lento — mitigado pela trava de MFE/profit;
+    (c) resultado real depende de compilacao+backtest no MT5, nao
+    executaveis neste ambiente;
+    (d) 2 dias de dados e amostra curta — validar tambem em janela maior.
+
+CONFIRMACOES:
+   - Stage17 AINDA PODE OPERAR em dia bom: gate aprova tendencia
+     moderada/forte e expansao com ADX>=18, momentum>=35 e dominancia —
+     exatamente o contexto dos layers que renderam +219.12 no report.
+   - O patch NAO mata todos os trades: thresholds ancorados nos minimos
+     ja usados pelo proprio EA (nao nos niveis "strong").
+   - Veredito estrutural: a Stage17 NAO e estruturalmente pior que a
+     FIXED3 — o nucleo winner/layer e lucrativo; o problema era a porta
+     de entrada. Vale continuar com a Stage17 apos este patch.
+============================================================

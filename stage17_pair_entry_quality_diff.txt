@@ -1,0 +1,292 @@
+--- /root/.claude/uploads/9ba18817-9dd3-5aad-b4d8-68ee103ca66a/e8929118-HORSE_EA_V10_STAGE17_DUAL_SIDE_CONFIRMATION_EXTRACTION_FIXED.mq5	2026-07-05 18:55:32.598476454 +0000
++++ /home/user/Leonardo-Victor/HORSE_EA_V10_STAGE17_PAIR_ENTRY_QUALITY_FIXED.mq5	2026-07-05 19:05:28.058500905 +0000
+@@ -198,6 +198,8 @@
+ bool Stage17_ConfirmWinnerQuality(ulong winnerTicket, string &reason, string &rawClass, string &finalClass, double &profitMoney, double &mfeMoney, double &maeMoney, double &givebackPct, double &basketProfit, bool &beActive, bool &lockActive, bool &realSLConfirmed, bool &trendAlive, bool &severeReversal);
+ void Stage17_UpdateLayer1State();
+ void Stage17_ProfitExtractionManager();
++bool Stage17_PairEntryQualityGate();
++bool Stage17_NoWinnerFastAbort();
+ 
+ input bool   UseStage17DualSideConfirmation = true;
+ 
+@@ -245,6 +247,27 @@
+ input bool   Stage17_ForceLegacyHedgeAirbagOff = true;
+ input bool   Stage17_DebugLogs = true;
+ 
++// STAGE17 PAIR ENTRY QUALITY PATCH:
++// gate opens the BUY+SELL probe pair only when the market shows real winner/runner potential.
++input bool   Stage17_EnablePairEntryQualityGate = true;
++input double Stage17_MinADXForPair = 18.0;                  // HorseDetectMarketRegime: >=18 = moderate trend
++input double Stage17_MinDirectionalStrengthForPair = 55.0;  // max(g_buyStrengthScore, g_sellStrengthScore)
++input double Stage17_MinMomentumForPair = 35.0;             // aligned with MinMomentumScore
++input double Stage17_MinDirectionGapForPair = 7.0;          // aligned with AdaptiveDirectionNeutralThresholdV4
++input double Stage17_MinATRForPair = 120.0;                 // aligned with HealthyATRMinPoints
++input double Stage17_MaxATRForPair = 450.0;                 // aligned with HealthyATRMaxPoints
++input int    Stage17_MaxSpreadForPair = 35;                 // pair pays spread twice: tighter than Stage17_MaxSpreadPoints
++input bool   Stage17_BlockPairInChoppy = true;
++input bool   Stage17_BlockPairInRange = true;
++input bool   Stage17_RequireRunnerPotentialForPair = true;
++
++// STAGE17 NO WINNER FAST ABORT:
++// close both probe sides early when the pair bleeds cost and no winner is being born.
++input bool   Stage17_EnableNoWinnerFastAbort = true;
++input int    Stage17_NoWinnerFastAbortSeconds = 150;        // faster than Stage17_MaxDecisionSeconds/CloseBothAfterSeconds
++input double Stage17_NoWinnerFastAbortMaxBasketLoss = -6.0; // faster than Stage17_CloseBothIfBasketBelowMoney
++input double Stage17_NoWinnerFastAbortMinMFE = 3.0;         // aligned with Stage17_WeakSideMinMFEToSurvive
++
+ const int STAGE17_PAIR_IDLE = 0;
+ const int STAGE17_PAIR_ACTIVE = 1;
+ const int STAGE17_PAIR_DECIDED_WEAK_CLOSED = 2;
+@@ -22080,6 +22103,222 @@
+    return (sent && layerTicket > 0);
+ }
+ 
++bool Stage17_PairEntryQualityGate()
++{
++   if(!UseStage17DualSideConfirmation)
++      return false;
++   if(!Stage17_EnablePairEntryQualityGate)
++      return true;
++
++   long nextPairId = g_stage17NextPairId + 1;
++   string regimeReason = "";
++   ENUM_HORSE_MARKET_REGIME regime = HorseDetectMarketRegime(regimeReason);
++   double adx = V32GetADX((ENUM_TIMEFRAMES)_Period, 14, 1);
++   double atrPoints = g_atrM1Points;
++   int spread = GetCurrentSpreadPoints();
++   double buyScore = HorseCalculateBuyScore();
++   double sellScore = HorseCalculateSellScore();
++   double directionGap = MathAbs(buyScore - sellScore);
++   double dominantScore = MathMax(buyScore, sellScore);
++   double momentum = g_momentumScore;
++   double directionalStrength = MathMax(g_buyStrengthScore, g_sellStrengthScore);
++   string flowState = g_flowDirectionText;
++
++   bool trendRegimeOK = (regime == HORSE_TREND_STRONG_BULL || regime == HORSE_TREND_STRONG_BEAR ||
++                         regime == HORSE_TREND_MODERATE_BULL || regime == HORSE_TREND_MODERATE_BEAR);
++   bool expansionRegimeOK = (regime == HORSE_EXPANSION);
++   bool weakTrendRegime = (regime == HORSE_TREND_WEAK_BULL || regime == HORSE_TREND_WEAK_BEAR);
++   bool runnerPotential = ((trendRegimeOK || expansionRegimeOK) &&
++                           dominantScore >= AdaptiveDirectionMinValidScoreV4 &&
++                           directionGap >= Stage17_MinDirectionGapForPair &&
++                           adx >= Stage17_MinADXForPair &&
++                           momentum >= Stage17_MinMomentumForPair);
++
++   bool pairAllowed = true;
++   string reason = "ALLOW";
++
++   if(spread > Stage17_MaxSpreadForPair)
++   {
++      pairAllowed = false;
++      reason = "SPREAD_TOO_HIGH_FOR_PAIR";
++   }
++   else if(atrPoints <= 0.0)
++   {
++      pairAllowed = false;
++      reason = "ATR_DATA_NOT_READY";
++   }
++   else if(Stage17_MinATRForPair > 0.0 && atrPoints < Stage17_MinATRForPair)
++   {
++      pairAllowed = false;
++      reason = "ATR_TOO_LOW";
++   }
++   else if(Stage17_MaxATRForPair > 0.0 && atrPoints > Stage17_MaxATRForPair)
++   {
++      pairAllowed = false;
++      reason = "ATR_TOO_HIGH";
++   }
++   else if(Stage17_BlockPairInChoppy && (regime == HORSE_CHOPPY || g_market.mode == MARKET_ERRATIC))
++   {
++      pairAllowed = false;
++      reason = "CHOPPY_MARKET_BLOCK";
++   }
++   else if(Stage17_BlockPairInRange && (regime == HORSE_RANGE || g_market.mode == MARKET_SIDEWAYS))
++   {
++      pairAllowed = false;
++      reason = "RANGE_MARKET_BLOCK";
++   }
++   else if(g_market.mode == MARKET_DEAD || g_market.mode == MARKET_UNKNOWN || g_market.mode == MARKET_SPREAD_DANGER)
++   {
++      pairAllowed = false;
++      reason = "MARKET_MODE_DEAD_OR_DANGER";
++   }
++   else if(weakTrendRegime)
++   {
++      pairAllowed = false;
++      reason = "WEAK_TREND_BLOCK";
++   }
++   else if(regime == HORSE_COMPRESSION || regime == HORSE_REVERSAL_RISK || regime == HORSE_NEUTRAL)
++   {
++      pairAllowed = false;
++      reason = "NO_EXPANSION_REGIME";
++   }
++   else if(adx < Stage17_MinADXForPair)
++   {
++      pairAllowed = false;
++      reason = "ADX_TOO_WEAK";
++   }
++   else if(momentum < Stage17_MinMomentumForPair)
++   {
++      pairAllowed = false;
++      reason = "MOMENTUM_TOO_WEAK";
++   }
++   else if(directionalStrength < Stage17_MinDirectionalStrengthForPair)
++   {
++      pairAllowed = false;
++      reason = "DIRECTIONAL_STRENGTH_TOO_LOW";
++   }
++   else if(g_flow.direction == FLOW_BALANCED)
++   {
++      pairAllowed = false;
++      reason = "FLOW_BALANCED_NO_DOMINANCE";
++   }
++   else if(g_flow.direction == FLOW_DANGEROUS)
++   {
++      pairAllowed = false;
++      reason = "FLOW_DANGEROUS";
++   }
++   else if(directionGap < Stage17_MinDirectionGapForPair)
++   {
++      pairAllowed = false;
++      reason = "DIRECTION_GAP_TOO_SMALL";
++   }
++   else if(dominantScore < AdaptiveDirectionMinValidScoreV4)
++   {
++      pairAllowed = false;
++      reason = "DOMINANT_SCORE_TOO_LOW";
++   }
++   else if(Stage17_RequireRunnerPotentialForPair && !runnerPotential)
++   {
++      pairAllowed = false;
++      reason = "NO_RUNNER_POTENTIAL";
++   }
++
++   if(Stage17_DebugLogs)
++   {
++      string common = StringFormat("pairId=%d time=%s regime=%s adx=%.1f atr=%.1f spread=%d buyScore=%.1f sellScore=%.1f directionGap=%.1f flowState=%s momentum=%.1f directionalStrength=%.1f runnerPotential=%s basketProfit=0.00 elapsedSeconds=0 buyMFE=0.00 sellMFE=0.00 winnerConfirmed=%s survivorUnconfirmed=%s pairAllowed=%s reason=%s",
++                                   (int)nextPairId,
++                                   TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS),
++                                   HorseMarketRegimeToText(regime),
++                                   adx, atrPoints, spread,
++                                   buyScore, sellScore, directionGap,
++                                   flowState, momentum, directionalStrength,
++                                   BoolToText(runnerPotential),
++                                   BoolToText(g_stage17Pair.winnerConfirmed),
++                                   BoolToText(g_stage17Pair.survivorUnconfirmed),
++                                   BoolToText(pairAllowed),
++                                   reason);
++      Print("[HORSE EA][STAGE17_DUAL_SIDE] [STAGE17_PAIR_ENTRY_QUALITY_CHECK] ", common);
++      if(pairAllowed)
++         Print("[HORSE EA][STAGE17_DUAL_SIDE] [STAGE17_PAIR_ENTRY_ALLOWED] ", common);
++      else if(reason == "NO_RUNNER_POTENTIAL")
++         Print("[HORSE EA][STAGE17_DUAL_SIDE] [STAGE17_PAIR_ENTRY_BLOCKED_NO_RUNNER_POTENTIAL] ", common);
++      else
++         Print("[HORSE EA][STAGE17_DUAL_SIDE] [STAGE17_PAIR_ENTRY_BLOCKED_BAD_MARKET] ", common);
++   }
++
++   return pairAllowed;
++}
++
++bool Stage17_NoWinnerFastAbort()
++{
++   if(!UseStage17DualSideConfirmation || !Stage17_EnableNoWinnerFastAbort)
++      return false;
++   if(g_stage17Pair.pairId <= 0)
++      return false;
++   if(g_stage17Pair.pairState != STAGE17_PAIR_ACTIVE)
++      return false;
++   if(g_stage17Pair.weakClosed || g_stage17Pair.winnerConfirmed || g_stage17Pair.decisionMade)
++      return false;
++
++   bool buyOpen = (g_stage17Pair.buyTicket > 0 && PositionSelectByTicket(g_stage17Pair.buyTicket));
++   bool sellOpen = (g_stage17Pair.sellTicket > 0 && PositionSelectByTicket(g_stage17Pair.sellTicket));
++   if(!buyOpen || !sellOpen)
++      return false;
++
++   int elapsedSeconds = (int)(TimeCurrent() - g_stage17Pair.openTime);
++   double buyProfit = CurrentPositionProfitMoneyV4(g_stage17Pair.buyTicket);
++   double sellProfit = CurrentPositionProfitMoneyV4(g_stage17Pair.sellTicket);
++   double buyMFE = GetTicketExitPeakMoneyV4(g_stage17Pair.buyTicket);
++   double sellMFE = GetTicketExitPeakMoneyV4(g_stage17Pair.sellTicket);
++   double basketProfit = buyProfit + sellProfit;
++   int spread = GetCurrentSpreadPoints();
++
++   // never abort against a side that already shows real winner/runner progress
++   bool anySideHasMFE = (buyMFE >= Stage17_NoWinnerFastAbortMinMFE || sellMFE >= Stage17_NoWinnerFastAbortMinMFE);
++   bool anySideProfitable = (buyProfit >= Stage17_StrongSideMinProfitMoney || sellProfit >= Stage17_StrongSideMinProfitMoney);
++
++   bool costBleed = (basketProfit <= Stage17_NoWinnerFastAbortMaxBasketLoss);
++   bool timeoutNoWinner = (elapsedSeconds >= Stage17_NoWinnerFastAbortSeconds && basketProfit < 0.0);
++   bool abortPair = (!anySideHasMFE && !anySideProfitable && (costBleed || timeoutNoWinner));
++   string reason = "HOLD_PAIR";
++   if(anySideHasMFE || anySideProfitable)
++      reason = "SIDE_SHOWS_WINNER_PROGRESS";
++   else if(costBleed)
++      reason = "BASKET_COST_BLEED";
++   else if(timeoutNoWinner)
++      reason = "NO_WINNER_TIMEOUT_FAST";
++
++   if(Stage17_DebugLogs)
++   {
++      double adx = V32GetADX((ENUM_TIMEFRAMES)_Period, 14, 1);
++      string common = StringFormat("pairId=%d time=%s regime=%s adx=%.1f atr=%.1f spread=%d buyScore=%.1f sellScore=%.1f directionGap=%.1f flowState=%s momentum=%.1f directionalStrength=%.1f runnerPotential=%s basketProfit=%.2f elapsedSeconds=%d buyMFE=%.2f sellMFE=%.2f winnerConfirmed=%s survivorUnconfirmed=%s pairAllowed=%s reason=%s",
++                                   (int)g_stage17Pair.pairId,
++                                   TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS),
++                                   MarketModeToText(g_market.mode),
++                                   adx, g_atrM1Points, spread,
++                                   g_buyStrengthScore, g_sellStrengthScore,
++                                   MathAbs(g_buyStrengthScore - g_sellStrengthScore),
++                                   g_flowDirectionText, g_momentumScore,
++                                   MathMax(g_buyStrengthScore, g_sellStrengthScore),
++                                   BoolToText(anySideHasMFE || anySideProfitable),
++                                   basketProfit, elapsedSeconds, buyMFE, sellMFE,
++                                   BoolToText(g_stage17Pair.winnerConfirmed),
++                                   BoolToText(g_stage17Pair.survivorUnconfirmed),
++                                   BoolToText(!abortPair),
++                                   reason);
++      Print("[HORSE EA][STAGE17_DUAL_SIDE] [STAGE17_NO_WINNER_FAST_ABORT_CHECK] ", common);
++      if(abortPair && costBleed)
++         Print("[HORSE EA][STAGE17_DUAL_SIDE] [STAGE17_PAIR_COST_BLEED_DETECTED] ", common);
++      if(abortPair)
++         Print("[HORSE EA][STAGE17_DUAL_SIDE] [STAGE17_NO_WINNER_FAST_ABORT_CLOSE] ", common);
++   }
++
++   if(!abortPair)
++      return false;
++
++   return Stage17_CloseBothNoWinner();
++}
++
+ void Stage17_DualSideOnTick()
+ {
+    if(!UseStage17DualSideConfirmation)
+@@ -22095,6 +22334,12 @@
+       g_stage17LegacyBlockThisTick = true;
+       Stage17_CompareSides();
+       Stage17_UpdatePairState();
++      if(g_stage17Pair.pairState == STAGE17_PAIR_ACTIVE &&
++         !g_stage17Pair.weakClosed && !g_stage17Pair.winnerConfirmed)
++      {
++         if(Stage17_NoWinnerFastAbort())
++            Stage17_UpdatePairState();
++      }
+       if(g_stage17Pair.pairState == STAGE17_PAIR_DECIDED_WEAK_CLOSED)
+       {
+          Stage17_ProfitExtractionManager();
+@@ -22104,7 +22349,7 @@
+       return;
+    }
+ 
+-   if(Stage17_CanOpenPair())
++   if(Stage17_CanOpenPair() && Stage17_PairEntryQualityGate())
+       Stage17_OpenPair();
+ }
+ 
+@@ -25463,5 +25708,5 @@
+ }
+ 
+ //+------------------------------------------------------------------+
+-
+-
++
++

@@ -1,0 +1,928 @@
+--- IA_FUNDED_GOLD_V1.2.3.2_PENDING_HANDOFF_FIXED.mq5	2026-07-11 20:09:35.712394375 +0000
++++ IA_FUNDED_GOLD_V1.2.3.3_PENDING_LIFECYCLE_FIXED.mq5	2026-07-11 20:42:14.525175299 +0000
+@@ -1,6 +1,6 @@
+ #property strict
+-#property version   "1.232"
+-#property description "IA FUNDED GOLD V1.2.3.2 - handoff transacional entre pendente e entrada a mercado."
++#property version   "1.233"
++#property description "IA FUNDED GOLD V1.2.3.3 - lifecycle transacional de pendentes: autoexclusao de slot, replacement de tipo e troca validada antes do cancelamento."
+ 
+ #include <Trade/Trade.mqh>
+ 
+@@ -277,6 +277,26 @@
+    MARKET_HANDOFF_EXECUTING = 3
+ };
+ 
++// V1.2.3.3 PENDING LIFECYCLE FIX
++// Cada cancelamento de pendente precisa declarar um motivo estrutural. Motivos
++// vagos (NORMAL/UPDATE/REFRESH/MANAGE) nao existem de proposito.
++enum ENUM_PENDING_CANCEL_REASON_V1233
++{
++   PENDING_CANCEL_REASON_NONE = 0,
++   PENDING_CANCEL_REASON_RISK_EMERGENCY = 1,
++   PENDING_CANCEL_REASON_GLOBAL_CLOSE = 2,
++   PENDING_CANCEL_REASON_EXPIRED = 3,
++   PENDING_CANCEL_REASON_INVALID_PRICE = 4,
++   PENDING_CANCEL_REASON_STRUCTURAL_INVALIDATION = 5,
++   PENDING_CANCEL_REASON_REPLACE_ORDER_TYPE = 6,
++   PENDING_CANCEL_REASON_MARKET_HANDOFF = 7,
++   PENDING_CANCEL_REASON_REBALANCE = 8,
++   PENDING_CANCEL_REASON_SYMBOL_DISABLED = 9,
++   PENDING_CANCEL_REASON_SHUTDOWN = 10,
++   PENDING_CANCEL_REASON_RECONCILIATION = 11
++};
++#define PENDING_CANCEL_REASON_COUNT_V1233 12
++
+ struct RebalanceCandidateV122
+ {
+    bool valid;
+@@ -453,6 +473,26 @@
+ string g_lastStatusLogReasonV1232 = "";
+ datetime g_lastStatusLogTimeV1232 = 0;
+ 
++// V1.2.3.3 PENDING LIFECYCLE FIX - estado do replacement transacional de tipo
++// (buy stop <-> buy limit, sell stop <-> sell limit) e contadores por motivo.
++// Nenhuma destas variaveis altera sinal, distancia, lote ou risco.
++bool g_buyPendingReplaceActiveV1233 = false;
++bool g_sellPendingReplaceActiveV1233 = false;
++ENUM_ORDER_TYPE g_buyPendingReplaceTypeV1233 = ORDER_TYPE_BUY_STOP;
++ENUM_ORDER_TYPE g_sellPendingReplaceTypeV1233 = ORDER_TYPE_SELL_STOP;
++ulong g_buyPendingReplaceOldTicketV1233 = 0;
++ulong g_sellPendingReplaceOldTicketV1233 = 0;
++datetime g_buyPendingReplaceSinceV1233 = 0;
++datetime g_sellPendingReplaceSinceV1233 = 0;
++long g_pendingMutationSeqV1233 = 0;
++int g_pendingCancelsByReasonV1233[PENDING_CANCEL_REASON_COUNT_V1233];
++int g_pendingReplaceRequestsV1233 = 0;
++int g_pendingReplaceCompletedV1233 = 0;
++int g_pendingReplaceReleasedV1233 = 0;
++int g_pendingReplaceTimeoutsV1233 = 0;
++int g_pendingRecreateBlockedV1233 = 0;
++int g_pendingSwapSimBlockedV1233 = 0;
++
+ int OnInit();
+ void OnDeinit(const int reason);
+ void OnTick();
+@@ -491,8 +531,8 @@
+ double GetBiasConfidenceV122();
+ int GetTargetBuySlotsV122();
+ int GetTargetSellSlotsV122();
+-bool CanAddTowardBiasV122(ENUM_POSITION_TYPE direction);
+-bool CanAddCounterBiasRecoveryV122(ENUM_POSITION_TYPE direction);
++bool CanAddTowardBiasV122(ENUM_POSITION_TYPE direction, int side_slots_adjust=0); // V1.2.3.3 PENDING LIFECYCLE FIX
++bool CanAddCounterBiasRecoveryV122(ENUM_POSITION_TYPE direction, int side_slots_adjust=0); // V1.2.3.3 PENDING LIFECYCLE FIX
+ string BiasToTextV122(ENUM_DIRECTIONAL_BIAS_V122 bias);
+ string ExitStateToTextV122(ENUM_EXIT_STATE_V122 state);
+ int RemainingFlatDelayV122();
+@@ -520,7 +560,14 @@
+ string PendingLifecycleStateTextV1231(ENUM_PENDING_LIFECYCLE_V1231 state);
+ bool RequestPendingCreateV1231(bool buy_side, ENUM_ORDER_TYPE desired_type, double desired_price, double required_margin, string reason);
+ bool RequestPendingModifyV1231(bool buy_side, ulong ticket, double desired_price, string reason);
+-bool RequestPendingCancelV1231(bool buy_side, ulong ticket, string reason);
++bool RequestPendingCancelV1231(bool buy_side, ulong ticket, ENUM_PENDING_CANCEL_REASON_V1233 reason_code, string reason, bool global_scope=false); // V1.2.3.3 PENDING LIFECYCLE FIX
++// V1.2.3.3 PENDING LIFECYCLE FIX - novas autoridades auxiliares
++string PendingCancelReasonTextV1233(ENUM_PENDING_CANCEL_REASON_V1233 reason_code);
++int PendingSideSlotAdjustV1233(bool buy_side, ulong exclude_order_ticket);
++bool SimulatePendingSwapV1233(ENUM_POSITION_TYPE entry_direction, bool pending_buy_side, ulong pending_ticket, string &reason);
++bool PendingReplaceActiveV1233(bool buy_side);
++void ReleasePendingReplacementV1233(bool buy_side, string reason, bool timed_out=false);
++void ProcessPendingReplacementV1233();
+ bool IsMarketHandoffActiveV1232();
+ string MarketHandoffStateTextV1232();
+ bool ProcessMarketEntryHandoffV1232();
+@@ -548,7 +595,7 @@
+ void ResetCandidateV121(EntryCandidateV121 &candidate);
+ double GetAdaptiveDistancePointsV121(ENUM_POSITION_TYPE direction, ENUM_ENTRY_GEOMETRY_V121 geometry, int regime);
+ int DetectRegimeConfirmadoV121();
+-bool IsGeometryApplicableV121(ENUM_POSITION_TYPE direction, ENUM_ENTRY_GEOMETRY_V121 geometry, int regime, string &reason);
++bool IsGeometryApplicableV121(ENUM_POSITION_TYPE direction, ENUM_ENTRY_GEOMETRY_V121 geometry, int regime, string &reason, int side_slots_adjust=0); // V1.2.3.3 PENDING LIFECYCLE FIX
+ int CountRecoveryContraExtremaV121(ENUM_POSITION_TYPE direction);
+ double EntryThresholdV121(ENUM_ENTRY_GEOMETRY_V121 geometry);
+ string DirectionToTextV121(ENUM_POSITION_TYPE direction);
+@@ -565,7 +612,7 @@
+ bool PlaceDynamicSellPending();
+ void RepositionDynamicPendingOrders();
+ void CancelInvalidPendingOrders();
+-void CancelAllPendingOrders();
++void CancelAllPendingOrders(ENUM_PENDING_CANCEL_REASON_V1233 reason_code); // V1.2.3.3 PENDING LIFECYCLE FIX
+ 
+ int CountOpenPositions();
+ int CountBuyPositions();
+@@ -721,7 +768,7 @@
+          g_flatSince = TimeCurrent();
+       g_waitingPairReopen = true;
+       if(CountPendingOrders() > 0)
+-         CancelAllPendingOrders();
++         CancelAllPendingOrders(PENDING_CANCEL_REASON_RECONCILIATION); // V1.2.3.3 PENDING LIFECYCLE FIX
+       LogMessage("[V122_BASKET_BECAME_FLAT] origem=init aguardando_reabertura=1 delay=" + IntegerToString(MathMax(0, ReopenDelaySecondsAfterClose)));
+    }
+ 
+@@ -745,6 +792,28 @@
+               " timeouts=" + IntegerToString(g_pendingTimeoutsV1231) +
+               " busy=" + IntegerToString(g_pendingBusyBlocksV1231) +
+               " executions=" + IntegerToString(g_pendingExecutionsV1231));
++   // V1.2.3.3 PENDING LIFECYCLE FIX: fechamento dos contadores por motivo
++   string reason_summary = "";
++   int reason_total = 0;
++   for(int r = 0; r < PENDING_CANCEL_REASON_COUNT_V1233; r++)
++   {
++      reason_total += g_pendingCancelsByReasonV1233[r];
++      if(g_pendingCancelsByReasonV1233[r] > 0)
++         reason_summary += " " + PendingCancelReasonTextV1233((ENUM_PENDING_CANCEL_REASON_V1233)r) + "=" +
++                           IntegerToString(g_pendingCancelsByReasonV1233[r]);
++   }
++   LogMessage("[V1233_PENDING_LIFECYCLE_SUMMARY] origem=deinit" +
++              " creates_total=" + IntegerToString(g_pendingCreatesBuyV1231 + g_pendingCreatesSellV1231) +
++              " cancels_total=" + IntegerToString(g_pendingCancelsBuyV1231 + g_pendingCancelsSellV1231) +
++              " cancels_por_motivo_total=" + IntegerToString(reason_total) +
++              " motivos:" + (reason_summary == "" ? " nenhum" : reason_summary) +
++              " replace_requests=" + IntegerToString(g_pendingReplaceRequestsV1233) +
++              " replace_completed=" + IntegerToString(g_pendingReplaceCompletedV1233) +
++              " replace_released=" + IntegerToString(g_pendingReplaceReleasedV1233) +
++              " replace_timeouts=" + IntegerToString(g_pendingReplaceTimeoutsV1233) +
++              " recreates_bloqueadas=" + IntegerToString(g_pendingRecreateBlockedV1233) +
++              " trocas_reprovadas_simulacao=" + IntegerToString(g_pendingSwapSimBlockedV1233) +
++              " pendentes_ativas=" + IntegerToString(CountPendingOrders()));
+    PersistBasketState();
+    if(g_atrHandle != INVALID_HANDLE)
+    {
+@@ -906,7 +975,7 @@
+       g_lastBasketCloseTime = g_flatSince;
+       ResetarPicoLucroCesta();
+       if(CountPendingOrders() > 0)
+-         CancelAllPendingOrders();
++         CancelAllPendingOrders(PENDING_CANCEL_REASON_GLOBAL_CLOSE); // V1.2.3.3 PENDING LIFECYCLE FIX
+       LogMessage("[V122_BASKET_BECAME_FLAT] time=" + TimeToString(g_flatSince, TIME_DATE|TIME_SECONDS) +
+                  " previous=" + IntegerToString(g_previousManagedPositionCount) + " current=0");
+    }
+@@ -948,7 +1017,7 @@
+ 
+    if(CountPendingOrders() > 0)
+    {
+-      CancelAllPendingOrders();
++      CancelAllPendingOrders(PENDING_CANCEL_REASON_GLOBAL_CLOSE); // V1.2.3.3 PENDING LIFECYCLE FIX
+       g_lastEntryBlockReasonV122 = "flat_com_pendentes_cancelando";
+       return true;
+    }
+@@ -1232,7 +1301,24 @@
+                continue;
+          }
+ 
+-         if(RequestPendingCancelV1231(buy_pending, ticket, "liberar_slot_rebalance"))
++         // V1.2.3.3 PENDING LIFECYCLE FIX: lado sob replacement pertence ao driver
++         if(PendingReplaceActiveV1233(buy_pending))
++            continue;
++
++         // V1.2.3.3 PENDING LIFECYCLE FIX: valida a troca pendente->posicao de
++         // Rebalance ANTES do cancelamento, com o mesmo simulador do Handoff.
++         string swap_reason = "";
++         if(!SimulatePendingSwapV1233(direction, buy_pending, ticket, swap_reason))
++         {
++            g_pendingSwapSimBlockedV1233++;
++            LogThrottledV1232("rebalance_swap_blocked_" + (direction == POSITION_TYPE_BUY ? "BUY" : "SELL") + "_" + swap_reason,
++                              "[V1233_PENDING_MUTATION_BLOCKED] origem=rebalance ticket=" + IntegerToString((int)ticket) +
++                              " direction=" + (direction == POSITION_TYPE_BUY ? "BUY" : "SELL") +
++                              " motivo=" + swap_reason, 10);
++            continue;
++         }
++
++         if(RequestPendingCancelV1231(buy_pending, ticket, PENDING_CANCEL_REASON_REBALANCE, "liberar_slot_rebalance"))
+          {
+             LogMessage("[V122_PENDING_CANCEL_FOR_REBALANCE] ticket=" + IntegerToString((int)ticket) +
+                        " direcao_rebalance=" + (direction == POSITION_TYPE_BUY ? "BUY" : "SELL"));
+@@ -1286,7 +1372,27 @@
+             continue;
+ 
+          bool buy_pending = IsBuyPendingType(type);
+-         if(RequestPendingCancelV1231(buy_pending, ticket, "liberar_slot_entrada_mercado"))
++
++         // V1.2.3.3 PENDING LIFECYCLE FIX: lado sob replacement pertence ao driver
++         if(PendingReplaceActiveV1233(buy_pending))
++            continue;
++
++         // V1.2.3.3 PENDING LIFECYCLE FIX: a troca inteira (pendente removida +
++         // posicao adicionada) e simulada ANTES do OrderDelete. Na V1.2.3.2 a
++         // viabilidade direcional/margem so era conferida depois do cancelamento,
++         // deixando o caminho residual CANCELAR->FALHAR->RECRIAR.
++         string swap_reason = "";
++         if(!SimulatePendingSwapV1233(direction, buy_pending, ticket, swap_reason))
++         {
++            g_pendingSwapSimBlockedV1233++;
++            LogThrottledV1232("handoff_swap_blocked_" + DirectionToTextV121(direction) + "_" + swap_reason,
++                              "[V1233_PENDING_MUTATION_BLOCKED] origem=handoff ticket=" + IntegerToString((int)ticket) +
++                              " direction=" + DirectionToTextV121(direction) +
++                              " motivo=" + swap_reason, 10);
++            continue;
++         }
++
++         if(RequestPendingCancelV1231(buy_pending, ticket, PENDING_CANCEL_REASON_MARKET_HANDOFF, "liberar_slot_entrada_mercado"))
+          {
+             g_marketHandoffCandidateV1232 = candidate;
+             g_marketHandoffCandidateV1232.valid = true;
+@@ -1497,12 +1603,15 @@
+    }
+ }
+ 
+-bool CanAddTowardBiasV122(ENUM_POSITION_TYPE direction)
++bool CanAddTowardBiasV122(ENUM_POSITION_TYPE direction, int side_slots_adjust) // V1.2.3.3 PENDING LIFECYCLE FIX
+ {
+    if(!UsarBiasDirecionalV122)
+       return true;
+ 
++   // V1.2.3.3 PENDING LIFECYCLE FIX: ao reavaliar uma pendente existente o
++   // ajuste (-1) remove o proprio slot dela; alocacao alvo permanece identica.
+    int side_slots = (direction == POSITION_TYPE_BUY ? CountBuyExposureSlots() : CountSellExposureSlots());
++   side_slots = MathMax(0, side_slots + side_slots_adjust);
+    int target = (direction == POSITION_TYPE_BUY ? GetTargetBuySlotsV122() : GetTargetSellSlotsV122());
+    if(side_slots >= target)
+       return false;
+@@ -1514,11 +1623,12 @@
+    return (g_directionalBiasV122 == BIAS_SELL || g_directionalBiasV122 == BIAS_STRONG_SELL);
+ }
+ 
+-bool CanAddCounterBiasRecoveryV122(ENUM_POSITION_TYPE direction)
++bool CanAddCounterBiasRecoveryV122(ENUM_POSITION_TYPE direction, int side_slots_adjust) // V1.2.3.3 PENDING LIFECYCLE FIX
+ {
+    if(!UsarBiasDirecionalV122)
+       return true;
+    int side_slots = (direction == POSITION_TYPE_BUY ? CountBuyExposureSlots() : CountSellExposureSlots());
++   side_slots = MathMax(0, side_slots + side_slots_adjust); // V1.2.3.3 PENDING LIFECYCLE FIX
+    int target = (direction == POSITION_TYPE_BUY ? GetTargetBuySlotsV122() : GetTargetSellSlotsV122());
+    return (side_slots < MathMax(1, target));
+ }
+@@ -2480,10 +2590,10 @@
+    return true;
+ }
+ 
+-bool RequestPendingCancelV1231(bool buy_side, ulong ticket, string reason)
++bool RequestPendingCancelV1231(bool buy_side, ulong ticket, ENUM_PENDING_CANCEL_REASON_V1233 reason_code, string reason, bool global_scope) // V1.2.3.3 PENDING LIFECYCLE FIX
+ {
+    datetime last_create = (buy_side ? g_buyPendingLastCreateTimeV1232 : g_sellPendingLastCreateTimeV1232);
+-   bool emergency_cancel = (reason == "cancelar_todas_pendentes");
++   bool emergency_cancel = global_scope;
+    if(!emergency_cancel && last_create > 0 && TimeCurrent() <= last_create)
+    {
+       LogThrottledV1232("cancel_same_second_" + (buy_side ? "BUY" : "SELL") + "_" + reason,
+@@ -2504,6 +2614,12 @@
+    if(!PendingActionGuardV1231(buy_side, PENDING_ACTION_CANCEL, ticket, current_type, 0.0, reason))
+       return false;
+ 
++   // V1.2.3.3 PENDING LIFECYCLE FIX: idade e contexto capturados antes da mutacao
++   datetime setup_time = 0;
++   if(OrderSelect(ticket))
++      setup_time = (datetime)OrderGetInteger(ORDER_TIME_SETUP);
++   int order_age = (setup_time > 0 ? (int)(TimeCurrent() - setup_time) : -1);
++
+    int expected_side_count = MathMax(0, (buy_side ? CountPendingBuyOrders() : CountPendingSellOrders()) - 1);
+    bool ok = trade.OrderDelete(ticket);
+    g_pendingMutationSentThisTickV1231 = true;
+@@ -2529,6 +2645,27 @@
+       g_sellPendingLastCancelTimeV1231 = TimeCurrent();
+       g_pendingCancelsSellV1231++;
+    }
++   // V1.2.3.3 PENDING LIFECYCLE FIX: contabiliza e registra o motivo estrutural
++   int reason_index = (int)reason_code;
++   if(reason_index >= 0 && reason_index < PENDING_CANCEL_REASON_COUNT_V1233)
++      g_pendingCancelsByReasonV1233[reason_index]++;
++   g_pendingMutationSeqV1233++;
++   LogMessage("[V1233_PENDING_CANCEL_REASON] mutation_id=" + IntegerToString((int)g_pendingMutationSeqV1233) +
++              " ticket=" + IntegerToString((int)ticket) +
++              " lado=" + (buy_side ? "BUY" : "SELL") +
++              " tipo=" + EnumToString(current_type) +
++              " preco=" + DoubleToString(current_price, _Digits) +
++              " idade_s=" + IntegerToString(order_age) +
++              " motivo=" + PendingCancelReasonTextV1233(reason_code) +
++              " detalhe=" + reason +
++              " pos_buy=" + IntegerToString(CountBuyPositions()) +
++              " pos_sell=" + IntegerToString(CountSellPositions()) +
++              " pend_buy=" + IntegerToString(CountPendingBuyOrders()) +
++              " pend_sell=" + IntegerToString(CountPendingSellOrders()) +
++              " expo=" + IntegerToString(UsedExposureSlotsV122()) + "/" + IntegerToString(LimitOpenPositions()) +
++              " handoff=" + (IsMarketHandoffActiveV1232() ? "1" : "0") +
++              " rebalance=" + ((g_buyRebalancePendingConfirmation || g_sellRebalancePendingConfirmation) ? "1" : "0") +
++              " replace=" + ((PendingReplaceActiveV1233(true) || PendingReplaceActiveV1233(false)) ? "1" : "0"));
+    SetPendingLifecycleV1231(buy_side, PENDING_LIFECYCLE_CANCEL_REQUESTED, PENDING_ACTION_CANCEL,
+                             ticket, current_type, current_price, reason);
+    LogPendingLifecycleV1231("[V1231_PENDING_CANCEL_REQUEST]", buy_side,
+@@ -2538,6 +2675,252 @@
+    return true;
+ }
+ 
++// ============================ V1.2.3.3 PENDING LIFECYCLE FIX ============================
++// Autoridades auxiliares do ciclo de vida: motivo de cancelamento, autoexclusao
++// do proprio slot, simulacao completa da troca pendente->mercado e replacement
++// transacional de tipo. Nenhuma funcao abaixo altera sinal, lote ou risco.
++
++string PendingCancelReasonTextV1233(ENUM_PENDING_CANCEL_REASON_V1233 reason_code)
++{
++   switch(reason_code)
++   {
++      case PENDING_CANCEL_REASON_RISK_EMERGENCY: return "RISK_EMERGENCY";
++      case PENDING_CANCEL_REASON_GLOBAL_CLOSE: return "GLOBAL_CLOSE";
++      case PENDING_CANCEL_REASON_EXPIRED: return "EXPIRED";
++      case PENDING_CANCEL_REASON_INVALID_PRICE: return "INVALID_PRICE";
++      case PENDING_CANCEL_REASON_STRUCTURAL_INVALIDATION: return "STRUCTURAL_INVALIDATION";
++      case PENDING_CANCEL_REASON_REPLACE_ORDER_TYPE: return "REPLACE_ORDER_TYPE";
++      case PENDING_CANCEL_REASON_MARKET_HANDOFF: return "MARKET_HANDOFF";
++      case PENDING_CANCEL_REASON_REBALANCE: return "REBALANCE";
++      case PENDING_CANCEL_REASON_SYMBOL_DISABLED: return "SYMBOL_DISABLED";
++      case PENDING_CANCEL_REASON_SHUTDOWN: return "SHUTDOWN";
++      case PENDING_CANCEL_REASON_RECONCILIATION: return "RECONCILIATION";
++      default: return "NONE";
++   }
++}
++
++// A propria pendente nao pode contar como slot ocupado quando o EA avalia se
++// ela continua desejada. Sem esta exclusao, posicoes_do_lado == target-1 fazia
++// a ordem invalidar a si mesma e renascer a cada dois segundos (causa raiz do
++// loop CREATE->CANCEL->CREATE da V1.2.3.2).
++int PendingSideSlotAdjustV1233(bool buy_side, ulong exclude_order_ticket)
++{
++   if(exclude_order_ticket == 0)
++      return 0;
++   ENUM_ORDER_TYPE type = (buy_side ? ORDER_TYPE_BUY_STOP : ORDER_TYPE_SELL_STOP);
++   double price = 0.0;
++   if(!PendingTicketExistsV1231(exclude_order_ticket, type, price))
++      return 0;
++   if(buy_side != IsBuyPendingType(type))
++      return 0;
++   return -1;
++}
++
++// Simula o estado que existira DEPOIS da troca (pendente removida + posicao a
++// mercado adicionada) antes de autorizar qualquer cancelamento por Handoff ou
++// Rebalance. Reprova a troca que fatalmente falharia depois do OrderDelete.
++bool SimulatePendingSwapV1233(ENUM_POSITION_TYPE entry_direction, bool pending_buy_side, ulong pending_ticket, string &reason)
++{
++   reason = "OK";
++   ENUM_ORDER_TYPE pending_type = (pending_buy_side ? ORDER_TYPE_BUY_STOP : ORDER_TYPE_SELL_STOP);
++   double pending_price = 0.0;
++   if(!PendingTicketExistsV1231(pending_ticket, pending_type, pending_price))
++   {
++      reason = "troca_ticket_ausente";
++      return false;
++   }
++   double pending_lot = OrderGetDouble(ORDER_VOLUME_CURRENT);
++   double lot = NormalizeVolume(FixedLot);
++   if(lot <= 0.0)
++   {
++      reason = "troca_lote_invalido";
++      return false;
++   }
++
++   int buy_slots = CountBuyExposureSlots() - (pending_buy_side ? 1 : 0) +
++                   (entry_direction == POSITION_TYPE_BUY ? 1 : 0);
++   int sell_slots = CountSellExposureSlots() - (pending_buy_side ? 0 : 1) +
++                    (entry_direction == POSITION_TYPE_SELL ? 1 : 0);
++   double buy_lots = GetBuyExposureLots() - (pending_buy_side ? pending_lot : 0.0) +
++                     (entry_direction == POSITION_TYPE_BUY ? lot : 0.0);
++   double sell_lots = GetSellExposureLots() - (pending_buy_side ? 0.0 : pending_lot) +
++                      (entry_direction == POSITION_TYPE_SELL ? lot : 0.0);
++
++   if(buy_slots > LimitBuyPositions())
++   {
++      reason = "troca_limite_buy";
++      return false;
++   }
++   if(sell_slots > LimitSellPositions())
++   {
++      reason = "troca_limite_sell";
++      return false;
++   }
++   int max_imbalance = MathMax(0, MaxDesequilibrioDirecional);
++   if(MathAbs(buy_slots - sell_slots) > max_imbalance)
++   {
++      reason = "troca_desequilibrio_direcional";
++      return false;
++   }
++   double net_lots = MathAbs(buy_lots - sell_lots);
++   if(MaxExposicaoLiquidaLotes > 0.0 && net_lots > MaxExposicaoLiquidaLotes + 0.0000001)
++   {
++      reason = "troca_exposicao_liquida";
++      return false;
++   }
++
++   ENUM_ORDER_TYPE market_type = (entry_direction == POSITION_TYPE_BUY ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
++   double market_price = (entry_direction == POSITION_TYPE_BUY ? g_tick.ask : g_tick.bid);
++   double required_margin = 0.0;
++   if(!HasMarginForOrderV122(market_type, lot, market_price, reason, required_margin))
++   {
++      reason = "troca_sem_margem";
++      return false;
++   }
++   return true;
++}
++
++bool PendingReplaceActiveV1233(bool buy_side)
++{
++   return (buy_side ? g_buyPendingReplaceActiveV1233 : g_sellPendingReplaceActiveV1233);
++}
++
++void ReleasePendingReplacementV1233(bool buy_side, string reason, bool timed_out)
++{
++   if(!PendingReplaceActiveV1233(buy_side))
++      return;
++   if(timed_out)
++      g_pendingReplaceTimeoutsV1233++;
++   else
++      g_pendingReplaceReleasedV1233++;
++   LogMessage("[V1233_PENDING_REPLACE_RELEASED] lado=" + (buy_side ? "BUY" : "SELL") +
++              " ticket_antigo=" + IntegerToString((int)(buy_side ? g_buyPendingReplaceOldTicketV1233 : g_sellPendingReplaceOldTicketV1233)) +
++              " tipo_reservado=" + EnumToString(buy_side ? g_buyPendingReplaceTypeV1233 : g_sellPendingReplaceTypeV1233) +
++              " timeout=" + (timed_out ? "1" : "0") +
++              " motivo=" + reason);
++   if(buy_side)
++   {
++      g_buyPendingReplaceActiveV1233 = false;
++      g_buyPendingReplaceOldTicketV1233 = 0;
++      g_buyPendingReplaceSinceV1233 = 0;
++   }
++   else
++   {
++      g_sellPendingReplaceActiveV1233 = false;
++      g_sellPendingReplaceOldTicketV1233 = 0;
++      g_sellPendingReplaceSinceV1233 = 0;
++   }
++}
++
++// Conclui um replacement de tipo reservado: espera a confirmacao do
++// cancelamento pela autoridade V1231 e cria exatamente a substituta reservada.
++// Concluido como REPLACED (create aceito), RELEASED (estado mudou) ou TIMEOUT.
++void ProcessPendingReplacementV1233()
++{
++   for(int side = 0; side < 2; side++)
++   {
++      bool buy_side = (side == 0);
++      if(!PendingReplaceActiveV1233(buy_side))
++         continue;
++
++      datetime since = (buy_side ? g_buyPendingReplaceSinceV1233 : g_sellPendingReplaceSinceV1233);
++      int timeout = MathMax(1, TradeReconciliationTimeoutSeconds);
++      if(since > 0 && (int)(TimeCurrent() - since) >= timeout)
++      {
++         ReleasePendingReplacementV1233(buy_side, "timeout_replacement", true);
++         continue;
++      }
++
++      // Cancelamento ainda em confirmacao no servidor: aguardar.
++      if(PendingLifecycleBusyV1231(buy_side))
++         continue;
++
++      ulong old_ticket = (buy_side ? g_buyPendingReplaceOldTicketV1233 : g_sellPendingReplaceOldTicketV1233);
++      ENUM_ORDER_TYPE old_check_type = (buy_side ? ORDER_TYPE_BUY_STOP : ORDER_TYPE_SELL_STOP);
++      double old_check_price = 0.0;
++      if(PendingTicketExistsV1231(old_ticket, old_check_type, old_check_price))
++      {
++         // Cancel nao confirmado (timeout da autoridade devolveu ACTIVE).
++         ReleasePendingReplacementV1233(buy_side, "cancelamento_nao_confirmado");
++         continue;
++      }
++
++      // Guardas de serializacao: nunca criar no mesmo segundo do cancelamento
++      // nem com outra mutacao em andamento. Aguarda o proximo tick.
++      datetime last_cancel = (buy_side ? g_buyPendingLastCancelTimeV1231 : g_sellPendingLastCancelTimeV1231);
++      if(last_cancel > 0 && TimeCurrent() <= last_cancel)
++         continue;
++      if(g_pendingMutationSentThisTickV1231 || AnyPendingLifecycleBusyV1231())
++         continue;
++
++      if(!IsPendingFiltersOK())
++      {
++         ReleasePendingReplacementV1233(buy_side, "filtros_bloqueando");
++         continue;
++      }
++
++      ENUM_ORDER_TYPE desired_type;
++      double desired_price = 0.0;
++      ENUM_ENTRY_GEOMETRY_V121 geometry = ENTRY_GEOMETRY_RECOVERY;
++      string pending_reason = "";
++      if(!GetDesiredPendingOrderCurrentMode(buy_side, desired_type, desired_price, geometry, pending_reason))
++      {
++         ReleasePendingReplacementV1233(buy_side, "desejado_indisponivel_" + pending_reason);
++         continue;
++      }
++      ENUM_ORDER_TYPE reserved_type = (buy_side ? g_buyPendingReplaceTypeV1233 : g_sellPendingReplaceTypeV1233);
++      if(desired_type != reserved_type)
++      {
++         ReleasePendingReplacementV1233(buy_side, "tipo_desejado_mudou");
++         continue;
++      }
++
++      double lot = NormalizeVolume(FixedLot);
++      string reason = "";
++      if(!HasDirectionalSlotRoom(buy_side ? POSITION_TYPE_BUY : POSITION_TYPE_SELL, 1, lot, reason))
++      {
++         ReleasePendingReplacementV1233(buy_side, "sem_slot_" + reason);
++         continue;
++      }
++      double required_margin = 0.0;
++      if(!HasMarginForOrderV122(desired_type, lot, desired_price, reason, required_margin))
++      {
++         ReleasePendingReplacementV1233(buy_side, "sem_margem");
++         continue;
++      }
++
++      if(RequestPendingCreateV1231(buy_side, desired_type, desired_price, required_margin, "replacement_tipo_v1233"))
++      {
++         g_pendingReplaceCompletedV1233++;
++         LogMessage("[V1233_PENDING_REPLACE_CONFIRMED] lado=" + (buy_side ? "BUY" : "SELL") +
++                    " ticket_antigo=" + IntegerToString((int)old_ticket) +
++                    " tipo=" + EnumToString(desired_type) +
++                    " preco=" + DoubleToString(desired_price, _Digits) +
++                    " resultado=REPLACED");
++         if(buy_side)
++         {
++            g_buyPendingReplaceActiveV1233 = false;
++            g_buyPendingReplaceOldTicketV1233 = 0;
++            g_buyPendingReplaceSinceV1233 = 0;
++         }
++         else
++         {
++            g_sellPendingReplaceActiveV1233 = false;
++            g_sellPendingReplaceOldTicketV1233 = 0;
++            g_sellPendingReplaceSinceV1233 = 0;
++         }
++      }
++      else
++      {
++         ReleasePendingReplacementV1233(buy_side, "create_rejeitado");
++      }
++
++      if(g_pendingMutationSentThisTickV1231)
++         return;
++   }
++}
++// ========================== FIM V1.2.3.3 PENDING LIFECYCLE FIX ==========================
++
+ bool IsMarketHandoffActiveV1232()
+ {
+    return (g_marketHandoffStateV1232 != MARKET_HANDOFF_NONE);
+@@ -3493,7 +3876,7 @@
+    return g_lastRegimeV121;
+ }
+ 
+-bool IsGeometryApplicableV121(ENUM_POSITION_TYPE direction, ENUM_ENTRY_GEOMETRY_V121 geometry, int regime, string &reason)
++bool IsGeometryApplicableV121(ENUM_POSITION_TYPE direction, ENUM_ENTRY_GEOMETRY_V121 geometry, int regime, string &reason, int side_slots_adjust) // V1.2.3.3 PENDING LIFECYCLE FIX
+ {
+    reason = "OK";
+ 
+@@ -3516,13 +3899,13 @@
+    }
+ 
+    bool neutral_momentum_v123 = (UsarExtracaoContinuaV123 && PermitirMomentumNeutroV123 && regime == 0);
+-   if(geometry == ENTRY_GEOMETRY_MOMENTUM && !neutral_momentum_v123 && !CanAddTowardBiasV122(direction))
++   if(geometry == ENTRY_GEOMETRY_MOMENTUM && !neutral_momentum_v123 && !CanAddTowardBiasV122(direction, side_slots_adjust))
+    {
+       reason = "bias_bloqueia_momentum";
+       return false;
+    }
+ 
+-   if(geometry == ENTRY_GEOMETRY_RECOVERY && !CanAddCounterBiasRecoveryV122(direction))
++   if(geometry == ENTRY_GEOMETRY_RECOVERY && !CanAddCounterBiasRecoveryV122(direction, side_slots_adjust))
+    {
+       reason = "bias_limite_recovery";
+       return false;
+@@ -4242,6 +4625,13 @@
+    ENUM_POSITION_TYPE direction = (buy_side ? POSITION_TYPE_BUY : POSITION_TYPE_SELL);
+    int regime = DetectRegimeConfirmadoV121();
+ 
++   // V1.2.3.3 PENDING LIFECYCLE FIX: ao reavaliar a pendente existente
++   // (exclude_order_ticket > 0) o proprio ticket nao conta como slot ocupado.
++   // Na V1.2.3.2 a exclusao valia apenas para a zona; nos limites de bias a
++   // ordem contava contra si mesma, era cancelada como "invalida_bias_*" e
++   // recriada no tick seguinte, gerando o loop CREATE->CANCEL->CREATE.
++   int side_slots_adjust = PendingSideSlotAdjustV1233(buy_side, exclude_order_ticket);
++
+    if(regime > 0)
+       geometry = (buy_side ? ENTRY_GEOMETRY_MOMENTUM : ENTRY_GEOMETRY_RECOVERY);
+    else if(regime < 0)
+@@ -4249,14 +4639,14 @@
+    else
+       geometry = ENTRY_GEOMETRY_RECOVERY;
+ 
+-   if(!IsGeometryApplicableV121(direction, geometry, regime, reason))
++   if(!IsGeometryApplicableV121(direction, geometry, regime, reason, side_slots_adjust))
+       return false;
+ 
+    if(MathAbs(regime) == 2 && geometry == ENTRY_GEOMETRY_RECOVERY)
+    {
+       bool counter_extreme = ((direction == POSITION_TYPE_BUY && regime < 0) ||
+                               (direction == POSITION_TYPE_SELL && regime > 0));
+-      if(counter_extreme && CountRecoveryContraExtremaV121(direction) >= MaxEntradasRecoveryContraExtremaV121)
++      if(counter_extreme && CountRecoveryContraExtremaV121(direction) + side_slots_adjust >= MaxEntradasRecoveryContraExtremaV121)
+       {
+          reason = "limite_recovery_contra_extrema";
+          LogMessage("[EXTREME_REGIME_POLICY_V121] pending direction=" + DirectionToTextV121(direction) +
+@@ -4355,26 +4745,32 @@
+ 
+    if(!UseDynamicPendingOrders)
+    {
+-      CancelAllPendingOrders();
++      CancelAllPendingOrders(PENDING_CANCEL_REASON_STRUCTURAL_INVALIDATION); // V1.2.3.3 PENDING LIFECYCLE FIX
+       return;
+    }
+ 
+    int open_positions = CountOpenPositions();
+    if(open_positions <= 0)
+    {
+-      CancelAllPendingOrders();
++      CancelAllPendingOrders(PENDING_CANCEL_REASON_GLOBAL_CLOSE); // V1.2.3.3 PENDING LIFECYCLE FIX
+       return;
+    }
+ 
+    if(open_positions >= LimitOpenPositions())
+    {
+-      CancelAllPendingOrders();
++      CancelAllPendingOrders(PENDING_CANCEL_REASON_STRUCTURAL_INVALIDATION); // V1.2.3.3 PENDING LIFECYCLE FIX
+       return;
+    }
+ 
+    if(!IsPendingFiltersOK())
+       return;
+ 
++   // V1.2.3.3 PENDING LIFECYCLE FIX: um replacement de tipo reservado tem
++   // prioridade sobre reposicionamento e novas criacoes do mesmo lado.
++   ProcessPendingReplacementV1233();
++   if(g_pendingMutationSentThisTickV1231)
++      return;
++
+    RepositionDynamicPendingOrders();
+    if(g_pendingMutationSentThisTickV1231)
+       return;
+@@ -4421,6 +4817,15 @@
+       return false;
+    if(g_pendingMutationSentThisTickV1231 || PendingLifecycleBusyV1231(true))
+       return false;
++   // V1.2.3.3 PENDING LIFECYCLE FIX: durante replacement reservado somente o
++   // driver transacional pode criar a substituta deste lado.
++   if(PendingReplaceActiveV1233(true))
++   {
++      g_pendingRecreateBlockedV1233++;
++      LogThrottledV1232("recreate_blocked_buy_replacement",
++                        "[V1233_PENDING_RECREATE_BLOCKED] lado=BUY motivo=replacement_ativo", 10);
++      return false;
++   }
+    if(CountPendingBuyOrders() >= LimitPendingBuyOrders())
+       return false;
+ 
+@@ -4492,6 +4897,15 @@
+       return false;
+    if(g_pendingMutationSentThisTickV1231 || PendingLifecycleBusyV1231(false))
+       return false;
++   // V1.2.3.3 PENDING LIFECYCLE FIX: durante replacement reservado somente o
++   // driver transacional pode criar a substituta deste lado.
++   if(PendingReplaceActiveV1233(false))
++   {
++      g_pendingRecreateBlockedV1233++;
++      LogThrottledV1232("recreate_blocked_sell_replacement",
++                        "[V1233_PENDING_RECREATE_BLOCKED] lado=SELL motivo=replacement_ativo", 10);
++      return false;
++   }
+    if(CountPendingSellOrders() >= LimitPendingSellOrders())
+       return false;
+ 
+@@ -4584,6 +4998,9 @@
+       bool buy_side = IsBuyPendingType(current_type);
+       if(PendingLifecycleBusyV1231(buy_side))
+          continue;
++      // V1.2.3.3 PENDING LIFECYCLE FIX: lado sob replacement pertence ao driver
++      if(PendingReplaceActiveV1233(buy_side))
++         continue;
+       ENUM_ORDER_TYPE desired_type;
+       double desired_price = 0.0;
+       ENUM_ENTRY_GEOMETRY_V121 geometry = ENTRY_GEOMETRY_RECOVERY;
+@@ -4613,7 +5030,12 @@
+          if(UsarMotorAgressivoV121 && UsarEntradasDirecionaisIndependentes)
+          {
+             g_pendingRegimeInvalidationsV1231++;
+-            if(RequestPendingCancelV1231(buy_side, ticket, "invalida_" + pending_reason))
++            // V1.2.3.3 PENDING LIFECYCLE FIX: invalidacao genuina (avaliada sem o
++            // proprio slot da ordem) recebe motivo estrutural explicito.
++            ENUM_PENDING_CANCEL_REASON_V1233 invalid_code =
++               (pending_reason == "preco_pendente_invalido" ? PENDING_CANCEL_REASON_INVALID_PRICE
++                                                            : PENDING_CANCEL_REASON_STRUCTURAL_INVALIDATION);
++            if(RequestPendingCancelV1231(buy_side, ticket, invalid_code, "invalida_" + pending_reason))
+                LogMessage("[ENTRY_BLOCKED_V121] pending invalidated reason=" + pending_reason);
+          }
+          if(g_pendingMutationSentThisTickV1231)
+@@ -4633,8 +5055,45 @@
+ 
+       if(wrong_type)
+       {
+-         if(RequestPendingCancelV1231(buy_side, ticket, "mudanca_tipo_pendente"))
++         // V1.2.3.3 PENDING LIFECYCLE FIX: mudanca estrutural real de tipo
++         // (stop <-> limit) vira replacement transacional. A substituta e
++         // validada ANTES do cancelamento, o tipo fica reservado, o gerenciador
++         // do lado fica bloqueado e o driver cria exatamente a ordem reservada
++         // apos a confirmacao do servidor (REPLACED / RELEASED / TIMEOUT).
++         double replace_lot = NormalizeVolume(FixedLot);
++         string replace_reason = "";
++         double replace_margin = 0.0;
++         if(!HasMarginForOrderV122(desired_type, replace_lot, desired_price, replace_reason, replace_margin))
++         {
++            LogThrottledV1232("replace_margin_blocked_" + (buy_side ? "BUY" : "SELL"),
++                              "[V1233_PENDING_MUTATION_BLOCKED] origem=replacement ticket=" + IntegerToString((int)ticket) +
++                              " motivo=sem_margem_substituta", 10);
++            continue;
++         }
++         if(RequestPendingCancelV1231(buy_side, ticket, PENDING_CANCEL_REASON_REPLACE_ORDER_TYPE, "mudanca_tipo_pendente"))
++         {
++            g_pendingReplaceRequestsV1233++;
++            if(buy_side)
++            {
++               g_buyPendingReplaceActiveV1233 = true;
++               g_buyPendingReplaceTypeV1233 = desired_type;
++               g_buyPendingReplaceOldTicketV1233 = ticket;
++               g_buyPendingReplaceSinceV1233 = TimeCurrent();
++            }
++            else
++            {
++               g_sellPendingReplaceActiveV1233 = true;
++               g_sellPendingReplaceTypeV1233 = desired_type;
++               g_sellPendingReplaceOldTicketV1233 = ticket;
++               g_sellPendingReplaceSinceV1233 = TimeCurrent();
++            }
++            LogMessage("[V1233_PENDING_REPLACE_RESERVED] lado=" + (buy_side ? "BUY" : "SELL") +
++                       " ticket_antigo=" + IntegerToString((int)ticket) +
++                       " tipo_atual=" + EnumToString(current_type) +
++                       " tipo_reservado=" + EnumToString(desired_type) +
++                       " preco_alvo=" + DoubleToString(desired_price, _Digits));
+             LogMessage("[V123_PENDING_TYPE_CHANGED] ticket=" + IntegerToString((int)ticket));
++         }
+          if(g_pendingMutationSentThisTickV1231)
+             return;
+          continue;
+@@ -4684,20 +5143,29 @@
+    if(open_positions <= 0 || open_positions >= LimitOpenPositions())
+    {
+       if(CountPendingOrders() > 0)
+-         CancelAllPendingOrders();
++         CancelAllPendingOrders(open_positions <= 0 ? PENDING_CANCEL_REASON_GLOBAL_CLOSE
++                                                    : PENDING_CANCEL_REASON_STRUCTURAL_INVALIDATION); // V1.2.3.3 PENDING LIFECYCLE FIX
+       return;
+    }
+ 
+    if(!AllowTrading || !IsSpreadOK() || !IsTradingHourOK() || IsNewsBlocked() || g_dailyLossBlocked || g_dailyProfitBlocked || g_basketDDBlocked)
+    {
+       if(CountPendingOrders() > 0)
+-         CancelAllPendingOrders();
++      {
++         // V1.2.3.3 PENDING LIFECYCLE FIX: classifica o bloqueio ativo
++         ENUM_PENDING_CANCEL_REASON_V1233 block_code = PENDING_CANCEL_REASON_STRUCTURAL_INVALIDATION;
++         if(!AllowTrading)
++            block_code = PENDING_CANCEL_REASON_SYMBOL_DISABLED;
++         else if(g_dailyLossBlocked || g_dailyProfitBlocked || g_basketDDBlocked)
++            block_code = PENDING_CANCEL_REASON_RISK_EMERGENCY;
++         CancelAllPendingOrders(block_code);
++      }
+       return;
+    }
+ 
+    if(open_positions + CountPendingOrders() > LimitOpenPositions())
+    {
+-      CancelAllPendingOrders();
++      CancelAllPendingOrders(PENDING_CANCEL_REASON_STRUCTURAL_INVALIDATION); // V1.2.3.3 PENDING LIFECYCLE FIX
+       return;
+    }
+ 
+@@ -4720,14 +5188,23 @@
+       if(!IsPendingOrderType(type))
+          continue;
+ 
++      // V1.2.3.3 PENDING LIFECYCLE FIX: lado sob replacement pertence ao driver
++      if(PendingReplaceActiveV1233(IsBuyPendingType(type)))
++         continue;
++
+       datetime expiration = (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION);
+       bool expired = (expiration > 0 && expiration <= TimeCurrent());
+       bool delete_order = expired;
+       string reason = "";
++      // V1.2.3.3 PENDING LIFECYCLE FIX: motivo explicito por cancelamento
++      ENUM_PENDING_CANCEL_REASON_V1233 cancel_code =
++         (expired ? PENDING_CANCEL_REASON_EXPIRED : PENDING_CANCEL_REASON_NONE);
+ 
+       if(IsBuyPendingType(type) && !HasDirectionalSlotRoom(POSITION_TYPE_BUY, 0, 0.0, reason))
+       {
+          delete_order = true;
++         if(cancel_code == PENDING_CANCEL_REASON_NONE)
++            cancel_code = PENDING_CANCEL_REASON_STRUCTURAL_INVALIDATION;
+          LogMessage("[PENDING_INVALIDATED] direcao=BUY motivo=" + reason);
+       }
+ 
+@@ -4736,12 +5213,16 @@
+          BloquearContraTendenciaExtrema && regime == -2)
+       {
+          delete_order = true;
++         if(cancel_code == PENDING_CANCEL_REASON_NONE)
++            cancel_code = PENDING_CANCEL_REASON_STRUCTURAL_INVALIDATION;
+          LogMessage("[PENDING_INVALIDATED] direcao=BUY motivo=contra_tendencia_extrema");
+       }
+ 
+       if(IsSellPendingType(type) && !HasDirectionalSlotRoom(POSITION_TYPE_SELL, 0, 0.0, reason))
+       {
+          delete_order = true;
++         if(cancel_code == PENDING_CANCEL_REASON_NONE)
++            cancel_code = PENDING_CANCEL_REASON_STRUCTURAL_INVALIDATION;
+          LogMessage("[PENDING_INVALIDATED] direcao=SELL motivo=" + reason);
+       }
+ 
+@@ -4749,13 +5230,19 @@
+          BloquearContraTendenciaExtrema && regime == 2)
+       {
+          delete_order = true;
++         if(cancel_code == PENDING_CANCEL_REASON_NONE)
++            cancel_code = PENDING_CANCEL_REASON_STRUCTURAL_INVALIDATION;
+          LogMessage("[PENDING_INVALIDATED] direcao=SELL motivo=contra_tendencia_extrema");
+       }
+ 
+       if(IsBuyPendingType(type))
+       {
+          if(keep_buy || kept_total >= LimitPendingOrders())
++         {
+             delete_order = true;
++            if(cancel_code == PENDING_CANCEL_REASON_NONE)
++               cancel_code = PENDING_CANCEL_REASON_RECONCILIATION; // V1.2.3.3: duplicada alem do limite
++         }
+          else
+          {
+             keep_buy = true;
+@@ -4765,7 +5252,11 @@
+       else if(IsSellPendingType(type))
+       {
+          if(keep_sell || kept_total >= LimitPendingOrders())
++         {
+             delete_order = true;
++            if(cancel_code == PENDING_CANCEL_REASON_NONE)
++               cancel_code = PENDING_CANCEL_REASON_RECONCILIATION; // V1.2.3.3: duplicada alem do limite
++         }
+          else
+          {
+             keep_sell = true;
+@@ -4776,7 +5267,9 @@
+       if(delete_order)
+       {
+          bool buy_side = IsBuyPendingType(type);
+-         if(RequestPendingCancelV1231(buy_side, ticket,
++         if(cancel_code == PENDING_CANCEL_REASON_NONE)
++            cancel_code = PENDING_CANCEL_REASON_STRUCTURAL_INVALIDATION;
++         if(RequestPendingCancelV1231(buy_side, ticket, cancel_code,
+                                       (expired ? "expirada_ou_invalida" : "invalida_ou_duplicada")))
+             LogMessage("cancelamento de pendentes.");
+          if(g_pendingMutationSentThisTickV1231)
+@@ -4785,13 +5278,19 @@
+    }
+ }
+ 
+-void CancelAllPendingOrders()
++void CancelAllPendingOrders(ENUM_PENDING_CANCEL_REASON_V1233 reason_code) // V1.2.3.3 PENDING LIFECYCLE FIX
+ {
+    if(IsMarketHandoffActiveV1232())
+    {
+       g_marketHandoffReleasedV1232++;
+       ClearMarketEntryHandoffV1232("cancelamento_global_ou_risco");
+    }
++   // V1.2.3.3 PENDING LIFECYCLE FIX: um cancelamento global encerra qualquer
++   // replacement reservado; a substituta nao pode nascer durante risco/flat.
++   if(PendingReplaceActiveV1233(true))
++      ReleasePendingReplacementV1233(true, "cancelamento_global_" + PendingCancelReasonTextV1233(reason_code));
++   if(PendingReplaceActiveV1233(false))
++      ReleasePendingReplacementV1233(false, "cancelamento_global_" + PendingCancelReasonTextV1233(reason_code));
+    if(g_pendingMutationSentThisTickV1231)
+       return;
+ 
+@@ -4811,7 +5310,7 @@
+          continue;
+ 
+       bool buy_side = IsBuyPendingType(type);
+-      if(RequestPendingCancelV1231(buy_side, ticket, "cancelar_todas_pendentes"))
++      if(RequestPendingCancelV1231(buy_side, ticket, reason_code, "cancelar_todas_pendentes", true))
+          LogMessage("cancelamento de pendentes.");
+       // Uma unica autoridade e uma unica mutacao por tick, mesmo durante
+       // encerramentos. As demais pendentes sao reconciliadas nos ticks seguintes.
+@@ -5122,7 +5621,7 @@
+    if(CountOpenPositions() > 0 || CountPendingOrders() > 0)
+       StartClosingScopeV122("close_all_basket");
+    if(CountPendingOrders() > 0)
+-      CancelAllPendingOrders();
++      CancelAllPendingOrders(PENDING_CANCEL_REASON_GLOBAL_CLOSE); // V1.2.3.3 PENDING LIFECYCLE FIX
+    SetExitStateV122(EXIT_CLOSING_POSITIONS, "close_all_basket");
+ 
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+@@ -5570,7 +6069,7 @@
+    {
+       g_basketDDBlocked = true;
+       SetStatus("DD BLOQUEADO", "bloqueio por DD");
+-      CancelAllPendingOrders();
++      CancelAllPendingOrders(PENDING_CANCEL_REASON_RISK_EMERGENCY); // V1.2.3.3 PENDING LIFECYCLE FIX
+    }
+ 
+    if(close_loss > 0.0 && profit <= -close_loss)
+@@ -5619,7 +6118,7 @@
+    {
+       g_accountDailyLossBlocked = true;
+       SetStatus("LOSS DIARIO", "bloqueio por loss diario da conta");
+-      CancelAllPendingOrders();
++      CancelAllPendingOrders(PENDING_CANCEL_REASON_RISK_EMERGENCY); // V1.2.3.3 PENDING LIFECYCLE FIX
+ 
+       if(FecharEsteEASeLossConta && CountOpenPositions() > 0)
+       {

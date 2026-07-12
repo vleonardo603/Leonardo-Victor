@@ -1,0 +1,60 @@
+============================================================
+V1.2.3.4 EXIT MFE SERVER SL FIX — LOG DE COMPILACAO
+Data: 2026-07-12
+Arquivo: IA_FUNDED_GOLD_V1.2.3.4_EXIT_MFE_SERVER_SL_FIXED.mq5
+Base: IA_FUNDED_GOLD_V1.2.3.3_PENDING_LIFECYCLE_FIXED.mq5 (7438 linhas)
+============================================================
+
+STATUS: COMPILACAO NAO EXECUTADA NESTE AMBIENTE — NAO COMPROVADO 0/0.
+
+Motivo (declarado honestamente, sem inventar resultado):
+Este patch foi produzido em um container Linux remoto sem MetaTrader 5 /
+MetaEditor / Wine instalados. Nao existe compilador MQL5 disponivel aqui,
+portanto:
+
+  - NAO foi gerado o arquivo .ex5;
+  - NAO existe log real "0 errors / 0 warnings" para anexar;
+  - NAO foi executado backtest de validacao.
+
+Verificacoes estaticas realizadas em substituicao (todas OK):
+
+  1. Balanceamento estrutural do arquivo inteiro apos remocao de strings
+     e comentarios: braces=0, parens=0, brackets=0 -> OK
+  2. Nenhuma string sem terminacao -> OK
+  3. As 10 funcoes novas (sufixo V1234) possuem exatamente 1 declaracao
+     antecipada + 1 definicao cada:
+     PriceDistanceToUSDV1234, FindExitTicketStateV1234,
+     RemoveExitTicketStateV1234, SyncExitTicketStatesV1234,
+     ProtectionDesiredSLV1234, ServerSLSatisfiesLevelV1234,
+     RequestProtectionSLV1234, CloseSingleTicketV1234,
+     ManageExitProtectionV1234, BlockGenericBasketExitV1234 -> OK
+  4. Todos os 12 inputs novos sao referenciados no codigo -> OK
+  5. Todos os helpers reutilizados existem no arquivo-base:
+     GetSelectedPositionProfitWithCosts, USDToPriceDistance,
+     ClassifySideV123, IsSLValid, ModifyPositionSL,
+     IsTradeRetcodeSuccessV122, LogThrottledV1232, NormalizePrice,
+     IsClosingScopeActiveV122, LogMessage, trade.PositionClose,
+     trade.PositionModify -> OK
+  6. Auditoria por hash MD5 de TODAS as funcoes: somente
+     GerenciarProtecaoLucroCestaMFE, ManagePriceBasedBasketClosing,
+     ModifyPositionSL, OnInit, OnDeinit, OnTick e UpdatePanel foram
+     alteradas; nenhuma funcao de entrada/pendentes/risco/lote mudou;
+     nenhuma funcao foi removida -> OK
+  7. Nenhum tipo externo novo, nenhum include novo, nenhuma macro
+     conflitante (EXIT_TICKET_STATE_MAX_V1234 e nova e unica) -> OK
+
+ACAO NECESSARIA DO USUARIO:
+  1. Abrir IA_FUNDED_GOLD_V1.2.3.4_EXIT_MFE_SERVER_SL_FIXED.mq5 no MetaEditor.
+  2. Compilar (F7). Resultado esperado: 0 errors / 0 warnings.
+  3. Se aparecer qualquer erro, ele estara restrito as linhas do patch
+     (ver v1234_exit_mfe_server_sl_diff.txt).
+  4. Rodar novo backtest com EnableLogs=true e filtrar os logs:
+     [EXIT_ONLY_AUDIT] [MFE_UPDATED] [WEAK_MAX_LOSS_TRIGGER]
+     [WEAK_CLOSE_REQUEST] [WEAK_CLOSE_CONFIRMED] [WEAK_CLOSE_FAILED]
+     [BE_MFE_TRIGGER] [LOCK_MFE_TRIGGER] [SL_MODIFY_REQUEST]
+     [SL_MODIFY_RETCODE] [SL_SERVER_CONFIRMED] [SL_SERVER_NOT_CONFIRMED]
+     [SL_MONOTONIC_BLOCK] [GOOD_SMALL_PROFIT_EXIT_BLOCKED]
+     [RUNNER_GENERIC_EXIT_BLOCKED] [PROFIT_MEMORY_PROTECTION]
+     [EMERGENCY_GIVEBACK_TRIGGER] [EXIT_AUTHORITY_DECISION]
+     [GIVEBACK_CLOSE_REQUEST] [GIVEBACK_CLOSE_CONFIRMED]
+============================================================

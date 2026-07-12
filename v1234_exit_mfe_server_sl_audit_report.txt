@@ -1,0 +1,358 @@
+================================================================================
+AUDITORIA E CORRECAO CIRURGICA DA GESTAO DE SAIDA
+V1.2.3.3 (base) -> V1.2.3.4 EXIT MFE SERVER SL FIXED
+Data: 2026-07-12
+Arquivo-base unico: IA_FUNDED_GOLD_V1.2.3.3_PENDING_LIFECYCLE_FIXED.mq5 (7438 linhas)
+Arquivo entregue:   IA_FUNDED_GOLD_V1.2.3.4_EXIT_MFE_SERVER_SL_FIXED.mq5 (8172 linhas)
+Evidencia complementar: LIFECYCLE.html (Strategy Tester, XAUUSD M15,
+2026.07.01-07.03, FTMO-Demo, ticks reais 100%)
+================================================================================
+
+--------------------------------------------------------------------------------
+FASE 1 — AUDITORIA FORENSE (ANTES DO PATCH)
+--------------------------------------------------------------------------------
+
+Observacao estrutural fundamental (comprovada no codigo-base):
+
+a) O EA NAO possui classes MODERATE, GOOD nem BIG_RUNNER. O classificador
+   real e ClassifySideV123() e devolve, POR LADO (nao por ticket):
+   ABSENT / PROTECTED / RECOVERY / BALANCED / RUNNER / STRONG / WEAK.
+   O patch NAO altera esse classificador. O mapeamento adotado (documentado,
+   sem criar classificacao nova de entrada):
+     - WEAK        -> classe existente "WEAK" (lado contra o bias com lucro<0)
+     - MODERATE    -> qualquer ticket cujo MFE monetario atinja os gatilhos
+                      de BE/Lock (nova memoria por ticket, sem nova classe)
+     - GOOD        -> ticket com lucro atual na faixa +5..+10 USD
+     - RUNNER      -> classes existentes "RUNNER"/"PROTECTED" (lado vencedor)
+     - BIG_RUNNER  -> INEXISTENTE no codigo (NAO COMPROVADO como classe);
+                      coberto pela mesma preservacao do RUNNER + ticket com
+                      direito de Lock por MFE (>= US$16).
+
+b) O EA NAO possui MFE por ticket. Existe apenas MFE da CESTA
+   (g_PicoLucroCestaUSD, AtualizarPicoLucroCesta, linha ~6161 do base).
+
+c) Nao existem funcoes SMALL_PROFIT_EXIT / QUICK_PROFIT_EXIT / SMART_EXIT /
+   TIME_EXIT / PULLBACK_EXIT por ticket. As "saidas genericas de lucro
+   pequeno" reais sao de CESTA:
+     - ManagePriceBasedBasketClosing (fecha TUDO com cesta >= US$5 ao tocar
+       a linha dinamica; linha ~5855 do base);
+     - GerenciarProtecaoLucroCestaMFE ramo LOCK (fecha TUDO quando pico da
+       cesta >= US$15 e lucro atual <= US$7; linha ~6239 do base).
+
+TABELA DA AUDITORIA (linhas do arquivo-base V1.2.3.3):
+
+| Acao               | Funcao                          | Linha aprox. | Usa lucro atual | Usa MFE            | Modifica SL | Fecha posicao |
+| ------------------ | ------------------------------- | -----------: | --------------- | ------------------ | ----------- | ------------- |
+| Classificacao      | ClassifySideV123                |         5723 | SIM (por lado)  | NAO                | NAO         | NAO           |
+| Atualizacao do MFE | AtualizarPicoLucroCesta         |         6161 | SIM             | So da CESTA        | NAO         | NAO           |
+| Break-even         | ManageBreakEven                 |         5897 | SIM (gatilho    | NAO                | SIM (via    | NAO           |
+|                    |                                 |              | instantaneo)    |                    | ModifyPositionSL) |         |
+| Lock               | INEXISTENTE por ticket          |            - | -               | -                  | -           | -             |
+|                    | (cesta: GerenciarProtecaoLucro- |         6193 | SIM             | So da CESTA        | NAO         | SIM (fecha    |
+|                    | CestaMFE fecha, nao trava SL)   |              |                 |                    |             | a cesta toda) |
+| Trailing           | ManageSmartTrailing             |         5949 | SIM (gatilho    | NAO                | SIM         | NAO           |
+|                    |                                 |              | instantaneo)    |                    |             |               |
+| Saida WEAK         | TryExtractWeakSideV123          |         5773 | SIM (cesta e    | NAO                | NAO         | SIM (lado     |
+|                    | (sem teto de perda por ticket)  |              | lado forte)     |                    |             | fraco inteiro)|
+| Saida GOOD         | ManagePriceBasedBasketClosing / |    5855/6239 | SIM (cesta)     | So da CESTA        | NAO         | SIM (cesta    |
+|                    | GerenciarProtecaoLucroCestaMFE  |              |                 |                    |             | toda)         |
+| Saida RUNNER       | mesmas rotinas de cesta acima + |    5816/5855 | SIM (cesta)     | So da CESTA        | NAO         | SIM (cesta    |
+|                    | ManageBasketClosing (alvo)      |        /6239 |                 |                    |             | toda)         |
+| PositionModify     | ModifyPositionSL                |         7159 | n/a             | n/a                | SIM (por    | NAO           |
+|                    |                                 |              |                 |                    | ticket)     |               |
+| PositionClose      | CloseAllBasket / CloseBuyBasket |    5618/5650 | n/a             | n/a                | NAO         | SIM (por      |
+|                    | / CloseSellBasket               |        /5682 |                 |                    |             | ticket, loop) |
+
+--------------------------------------------------------------------------------
+CAUSAS RAIZ (com funcao, linha, condicao, consequencia e prova)
+--------------------------------------------------------------------------------
+
+CAUSA RAIZ 1 — COMPROVADA — Nao existe teto de perda por ticket.
+  Funcao: nenhuma (ausencia comprovada). Os unicos fechamentos de posicao no
+  base sao CloseAllBasket/CloseBuyBasket/CloseSellBasket (5618/5650/5682),
+  todos coletivos. Limites de risco sao apenas de CESTA/dia (DD 350/600,
+  loss diario 700).
+  Condicao defeituosa: ticket perdedor (lado WEAK) nunca e cortado
+  individualmente.
+  Consequencia: perdas individuais de -50/-70/-90 USD.
+  Prova no codigo: nao ha nenhum PositionClose fora das tres funcoes de
+  cesta. Prova no HTML: 11 saidas <= -50 USD; maior perda -90.88; loss medio
+  -35.96 vs lucro medio +10.81; fechamento em grupo de 2026.07.01 14:19:18
+  liquidou tickets a -50.49 / -59.49 / -63.62; final do teste com 5 BUY
+  abertos a -66.96..-90.14 (net -397.31) sem nenhuma protecao.
+
+CAUSA RAIZ 2 — COMPROVADA — Protecao usa somente lucro instantaneo; nao ha
+  MFE por ticket; o "direito" a protecao desaparece no pullback.
+  Funcao: ManageBreakEven, linha 5913-5914 do base:
+     double profit = GetSelectedPositionProfitWithCosts();
+     if(profit < BreakEvenStartUSD || profit <= 0.0) continue;
+  e ManageSmartTrailing, linha 5965-5966 (mesmo padrao com
+  Minimum_trailing_profit).
+  Condicao defeituosa: o gatilho exige lucro atual >= 6 (BE) / >= 8
+  (trailing) NO INSTANTE do tick. Um ticket que fez MFE +20 e recuou para +5
+  e tratado como se nunca tivesse lucrado.
+  Consequencia: (i) posicao com MFE relevante volta livremente para
+  -50/-90; (ii) quando o BE chega a ser aplicado, trava apenas +1 USD
+  (BreakEvenLockUSD) e todo o MFE e devolvido.
+  Prova no codigo: linhas acima. Prova no HTML: das 45 saidas por SL, 43
+  sairam a ~+0.29..+3.00 USD (o lock de +1 do BE legado) — MFE devolvido; e
+  os tickets que nunca reataram o gatilho morreram a -50/-65.
+  Nao existe nenhum tier de Lock intermediario (+16 -> +4) no base.
+
+CAUSA RAIZ 3 — COMPROVADA — Saidas genericas de cesta com lucro pequeno
+  matam vencedoras e forcam a realizacao de perdedoras profundas.
+  Funcoes: ManagePriceBasedBasketClosing (5855; BasketProfitUSD_MinConfirm=5)
+  e GerenciarProtecaoLucroCestaMFE ramo LOCK (6239; pico>=15 e atual<=7).
+  Condicao defeituosa: CloseAllBasket() com lucro liquido de apenas ~5-7 USD,
+  sem verificar classe/estado individual das posicoes.
+  Consequencia: RUNNER/GOOD encerrados com +35..+48 junto de perdedoras a
+  -50..-65, por um ganho liquido de ~5 USD.
+  Prova no HTML: grupos simultaneos 14:19:18 (net +5.90 com pernas -63.62 e
+  +47.81), 16:40:15 (net +1.81), 16:45:10 (net +5.11), 23:04:31 (net +6.42
+  com pernas -65.43 e +48.20), 04:02:28 (net +5.39 com pernas -22.05 e
+  +20.94).
+
+CAUSA RAIZ 4 — COMPROVADA (defeito de robustez, sem log para quantificar
+  ocorrencias) — ModifyPositionSL nao verifica trade.ResultRetcode().
+  Funcao: ModifyPositionSL, linha 7171 do base:
+     if(!trade.PositionModify(ticket, NormalizePrice(new_sl), current_tp))
+  Condicao defeituosa: usa apenas o retorno booleano; a documentacao do
+  CTrade exige verificar ResultRetcode(). Alem disso os chamadores ignoram o
+  retorno (sem cooldown/limite de tentativa) e nao existe nenhum estado
+  "protegido por ticket" no base.
+  Consequencia possivel: tratar como aplicado um SL rejeitado pelo servidor.
+  Frequencia real: NAO COMPROVADO (sem logs anteriores). O patch adiciona
+  [SL_MODIFY_RETCODE]/[SL_SERVER_CONFIRMED]/[SL_SERVER_NOT_CONFIRMED] para
+  medir no proximo backtest.
+
+DEFEITOS DA LISTA DE HIPOTESES — RESULTADO DA AUDITORIA:
+  - "classificacao usa MFE, protecao usa lucro atual": variante COMPROVADA
+    (protecao usa somente lucro instantaneo; MFE por ticket nem existe).
+  - "MFE diminui junto com lucro atual": NAO OCORRE para o MFE da cesta
+    (monotonico enquanto ha posicoes; linhas 6181-6184). Por ticket: MFE
+    inexistia (CAUSA RAIZ 2).
+  - "MFE zerado com posicao aberta": NAO OCORRE (reset apenas com 0 posicoes).
+  - "MFE de um ticket interfere em outro / BUY e SELL compartilham estado":
+    o unico MFE era da cesta inteira (compartilhado POR DESENHO). O novo
+    estado e por ticket.
+  - "PositionModify true sem confirmar POSITION_SL": parcialmente presente:
+    a releitura existia quando ConfirmarSLNoServidor=true, mas o retcode nao
+    era verificado (CAUSA RAIZ 4).
+  - "flag de protecao ativada antes da confirmacao": NAO COMPROVADO no base
+    porque flags de protecao nao existiam; o novo estado por ticket so liga
+    flag apos releitura do POSITION_SL.
+  - "uma funcao poe SL e outra remove/recua": NAO OCORRE no base
+    (ManageBreakEven so melhora: 5931-5941; trailing so melhora: 6031-6044).
+    O patch adiciona bloqueio monotonico estrutural em ModifyPositionSL como
+    defesa para qualquer chamador futuro.
+  - "GOOD fechado por lucro pequeno / RUNNER por smart exit generico":
+    COMPROVADO na forma de cesta (CAUSA RAIZ 3).
+  - "modificacao/fechamento por simbolo atingindo ticket errado": NAO OCORRE
+    (tudo por ticket: PositionClose(ticket), PositionModify(ticket)).
+  - "TP apagado durante PositionModify": NAO OCORRE (current_tp preservado
+    em todos os chamadores; agora tambem logado).
+  - "conversao USD->preco ignora volume/tick": NAO OCORRE
+    (USDToPriceDistance usa tick_value, tick_size e volume; reutilizado).
+  - "estado removido antes da confirmacao do encerramento": no base nao
+    havia estado por ticket; no patch a limpeza ocorre somente apos o ticket
+    sumir do servidor.
+  - "duas funcoes fecham o mesmo ticket no mesmo tick": mitigado no base
+    pelos early-returns do escopo de fechamento; o patch adiciona trava
+    g_exitCloseSentThisTickV1234 + cooldown por ticket.
+  - "SL modificado e posicao fechada no mesmo ciclo": possivel no base
+    (BE/trailing rodam antes das saidas de cesta) e inalterado por ser
+    comportamento pre-existente e inofensivo; a NOVA autoridade nunca
+    modifica e fecha o mesmo ticket no mesmo ciclo (continue apos close).
+
+--------------------------------------------------------------------------------
+FASE 2 — PATCH MINIMO APLICADO
+--------------------------------------------------------------------------------
+
+FUNCOES ALTERADAS (7, comprovado por hash MD5 de todas as funcoes):
+  1. OnTick                          +1 chamada (ManageExitProtectionV1234)
+     Justificativa: unico ponto de entrada da autoridade por ticket, apos o
+     risco diario e antes de BE/trailing/saidas de cesta (hierarquia).
+  2. ManagePriceBasedBasketClosing   +guard BlockGenericBasketExitV1234
+     Justificativa: e a saida generica de lucro pequeno (>=US$5) que matava
+     GOOD/RUNNER (CAUSA RAIZ 3). TryExtractWeakSideV123 continua rodando
+     ANTES (extracao do lado fraco preservada).
+  3. GerenciarProtecaoLucroCestaMFE  +guard no ramo LOCK apenas
+     Justificativa: o LOCK da cesta (pico>=15, atual<=7) e "fechamento
+     porque o lucro atual ficou menor que o MFE" — proibido para GOOD/RUNNER.
+     O ramo HARD (pico>=30), os alvos, o DD e o loss diario NAO foram tocados.
+  4. ModifyPositionSL                retcode verificado + bloqueio monotonico
+     estrutural + logs [SL_MODIFY_REQUEST]/[SL_MODIFY_RETCODE]/
+     [SL_SERVER_CONFIRMED]/[SL_SERVER_NOT_CONFIRMED] + posicao inexistente
+     tratada como encerramento. Justificativa: CAUSA RAIZ 4 e requisito de
+     SL monotonico; beneficia tambem BE/trailing legados sem mudar suas regras.
+  5. OnInit                          +1 log [EXIT_ONLY_AUDIT] com a config.
+  6. OnDeinit                        +1 log [EXIT_ONLY_AUDIT] resumo de
+     contadores (validacao do proximo backtest).
+  7. UpdatePanel                     string de versao (identificacao apenas).
+
+FUNCOES NOVAS (10, secao unica delimitada, sufixo V1234):
+  PriceDistanceToUSDV1234        conversao inversa do helper existente
+  FindExitTicketStateV1234       busca de estado por ticket
+  RemoveExitTicketStateV1234     limpeza (somente apos confirmacao)
+  SyncExitTicketStatesV1234      cria estado por posicao; MFE monotonico
+                                 peak=MathMax(peak,lucro); remove somente
+                                 quando o ticket nao existe mais no servidor
+  ProtectionDesiredSLV1234       SL alvo por direcao/volume/tick (helper
+                                 monetario existente USDToPriceDistance)
+  ServerSLSatisfiesLevelV1234    comparacao direcional com tolerancia de tick
+  RequestProtectionSLV1234       pipeline: cooldown/backoff -> selecionar
+                                 ticket -> capturar SL/TP -> normalizar ->
+                                 monotonico -> IsSLValid (stops/freeze/bid/
+                                 ask) -> ModifyPositionSL -> retcode ->
+                                 re-selecao -> POSITION_SL -> tolerancia ->
+                                 flag SOMENTE apos confirmacao
+  CloseSingleTicketV1234         fecha SO o ticket, verifica retcode,
+                                 confirma inexistencia, limpa estado depois
+  ManageExitProtectionV1234      autoridade por ticket: (1) teto WEAK
+                                 -12.50 com MFE<=5; (2) direitos BE(8)/
+                                 Lock(16) permanentes por MFE; (3) SL real
+                                 do tier pendente; (4) devolucao extrema
+                                 (peak-20) somente sem SL confirmado e com
+                                 tentativas esgotadas
+  BlockGenericBasketExitV1234    guard GOOD(+5..+10)/RUNNER/PROTECTED/
+                                 lockRight para as 2 saidas genericas
+
+INPUTS NOVOS (grupo "=== V1.2.3.4 EXIT PROTECTION ==="):
+  ExitProtection_Enable=true; WeakMaxLossUSD=12.50; WeakMaxMFEUSD=5.00;
+  BETriggerMFEUSD=8.00; BEProfitUSD=0.50; LockTriggerMFEUSD=16.00;
+  LockProfitUSD=4.00; GoodProfitMinUSD=5.00; GoodProfitMaxUSD=10.00;
+  ModifyCooldownSeconds=2; MaxModifyAttempts=3; EmergencyGivebackUSD=20.00.
+  Os inputs legados BreakEvenStartUSD/BreakEvenLockUSD/Minimum_trailing_profit
+  NAO foram alterados (BE e trailing legados continuam como complemento que
+  so pode MELHORAR o SL).
+
+ESTADO POR TICKET: struct ExitTicketStateV1234 (ticket, simbolo, magic,
+direcao, volume, preco de entrada, MFE de pico, ultimo lucro, direitos BE/
+Lock, confirmacoes BE/Lock, ultimo SL solicitado, SL confirmado do servidor,
+hora/contagem de tentativas de modify e de close). Array proprio, chave =
+ticket; BUY/SELL/tickets/magics nunca compartilham entrada. Sem persistencia
+externa nova (nao comprovada como causa raiz; limitacao documentada: reinicio
+do EA zera o MFE de pico para o lucro atual, e um SL ja existente no servidor
+e reconhecido e nunca piorado).
+
+HIERARQUIA RESULTANTE (por tick):
+  1. ManageDailyRisk / ManageDailyProfitTarget (inalterados)
+  2. AtualizarPicoLucroCesta (inalterado)
+  3. ManageExitProtectionV1234 (novo: MFE por ticket -> teto WEAK -> SL real
+     BE/Lock -> devolucao extrema)
+  4. ManageBreakEven / ManageSmartTrailing (inalterados; so melhoram SL)
+  5. ManageBasketClosing (alvo 25/50 + extracao lado fraco; inalterado)
+  6. ManagePriceBasedBasketClosing (com guard GOOD/RUNNER)
+  7. GerenciarProtecaoLucroCestaMFE (HARD inalterado; LOCK com guard)
+  8. ManageBasketDrawdown (inalterado)
+
+O guard NAO bloqueia: Hard Drawdown, Daily Loss, Emergency/risco da conta,
+fechamento forte por pico (>=30), alvos da cesta (25/50), extracao do lado
+fraco, SL real atingido, fechamento manual.
+
+--------------------------------------------------------------------------------
+VALIDACAO DOS CENARIOS OBRIGATORIOS (analise estatica do fluxo)
+--------------------------------------------------------------------------------
+Cenario 1  WEAK MFE+2 lucro-12.50: classe WEAK + peak(2)<=5 + lucro<=-12.50
+           -> [WEAK_MAX_LOSS_TRIGGER] -> CloseSingleTicketV1234 fecha SO o
+           ticket, verifica retcode, confirma inexistencia; estado limpo
+           depois. ATENDIDO.
+Cenario 2  MODERATE MFE+10 lucro+2: peak>=8 -> beRight permanente ->
+           RequestProtectionSLV1234(BE) -> SL open+0.50USD confirmado no
+           servidor -> flag so depois. ATENDIDO.
+Cenario 3  MODERATE MFE+20 lucro+5: peak>=16 -> lockRight -> SL protege +4;
+           pullback nao cancela (direito e flag nunca revertem). ATENDIDO.
+Cenario 4  GOOD lucro+7 MFE+14 e saida generica: BlockGenericBasketExitV1234
+           bloqueia PRICE_LINE/BASKET_MFE_LOCK; log
+           [GOOD_SMALL_PROFIT_EXIT_BLOCKED] com decisao HOLD. ATENDIDO.
+Cenario 5  GOOD evolui para RUNNER: o patch nunca fecha GOOD e o SL de
+           BE/Lock fica abaixo do preco; classificacao RUNNER e do
+           classificador legado (inalterado). NAO IMPEDIDO. ATENDIDO.
+Cenario 6  RUNNER pullback + saida generica: classe RUNNER/PROTECTED ou
+           lockRight -> [RUNNER_GENERIC_EXIT_BLOCKED]; so sai por SL real/
+           trailing/alvo/risco. ATENDIDO.
+Cenario 7  PositionModify true mas POSITION_SL divergente: retcode ok porem
+           releitura fora da tolerancia -> [SL_SERVER_NOT_CONFIRMED], flag
+           NAO liga, nova tentativa com cooldown 2s e backoff x10 apos 3
+           falhas. ATENDIDO.
+Cenario 8  BUY tentativa de reduzir SL: clamp MathMax + bloqueio
+           [SL_MONOTONIC_BLOCK] (na autoridade e tambem dentro de
+           ModifyPositionSL para qualquer chamador). ATENDIDO.
+Cenario 9  SELL tentativa de aumentar SL: simetrico com MathMin. ATENDIDO.
+Cenario 10 MFE atingiu gatilho e veio pullback: SL real ja solicitado no
+           tick do gatilho; se nao confirmado, retentativas + fallback de
+           devolucao extrema (peak-20) somente sem SL confirmado; posicao
+           nao volta livre para -50/-90 por falha logica interna. ATENDIDO.
+           (Gaps alem do SL sao risco de mercado, nao logico — documentado.)
+
+NAO COMPROVADO / LIMITACOES DECLARADAS:
+  - Compilacao 0 errors/0 warnings: NAO COMPROVADO neste ambiente (sem
+    MetaEditor); ver v1234_exit_mfe_server_sl_compile.log.
+  - Frequencia real de retcode invalido em PositionModify no historico:
+    NAO COMPROVADO (sem logs anteriores); logs novos medem no proximo teste.
+  - BIG_RUNNER como classe distinta: INEXISTENTE no codigo; coberto por
+    RUNNER/PROTECTED/lockRight.
+  - Ticket perdedor profundo com lado classificado RECOVERY (bias neutro)
+    nao recebe o teto WEAK, porque os criterios de classe sao intocaveis
+    por ordem expressa; o DD/loss diario seguem cobrindo esse caso.
+  - Comportamento em conta real com execucao assincrona: a confirmacao
+    re-le POSITION_SL no mesmo tick; se o servidor demorar, o tick seguinte
+    reconfirma (flag nunca liga sem releitura valida).
+
+--------------------------------------------------------------------------------
+TABELA DE REQUISITOS
+--------------------------------------------------------------------------------
+| Requisito                         | Funcao                                   | Evidencia                                    | Log                                   | Status |
+| --------------------------------- | ---------------------------------------- | -------------------------------------------- | ------------------------------------- | ------ |
+| WEAK limitado                     | ManageExitProtectionV1234 +               | predicado classe WEAK, lucro<=-12.50,        | WEAK_MAX_LOSS_TRIGGER,                | OK     |
+|                                   | CloseSingleTicketV1234                    | MFE<=5; fecha somente o ticket               | WEAK_CLOSE_REQUEST/CONFIRMED/FAILED   |        |
+| Break-even por MFE                | RequestProtectionSLV1234(false)           | direito permanente com peak>=8; SL +0.50     | BE_MFE_TRIGGER, SL_SERVER_CONFIRMED   | OK     |
+| Lock por MFE                      | RequestProtectionSLV1234(true)            | direito permanente com peak>=16; SL +4.00    | LOCK_MFE_TRIGGER, SL_SERVER_CONFIRMED | OK     |
+| GOOD protegido                    | BlockGenericBasketExitV1234               | faixa +5..+10 imune a PRICE_LINE e           | GOOD_SMALL_PROFIT_EXIT_BLOCKED        | OK     |
+|                                   |                                           | BASKET_MFE_LOCK                              |                                       |        |
+| RUNNER preservado                 | BlockGenericBasketExitV1234               | classes RUNNER/PROTECTED imunes as saidas    | RUNNER_GENERIC_EXIT_BLOCKED           | OK     |
+|                                   |                                           | genericas                                    |                                       |        |
+| BIG_RUNNER preservado             | idem (lockRight por MFE>=16)              | classe inexistente no EA; coberto pelo mesmo | RUNNER_GENERIC_EXIT_BLOCKED           | OK*    |
+|                                   |                                           | guard (*NAO COMPROVADO como classe distinta) |                                       |        |
+| SL real confirmado                | RequestProtectionSLV1234 +                | retcode + re-selecao + POSITION_SL +         | SL_MODIFY_REQUEST/RETCODE,            | OK     |
+|                                   | ModifyPositionSL                          | tolerancia de tick; flag so depois           | SL_SERVER_CONFIRMED/NOT_CONFIRMED     |        |
+| SL monotonico                     | ModifyPositionSL (estrutural) +           | BUY nunca reduz, SELL nunca aumenta          | SL_MONOTONIC_BLOCK                    | OK     |
+|                                   | clamp na autoridade                       | (clamp + bloqueio)                           |                                       |        |
+| TP preservado                     | ModifyPositionSL / RequestProtectionSL    | TP capturado do servidor e reenviado          | SL_MODIFY_REQUEST (tp_preservado=)    | OK     |
+| Estado isolado por ticket         | ExitTicketStateV1234[] +                  | chave=ticket; simbolo+magic registrados;     | EXIT_ONLY_AUDIT                       | OK     |
+|                                   | SyncExitTicketStatesV1234                 | limpeza so apos confirmacao no servidor      |                                       |        |
+| Protecao contra devolucao extrema | ManageExitProtectionV1234 (4)             | somente sem SL confirmado + tentativas       | EMERGENCY_GIVEBACK_TRIGGER,           | OK     |
+|                                   |                                           | esgotadas + devolucao >= 20                  | GIVEBACK_CLOSE_*                      |        |
+
+--------------------------------------------------------------------------------
+CONFIRMACAO DE NAO-ALTERACAO (auditoria por hash MD5 de todas as funcoes)
+--------------------------------------------------------------------------------
+IDENTICAS ao base (zero bytes de diferenca), entre outras:
+  Entradas/sinais: OpenBuySellPair, SendMarketOrderV122,
+    SelectAndExecuteCandidatesV121, BuildDirectionalCandidateV121,
+    ScoreEntryCandidateV121, ExecuteEntryCandidateV121, CanOpenDirectionalEntry
+  BUY/SELL, frequencia, lotes, layers, hedge: NormalizeVolume, FixedLot
+    (input), LimitOpenPositions/LimitBuy/LimitSell, HasDirectionalSlotRoom
+  Pendentes/Pending Lifecycle: ManageDynamicPendingOrders,
+    PlaceDynamicBuyPending, PlaceDynamicSellPending,
+    RepositionDynamicPendingOrders, CancelInvalidPendingOrders,
+    CancelAllPendingOrders, RequestPendingCreateV1231,
+    RequestPendingModifyV1231, RequestPendingCancelV1231,
+    ProcessPendingReplacementV1233, ProcessMarketEntryHandoffV1232
+  Score/filtros: EntryThresholdV121, BaseEntryFiltersOK, IsSpreadOK,
+    IsTradingHourOK, DetectPriceActionBias, DetectNativeVolumeFlow
+  Risk Governor: ManageDailyRisk, ManageBasketDrawdown,
+    ManageDailyProfitTarget, IsBasketHealthyForNewEntry
+  Classificador e extracao: ClassifySideV123, UpdateSideIdentificationV123,
+    TryExtractWeakSideV123
+  Saidas legadas: ManageBasketClosing, CloseAllBasket, CloseBuyBasket,
+    CloseSellBasket, ManageBreakEven, ManageSmartTrailing,
+    AtualizarPicoLucroCesta, ResetarPicoLucroCesta
+  Nenhuma funcao removida. Nenhum OrderSend de abertura tocado. Magic Number
+  e comentarios de ordem intactos.
+
+DIFF: 14 hunks, restritos a: cabecalho de versao, inputs novos, estado novo,
+declaracoes, OnInit/OnDeinit (logs), OnTick (1 chamada), guard em 2 saidas
+genericas, secao nova V1234, string de versao do painel e ModifyPositionSL.
+Arquivo completo do diff: v1234_exit_mfe_server_sl_diff.txt
+================================================================================

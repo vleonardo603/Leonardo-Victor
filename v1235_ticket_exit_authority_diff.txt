@@ -1,0 +1,1987 @@
+--- IA_FUNDED_GOLD_V1.2.3.4_EXIT_MFE_SERVER_SL_FIXED_FLEXIBLE_LOT.mq5	2026-07-12 18:09:56.780665888 +0000
++++ IA_FUNDED_GOLD_V1.2.3.5_BIDIRECTIONAL_TICKET_EXIT_AUTHORITY_FIXED_FLEXIBLE_LOT.mq5	2026-07-12 18:39:01.363672940 +0000
+@@ -1,6 +1,6 @@
+ #property strict
+-#property version   "1.234"
+-#property description "IA FUNDED GOLD V1.2.3.4 FLEXIBLE LOT - mesma logica operacional, com FixedLot liberado conforme limites do simbolo."
++#property version   "1.235"
++#property description "IA FUNDED GOLD V1.2.3.5 BIDIRECTIONAL TICKET EXIT AUTHORITY - autoridade de saida POR TICKET (teto absoluto do desprotegido, SL real confirmado, corte seletivo do lado fraco, preservacao do forte); base V1.2.3.4 FLEXIBLE LOT preservada."
+ 
+ #include <Trade/Trade.mqh>
+ 
+@@ -311,6 +311,35 @@
+ };
+ #define PENDING_CANCEL_REASON_COUNT_V1233 12
+ 
++// V1.2.3.5 BIDIRECTIONAL TICKET EXIT AUTHORITY
++// Estado operacional POR TICKET. A classe lateral (ClassifySideV123) continua
++// existindo APENAS como contexto de mercado, painel, entrada, bias e rebalance.
++// REGRA CENTRAL: side_class = CONTEXTO; ticket_state = AUTORIDADE DE SAIDA.
++enum ENUM_EXIT_TICKET_OPSTATE_V1235
++{
++   TICKET_NEW = 0,                  // estado recem-criado neste ciclo
++   TICKET_UNPROTECTED = 1,          // sem SL protetor real confirmado no servidor
++   TICKET_UNPROTECTED_LOW_MFE = 2,  // sem protecao e com MFE ainda baixo (diagnostico)
++   TICKET_BE_ELIGIBLE = 3,          // direito ao BE por MFE, SL ainda nao confirmado
++   TICKET_BE_CONFIRMED = 4,         // BE com SL real relido do servidor
++   TICKET_LOCK_ELIGIBLE = 5,        // direito ao Lock por MFE, SL ainda nao confirmado
++   TICKET_LOCK_CONFIRMED = 6,       // Lock com SL real relido do servidor
++   TICKET_RUNNER_CONFIRMED = 7,     // Lock confirmado + SL real protegendo lucro
++   TICKET_CLOSE_REQUESTED = 8,      // fechamento solicitado neste ciclo
++   TICKET_CLOSE_RECONCILING = 9,    // envio aceito, ticket ainda visivel no servidor
++   TICKET_CLOSED = 10               // encerramento confirmado no servidor
++};
++
++// V1.2.3.5: resultado da autoridade seletiva das saidas GENERICAS de cesta.
++// Substitui o bloqueio total (BlockGenericBasketExitV1234): um unico ticket
++// protegido NAO congela mais a cesta inteira.
++enum ENUM_GENERIC_EXIT_DECISION_V1235
++{
++   GENERIC_EXIT_ALLOW_FULL_CLOSE = 0,   // nenhum ticket com SL real confirmado: fechamento normal
++   GENERIC_EXIT_SELECTIVE_CLOSE_SENT = 1, // fechamento individual de ticket desprotegido enviado
++   GENERIC_EXIT_NO_ACTION = 2           // somente tickets protegidos restantes: preservar e seguir
++};
++
+ struct RebalanceCandidateV122
+ {
+    bool valid;
+@@ -507,11 +536,12 @@
+ int g_pendingRecreateBlockedV1233 = 0;
+ int g_pendingSwapSimBlockedV1233 = 0;
+ 
+-// ============================ V1.2.3.4 EXIT MFE SERVER SL FIX ============================
+-// Estado de protecao de saida ISOLADO POR TICKET. Nenhuma destas variaveis altera
+-// sinal, entrada, lote, pendentes ou risco; elas apenas registram MFE monetario,
+-// direitos de Break-even/Lock e a confirmacao do SL real no servidor.
+-struct ExitTicketStateV1234
++// ===================== V1.2.3.5 BIDIRECTIONAL TICKET EXIT AUTHORITY =====================
++// Estado de protecao de saida ISOLADO POR TICKET. Evolucao da ExitTicketStateV1234:
++// TODOS os campos existentes preservados; adicionados apenas MAE monotonico,
++// estado operacional, motivo da ultima decisao e controle de persistencia.
++// Nenhuma destas variaveis altera sinal, entrada, lote, pendentes ou risco.
++struct ExitTicketStateV1235
+ {
+    ulong    ticket;             // ticket da posicao no servidor
+    string   symbol;             // simbolo da posicao
+@@ -520,11 +550,12 @@
+    double   volume;             // volume real da posicao
+    double   openPrice;          // preco de entrada
+    double   peakMfeUsd;         // MFE monetario monotonico (nunca diminui)
++   double   maeUsd;             // V1.2.3.5: MAE monetario monotonico (nunca sobe)
+    double   lastProfitUsd;      // ultimo lucro atual lido
+    bool     beRight;            // direito permanente ao Break-even (por MFE)
+    bool     lockRight;          // direito permanente ao Lock (por MFE)
+-   bool     beConfirmed;        // BE confirmado no servidor (POSITION_SL lido)
+-   bool     lockConfirmed;      // Lock confirmado no servidor (POSITION_SL lido)
++   bool     beConfirmed;        // BE confirmado no servidor (POSITION_SL relido)
++   bool     lockConfirmed;      // Lock confirmado no servidor (POSITION_SL relido)
+    double   lastRequestedSL;    // ultimo SL solicitado
+    double   confirmedServerSL;  // ultimo SL real confirmado no servidor
+    datetime lastModifyAttempt;  // hora da ultima tentativa de SL
+@@ -532,21 +563,38 @@
+    datetime lastCloseAttempt;   // hora da ultima tentativa de fechamento
+    int      closeAttempts;      // tentativas consecutivas de fechamento
+    double   lastLoggedMfeUsd;   // ultimo MFE registrado em log (anti-spam)
++   int      opState;            // V1.2.3.5: ENUM_EXIT_TICKET_OPSTATE_V1235
++   string   lastDecisionReason; // V1.2.3.5: motivo da ultima decisao de autoridade
++   bool     restoredFromPersistence; // V1.2.3.5: estado restaurado apos reinicio
++   bool     runnerLogged;       // V1.2.3.5: RUNNER_TICKET_CONFIRMED ja registrado
++   double   lastPersistedMfe;   // V1.2.3.5: anti-spam de persistencia por MFE
+ };
+-#define EXIT_TICKET_STATE_MAX_V1234 64
+-ExitTicketStateV1234 g_exitTicketStatesV1234[EXIT_TICKET_STATE_MAX_V1234];
+-int g_exitTicketStateCountV1234 = 0;
++#define EXIT_TICKET_STATE_MAX_V1235 64
++ExitTicketStateV1235 g_exitTicketStatesV1235[EXIT_TICKET_STATE_MAX_V1235];
++int g_exitTicketStateCountV1235 = 0;
++// Flag da V1.2.3.4 preservada (fechamento INDIVIDUAL enviado neste tick).
+ bool g_exitCloseSentThisTickV1234 = false;
+-int g_exitWeakClosesV1234 = 0;
+-int g_exitWeakCloseFailsV1234 = 0;
+-int g_exitBeConfirmedV1234 = 0;
+-int g_exitLockConfirmedV1234 = 0;
++// V1.2.3.5: QUALQUER fechamento (individual OU de cesta) solicitado neste tick.
++// Enquanto true, nenhuma reabertura, presenca bilateral, entrada ou pendente roda.
++bool g_exitActionSentThisTickV1235 = false;
++// Contadores V1.2.3.4 preservados por serem usados tambem por ModifyPositionSL().
+ int g_exitSlNotConfirmedV1234 = 0;
+ int g_exitMonotonicBlocksV1234 = 0;
+-int g_exitGoodBlocksV1234 = 0;
+-int g_exitRunnerBlocksV1234 = 0;
+-int g_exitGivebackClosesV1234 = 0;
+-// ========================== FIM ESTADO V1.2.3.4 EXIT PROTECTION ==========================
++// Contadores V1.2.3.5 (resumo do deinit).
++int g_exitTicketsCreatedV1235 = 0;      // estados de ticket criados
++int g_exitStatesRestoredV1235 = 0;      // estados restaurados da persistencia
++int g_exitCapClosesV1235 = 0;           // cortes por teto absoluto de ticket desprotegido
++int g_exitWeakSideCutsV1235 = 0;        // cortes seletivos do lado fraco
++int g_exitCloseFailsV1235 = 0;          // falhas de fechamento individual
++int g_exitBeConfirmedV1235 = 0;         // BE confirmados no servidor
++int g_exitLockConfirmedV1235 = 0;       // Lock confirmados no servidor
++int g_exitRunnersConfirmedV1235 = 0;    // runners confirmados por ticket
++int g_exitGivebackClosesV1235 = 0;      // fechamentos por devolucao sem SL confirmado
++int g_exitSelectiveClosesV1235 = 0;     // fechamentos individuais por saida generica seletiva
++int g_exitFullClosesAllowedV1235 = 0;   // full closes genericos liberados
++int g_exitProtectedHoldsV1235 = 0;      // preservacoes de ticket protegido em saida generica
++int g_exitSameTickEntryBlocksV1235 = 0; // entradas bloqueadas no mesmo tick de um fechamento
++// =================== FIM ESTADO V1.2.3.5 BIDIRECTIONAL TICKET EXIT AUTHORITY ===================
+ 
+ int OnInit();
+ void OnDeinit(const int reason);
+@@ -707,17 +755,32 @@
+ 
+ double USDToPriceDistance(double usd, double volume);
+ 
+-// V1.2.3.4 EXIT MFE SERVER SL FIX - autoridades de protecao de saida por ticket
+-double PriceDistanceToUSDV1234(double price_distance, double volume);
+-int    FindExitTicketStateV1234(ulong ticket);
+-void   RemoveExitTicketStateV1234(int index, string reason);
+-void   SyncExitTicketStatesV1234();
+-double ProtectionDesiredSLV1234(int direction, double open_price, double volume, double protect_usd);
+-bool   ServerSLSatisfiesLevelV1234(int direction, double server_sl, double desired_sl, double tolerance);
+-bool   RequestProtectionSLV1234(int index, bool lock_tier);
+-bool   CloseSingleTicketV1234(int index, string tag, string reason);
+-void   ManageExitProtectionV1234();
+-bool   BlockGenericBasketExitV1234(string trigger, double basket_profit);
++// V1.2.3.5 BIDIRECTIONAL TICKET EXIT AUTHORITY - autoridades de saida por ticket
++double PriceDistanceToUSDV1235(double price_distance, double volume);
++string TicketToStringV1235(ulong ticket);
++string TicketOpStateToTextV1235(int op_state);
++int    FindExitTicketStateV1235(ulong ticket);
++void   RemoveExitTicketStateV1235(int index, string reason);
++string ExitTicketPersistKeyV1235(ulong ticket, string field);
++void   PersistExitTicketStateV1235(int index, string origem);
++bool   RestoreExitTicketStateV1235(int index);
++void   ClearExitTicketPersistenceV1235(ulong ticket);
++void   CleanupOrphanExitTicketPersistenceV1235();
++void   PersistAllExitTicketStatesV1235(string origem);
++void   SyncExitTicketStatesV1235();
++double ProtectionDesiredSLV1235(int direction, double open_price, double volume, double protect_usd);
++bool   ServerSLSatisfiesLevelV1235(int direction, double server_sl, double desired_sl, double tolerance);
++double ProtectionToleranceV1235();
++bool   HasConfirmedProtectiveSLV1235(int state_index);
++bool   TicketRunnerConfirmedV1235(int state_index);
++void   UpdateTicketOpStateV1235(int index, string origem);
++bool   RequestProtectionSLV1235(int index, bool lock_tier);
++bool   CloseSingleTicketV1235(int index, string authority, string reason);
++void   ManageExitProtectionV1235();
++int    SelectWeakSideCutCandidateV1235(int weak_direction, bool require_negative);
++bool   CutOneWeakTicketV1235(int weak_direction, string trigger, string authority, bool require_negative);
++bool   TryCutConfirmedWeakSideV1235();
++int    HandleGenericExitSelectiveV1235(string trigger, double basket_profit);
+ 
+ void DrawBasketLines();
+ void DeleteBasketLines();
+@@ -866,18 +929,30 @@
+    }
+ 
+    UpdateMissingSideTimersV122();
+-   // V1.2.3.4 EXIT MFE SERVER SL FIX: configuracao ativa da protecao de saida
+-   LogMessage("[EXIT_ONLY_AUDIT] evento=config enable=" + (ExitProtection_Enable ? "1" : "0") +
+-              " weak_max_loss=" + DoubleToString(ExitProtection_WeakMaxLossUSD, 2) +
+-              " weak_max_mfe=" + DoubleToString(ExitProtection_WeakMaxMFEUSD, 2) +
++   // V1.2.3.5 BIDIRECTIONAL TICKET EXIT AUTHORITY: configuracao ativa.
++   // ExitProtection_WeakMaxLossUSD passa a ser TETO ABSOLUTO de perda para
++   // QUALQUER ticket desprotegido, independente da classe agregada do lado.
++   LogMessage("[EXIT_V1235_CONFIG] enable=" + (ExitProtection_Enable ? "1" : "0") +
++              " teto_ticket_desprotegido=" + DoubleToString(ExitProtection_WeakMaxLossUSD, 2) +
++              " weak_max_mfe_diagnostico=" + DoubleToString(ExitProtection_WeakMaxMFEUSD, 2) +
+               " be_trigger_mfe=" + DoubleToString(ExitProtection_BETriggerMFEUSD, 2) +
+               " be_profit=" + DoubleToString(ExitProtection_BEProfitUSD, 2) +
+               " lock_trigger_mfe=" + DoubleToString(ExitProtection_LockTriggerMFEUSD, 2) +
+               " lock_profit=" + DoubleToString(ExitProtection_LockProfitUSD, 2) +
+-              " good_faixa=" + DoubleToString(ExitProtection_GoodProfitMinUSD, 2) + ".." + DoubleToString(ExitProtection_GoodProfitMaxUSD, 2) +
++              " good_faixa_sem_autoridade=" + DoubleToString(ExitProtection_GoodProfitMinUSD, 2) + ".." + DoubleToString(ExitProtection_GoodProfitMaxUSD, 2) +
+               " cooldown=" + IntegerToString(ExitProtection_ModifyCooldownSeconds) +
+               " max_tentativas=" + IntegerToString(ExitProtection_MaxModifyAttempts) +
+-              " giveback=" + DoubleToString(ExitProtection_EmergencyGivebackUSD, 2));
++              " giveback=" + DoubleToString(ExitProtection_EmergencyGivebackUSD, 2) +
++              " autoridade=TICKET side_class=contexto");
++   // V1.2.3.5: a faixa entre WeakMaxMFE e BETrigger NAO desliga o teto absoluto.
++   // Inputs NAO sao alterados automaticamente; apenas registro unico no OnInit.
++   if(ExitProtection_WeakMaxMFEUSD < ExitProtection_BETriggerMFEUSD)
++      LogMessage("[EXIT_CONFIG_GAP_NEUTRALIZED] weak_max_mfe=" + DoubleToString(ExitProtection_WeakMaxMFEUSD, 2) +
++                 " be_trigger_mfe=" + DoubleToString(ExitProtection_BETriggerMFEUSD, 2) +
++                 " acao=teto_desprotegido_permanece_ativo_independente_do_mfe");
++   // V1.2.3.5: persistencia por ticket - remove chaves de tickets que o servidor
++   // confirma como inexistentes (nunca restaura estado de ticket encerrado).
++   CleanupOrphanExitTicketPersistenceV1235();
+    LogMessage("EA iniciado.");
+    LogMessage("Conta HEDGE detectada.");
+    return INIT_SUCCEEDED;
+@@ -919,17 +994,26 @@
+               " recreates_bloqueadas=" + IntegerToString(g_pendingRecreateBlockedV1233) +
+               " trocas_reprovadas_simulacao=" + IntegerToString(g_pendingSwapSimBlockedV1233) +
+               " pendentes_ativas=" + IntegerToString(CountPendingOrders()));
+-   // V1.2.3.4 EXIT MFE SERVER SL FIX: resumo da protecao de saida por ticket
+-   LogMessage("[EXIT_ONLY_AUDIT] evento=resumo_deinit weak_closes=" + IntegerToString(g_exitWeakClosesV1234) +
+-              " weak_close_fails=" + IntegerToString(g_exitWeakCloseFailsV1234) +
+-              " be_confirmados=" + IntegerToString(g_exitBeConfirmedV1234) +
+-              " lock_confirmados=" + IntegerToString(g_exitLockConfirmedV1234) +
+-              " sl_nao_confirmados=" + IntegerToString(g_exitSlNotConfirmedV1234) +
++   // V1.2.3.5: persiste MFE/MAE/direitos/confirmacoes por ticket antes do
++   // encerramento, para sobreviver ao reinicio do EA/terminal.
++   PersistAllExitTicketStatesV1235("deinit");
++   // V1.2.3.5 BIDIRECTIONAL TICKET EXIT AUTHORITY: resumo final por ticket
++   LogMessage("[EXIT_V1235_SUMMARY] tickets_criados=" + IntegerToString(g_exitTicketsCreatedV1235) +
++              " estados_restaurados=" + IntegerToString(g_exitStatesRestoredV1235) +
++              " cortes_teto_individual=" + IntegerToString(g_exitCapClosesV1235) +
++              " cortes_seletivos_lado_fraco=" + IntegerToString(g_exitWeakSideCutsV1235) +
++              " falhas_fechamento=" + IntegerToString(g_exitCloseFailsV1235) +
++              " be_confirmados=" + IntegerToString(g_exitBeConfirmedV1235) +
++              " lock_confirmados=" + IntegerToString(g_exitLockConfirmedV1235) +
++              " runners_confirmados=" + IntegerToString(g_exitRunnersConfirmedV1235) +
++              " falhas_confirmacao_sl=" + IntegerToString(g_exitSlNotConfirmedV1234) +
++              " givebacks=" + IntegerToString(g_exitGivebackClosesV1235) +
++              " saidas_seletivas=" + IntegerToString(g_exitSelectiveClosesV1235) +
++              " full_closes_liberados=" + IntegerToString(g_exitFullClosesAllowedV1235) +
++              " holds_protegidos=" + IntegerToString(g_exitProtectedHoldsV1235) +
++              " entradas_bloqueadas_mesmo_tick=" + IntegerToString(g_exitSameTickEntryBlocksV1235) +
+               " bloqueios_monotonicos=" + IntegerToString(g_exitMonotonicBlocksV1234) +
+-              " good_preservadas=" + IntegerToString(g_exitGoodBlocksV1234) +
+-              " runner_preservadas=" + IntegerToString(g_exitRunnerBlocksV1234) +
+-              " giveback_closes=" + IntegerToString(g_exitGivebackClosesV1234) +
+-              " estados_ativos=" + IntegerToString(g_exitTicketStateCountV1234));
++              " estados_ativos=" + IntegerToString(g_exitTicketStateCountV1235));
+    PersistBasketState();
+    if(g_atrHandle != INVALID_HANDLE)
+    {
+@@ -947,6 +1031,11 @@
+    // pendente por passagem do OnTick.
+    g_pendingMutationSentThisTickV1231 = false;
+    g_marketHandoffResolvedThisTickV1232 = false;
++   // V1.2.3.5: flags de fechamento do tick corrente. Qualquer fechamento
++   // (individual ou de cesta) solicitado neste tick bloqueia reabertura,
++   // presenca bilateral, entradas e pendentes ate o proximo tick.
++   g_exitCloseSentThisTickV1234 = false;
++   g_exitActionSentThisTickV1235 = false;
+ 
+    if(!UpdateSymbolData())
+    {
+@@ -978,10 +1067,43 @@
+    ManageDailyProfitTarget();
+    AtualizarPicoLucroCesta();
+ 
+-   // V1.2.3.4 EXIT MFE SERVER SL FIX: MFE monetario por ticket, teto WEAK,
+-   // Break-even/Lock por MFE com SL real confirmado no servidor. Roda depois
+-   // do risco diario e antes das demais rotinas de saida.
+-   ManageExitProtectionV1234();
++   // V1.2.3.5: SAIDAS SOBERANAS DE RISCO rodam ANTES da autoridade por ticket.
++   // O DD obrigatorio da cesta era avaliado somente depois das saidas genericas;
++   // agora loss diario e DD sao avaliados juntos e nenhuma preservacao
++   // (BE/LOCK/RUNNER/GOOD) bloqueia esses fechamentos.
++   ManageBasketDrawdown();
++   if(IsClosingScopeActiveV122())
++   {
++      DrawBasketLines();
++      UpdatePanel();
++      return;
++   }
++
++   // V1.2.3.5 BIDIRECTIONAL TICKET EXIT AUTHORITY: sincronizacao e persistencia
++   // por ticket, TETO ABSOLUTO do ticket desprotegido (independente da classe
++   // agregada do lado), direitos BE/Lock por MFE, SL real confirmado no servidor
++   // e fallback de devolucao sem SL confirmado.
++   ManageExitProtectionV1235();
++
++   // V1.2.3.5: corte seletivo do lado fraco em tempo real (no maximo UM ticket
++   // por tick), preservando todo ticket com SL real protetor confirmado.
++   TryCutConfirmedWeakSideV1235();
++
++   // V1.2.3.5: fechamento enviado neste tick encerra o fluxo AQUI. Proibido
++   // fechar ticket e continuar para trailing, saidas de cesta, reabertura,
++   // presenca bilateral, entradas ou pendentes no mesmo tick.
++   if(g_exitActionSentThisTickV1235 || g_exitCloseSentThisTickV1234)
++   {
++      g_exitSameTickEntryBlocksV1235++;
++      LogThrottledV1232("v1235_same_tick_block_ticket",
++                        "[EXIT_SAME_TICK_ENTRY_BLOCK] origem=autoridade_por_ticket posicoes=" +
++                        IntegerToString(CountOpenPositions()) +
++                        " acao=aguardar_reconciliacao_proximo_tick", 5);
++      DrawBasketLines();
++      UpdatePanel();
++      PersistBasketState();
++      return;
++   }
+ 
+    // Primeiro protege o lucro individual. Depois decide se extrai apenas o
+    // lado fraco ou se encerra toda a cesta.
+@@ -1010,7 +1132,8 @@
+       UpdatePanel();
+       return;
+    }
+-   ManageBasketDrawdown();
++   // V1.2.3.5: ManageBasketDrawdown() foi movido para ANTES da autoridade por
++   // ticket (saida soberana de risco); nao roda mais depois das saidas genericas.
+ 
+    if(g_tradeStateDirty)
+    {
+@@ -1033,6 +1156,22 @@
+       return;
+    }
+ 
++   // V1.2.3.5: guarda final - fechamentos seletivos enviados pelas saidas
++   // genericas (BASKET_TARGET/PRICE_LINE/BASKET_MFE_LOCK) tambem bloqueiam
++   // reabertura, presenca bilateral, entradas e pendentes neste tick.
++   if(g_exitActionSentThisTickV1235 || g_exitCloseSentThisTickV1234)
++   {
++      g_exitSameTickEntryBlocksV1235++;
++      LogThrottledV1232("v1235_same_tick_block_generic",
++                        "[EXIT_SAME_TICK_ENTRY_BLOCK] origem=saida_generica_seletiva posicoes=" +
++                        IntegerToString(CountOpenPositions()) +
++                        " acao=aguardar_reconciliacao_proximo_tick", 5);
++      DrawBasketLines();
++      UpdatePanel();
++      PersistBasketState();
++      return;
++   }
++
+    if(ManageFlatPairReopenV122())
+    {
+       DrawBasketLines();
+@@ -5739,6 +5878,8 @@
+ bool CloseAllBasket()
+ {
+    bool all_ok = true;
++   // V1.2.3.5: qualquer fechamento de cesta bloqueia novas entradas neste tick.
++   g_exitActionSentThisTickV1235 = true;
+    if(CountOpenPositions() > 0 || CountPendingOrders() > 0)
+       StartClosingScopeV122("close_all_basket");
+    if(CountPendingOrders() > 0)
+@@ -5771,6 +5912,8 @@
+ bool CloseBuyBasket()
+ {
+    bool all_ok = true;
++   // V1.2.3.5: qualquer fechamento de cesta bloqueia novas entradas neste tick.
++   g_exitActionSentThisTickV1235 = true;
+    if(CountBuyPositions() > 0)
+       StartClosingScopeV122("close_buy_basket");
+    SetExitStateV122(EXIT_CLOSING_POSITIONS, "close_buy_basket");
+@@ -5803,6 +5946,8 @@
+ bool CloseSellBasket()
+ {
+    bool all_ok = true;
++   // V1.2.3.5: qualquer fechamento de cesta bloqueia novas entradas neste tick.
++   g_exitActionSentThisTickV1235 = true;
+    if(CountSellPositions() > 0)
+       StartClosingScopeV122("close_sell_basket");
+    SetExitStateV122(EXIT_CLOSING_POSITIONS, "close_sell_basket");
+@@ -5923,15 +6068,18 @@
+               " weak_profit=" + DoubleToString(weak_profit, 2) +
+               " basket=" + DoubleToString(basket_profit, 2));
+ 
+-   bool closed = (bias_sign > 0 ? CloseSellBasket() : CloseBuyBasket());
+-   if(closed)
+-   {
+-      g_lastSideExtractionTimeV123 = TimeCurrent();
++   // V1.2.3.5: a extracao NAO fecha mais o lado fraco inteiro (CloseSellBasket/
++   // CloseBuyBasket derrubava inclusive tickets protegidos por SL real).
++   // Autoridade por ticket: corta no maximo UM ticket fraco negativo e
++   // desprotegido por tick e preserva qualquer ticket com protecao confirmada.
++   int weak_direction = (bias_sign > 0 ? (int)POSITION_TYPE_SELL : (int)POSITION_TYPE_BUY);
++   bool cut = CutOneWeakTicketV1235(weak_direction, trigger, "WEAK_SIDE_CUT", true);
++   if(cut)
+       LogMessage("[V123_WEAK_SIDE_CUT] trigger=" + trigger +
+                  " side=" + weak_side +
++                 " modo=seletivo_por_ticket_v1235" +
+                  " strong_side_preserved=" + strong_side);
+-   }
+-   return closed;
++   return cut;
+ }
+ 
+ void ManageBasketClosing()
+@@ -5953,6 +6101,13 @@
+       {
+          if(TryExtractWeakSideV123("BASKET_TARGET"))
+             return;
++         // V1.2.3.5: o alvo monetario comum da cesta tambem e uma saida generica.
++         // Se existir ticket com SL real confirmado, fecha-se individualmente o
++         // desprotegido e preserva-se o protegido; full close somente quando
++         // nenhum ticket possui protecao real confirmada.
++         int generic_decision = HandleGenericExitSelectiveV1235("BASKET_TARGET", basket_profit);
++         if(generic_decision != GENERIC_EXIT_ALLOW_FULL_CLOSE)
++            return;
+          LogMessage("fechamento por lucro USD.");
+          CloseAllBasket();
+       }
+@@ -6010,10 +6165,12 @@
+    {
+       if(TryExtractWeakSideV123("PRICE_LINE"))
+          return;
+-      // V1.2.3.4 EXIT MFE SERVER SL FIX: saida generica de lucro pequeno nao
+-      // pode matar GOOD (+5..+10) nem RUNNER; vencedoras ficam protegidas por
+-      // SL real e a cesta permanece elegivel aos alvos superiores.
+-      if(BlockGenericBasketExitV1234("PRICE_LINE", profit))
++      // V1.2.3.5: autoridade SELETIVA no lugar do bloqueio total da cesta.
++      // Ticket com SL real confirmado e preservado; ticket desprotegido (mesmo
++      // GOOD por lucro atual ou com beRight/lockRight sem confirmacao) e
++      // fechado individualmente; full close apenas sem nenhum protegido.
++      int generic_decision = HandleGenericExitSelectiveV1235("PRICE_LINE", profit);
++      if(generic_decision != GENERIC_EXIT_ALLOW_FULL_CLOSE)
+          return;
+       LogMessage("fechamento por linha dinamica.");
+       CloseAllBasket();
+@@ -6366,12 +6523,16 @@
+       lucroAtualCesta <= LucroProtegidoAposPicoUSD &&
+       lucroAtualCesta > 0.0)
+    {
+-      // V1.2.3.4 EXIT MFE SERVER SL FIX: o lock da cesta e uma saida generica
+-      // de lucro pequeno (fecha tudo com lucro atual <= LucroProtegidoAposPicoUSD).
+-      // Nao pode matar GOOD/RUNNER; o fechamento forte (pico), os alvos da
+-      // cesta, o DD e o loss diario permanecem intactos.
+-      if(BlockGenericBasketExitV1234("BASKET_MFE_LOCK", lucroAtualCesta))
+-         return false;
++      // V1.2.3.5: o lock da cesta e uma saida generica de lucro pequeno.
++      // Autoridade SELETIVA: preserva somente tickets com SL real confirmado,
++      // fecha individualmente os desprotegidos e so libera o full close quando
++      // nenhum ticket possui protecao real. O fechamento forte por pico, o DD
++      // e o loss diario permanecem intactos (soberanos).
++      int generic_decision = HandleGenericExitSelectiveV1235("BASKET_MFE_LOCK", lucroAtualCesta);
++      if(generic_decision == GENERIC_EXIT_SELECTIVE_CLOSE_SENT)
++         return true;   // fechamento individual enviado: interrompe o fluxo deste tick
++      if(generic_decision == GENERIC_EXIT_NO_ACTION)
++         return false;  // somente protegidos restantes: cesta segue elegivel aos alvos superiores
+ 
+       g_FechamentoMFECestaEmAndamento = true;
+ 
+@@ -6412,15 +6573,17 @@
+    return MathAbs(usd) / (tick_value * volume) * tick_size;
+ }
+ 
+-// ============================ V1.2.3.4 EXIT MFE SERVER SL FIX ============================
+-// Autoridade de protecao de saida POR TICKET. Escopo restrito a: MFE monetario
+-// por ticket, teto de perda WEAK, Break-even/Lock por MFE, confirmacao do SL
+-// real no servidor, preservacao de GOOD/RUNNER e fallback de devolucao extrema.
++// ===================== V1.2.3.5 BIDIRECTIONAL TICKET EXIT AUTHORITY =====================
++// Autoridade de saida POR TICKET (evolucao do bloco V1.2.3.4). Escopo restrito a:
++// MFE/MAE monetarios por ticket, TETO ABSOLUTO de perda do ticket desprotegido,
++// Break-even/Lock por MFE com SL real confirmado no servidor, corte seletivo do
++// lado fraco, saida generica seletiva, persistencia por ticket e fallback de
++// devolucao extrema. side_class (ClassifySideV123) permanece APENAS como contexto.
+ // Nenhuma funcao abaixo cria entradas, altera sinais, lotes, pendentes ou risco.
+ 
+ // Conversao inversa do helper monetario existente: distancia de preco -> USD.
+ // Mesma base (tick size, tick value, volume) usada por USDToPriceDistance().
+-double PriceDistanceToUSDV1234(double price_distance, double volume)
++double PriceDistanceToUSDV1235(double price_distance, double volume)
+ {
+    double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+    double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+@@ -6429,38 +6592,208 @@
+    return price_distance / tick_size * tick_value * volume;
+ }
+ 
+-int FindExitTicketStateV1234(ulong ticket)
++// V1.2.3.5: formatacao segura de ticket em 64 bits. Substitui todos os casts
++// IntegerToString((int)ticket) das rotinas de saida (ulong nunca e truncado).
++string TicketToStringV1235(ulong ticket)
+ {
+-   for(int i = 0; i < g_exitTicketStateCountV1234; i++)
++   return StringFormat("%I64u", ticket);
++}
++
++string TicketOpStateToTextV1235(int op_state)
++{
++   switch((ENUM_EXIT_TICKET_OPSTATE_V1235)op_state)
+    {
+-      if(g_exitTicketStatesV1234[i].ticket == ticket)
++      case TICKET_NEW:                 return "TICKET_NEW";
++      case TICKET_UNPROTECTED:         return "TICKET_UNPROTECTED";
++      case TICKET_UNPROTECTED_LOW_MFE: return "TICKET_UNPROTECTED_LOW_MFE";
++      case TICKET_BE_ELIGIBLE:         return "TICKET_BE_ELIGIBLE";
++      case TICKET_BE_CONFIRMED:        return "TICKET_BE_CONFIRMED";
++      case TICKET_LOCK_ELIGIBLE:       return "TICKET_LOCK_ELIGIBLE";
++      case TICKET_LOCK_CONFIRMED:      return "TICKET_LOCK_CONFIRMED";
++      case TICKET_RUNNER_CONFIRMED:    return "TICKET_RUNNER_CONFIRMED";
++      case TICKET_CLOSE_REQUESTED:     return "TICKET_CLOSE_REQUESTED";
++      case TICKET_CLOSE_RECONCILING:   return "TICKET_CLOSE_RECONCILING";
++      case TICKET_CLOSED:              return "TICKET_CLOSED";
++   }
++   return "TICKET_UNKNOWN";
++}
++
++// Tolerancia unica de comparacao de SL (mesma base da confirmacao existente).
++double ProtectionToleranceV1235()
++{
++   double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
++   return MathMax(tick_size, _Point) * MathMax(1.0, ToleranciaConfirmacaoSLTicks);
++}
++
++int FindExitTicketStateV1235(ulong ticket)
++{
++   for(int i = 0; i < g_exitTicketStateCountV1235; i++)
++   {
++      if(g_exitTicketStatesV1235[i].ticket == ticket)
+          return i;
+    }
+    return -1;
+ }
+ 
+-void RemoveExitTicketStateV1234(int index, string reason)
+-{
+-   if(index < 0 || index >= g_exitTicketStateCountV1234)
+-      return;
+-   LogMessage("[EXIT_ONLY_AUDIT] evento=estado_ticket_removido ticket=" +
+-              IntegerToString((int)g_exitTicketStatesV1234[index].ticket) +
+-              " mfe_final=" + DoubleToString(g_exitTicketStatesV1234[index].peakMfeUsd, 2) +
+-              " lucro_final_visto=" + DoubleToString(g_exitTicketStatesV1234[index].lastProfitUsd, 2) +
+-              " be_conf=" + (g_exitTicketStatesV1234[index].beConfirmed ? "1" : "0") +
+-              " lock_conf=" + (g_exitTicketStatesV1234[index].lockConfirmed ? "1" : "0") +
++// Remocao de estado somente apos confirmacao de encerramento no servidor.
++// A persistencia do ticket e limpa AQUI (nunca antes da confirmacao real).
++void RemoveExitTicketStateV1235(int index, string reason)
++{
++   if(index < 0 || index >= g_exitTicketStateCountV1235)
++      return;
++   g_exitTicketStatesV1235[index].opState = (int)TICKET_CLOSED;
++   LogMessage("[TICKET_STATE_REMOVED] ticket=" + TicketToStringV1235(g_exitTicketStatesV1235[index].ticket) +
++              " estado_final=" + TicketOpStateToTextV1235(g_exitTicketStatesV1235[index].opState) +
++              " mfe_final=" + DoubleToString(g_exitTicketStatesV1235[index].peakMfeUsd, 2) +
++              " mae_final=" + DoubleToString(g_exitTicketStatesV1235[index].maeUsd, 2) +
++              " lucro_final_visto=" + DoubleToString(g_exitTicketStatesV1235[index].lastProfitUsd, 2) +
++              " be_conf=" + (g_exitTicketStatesV1235[index].beConfirmed ? "1" : "0") +
++              " lock_conf=" + (g_exitTicketStatesV1235[index].lockConfirmed ? "1" : "0") +
++              " persistencia_limpa=1" +
+               " motivo=" + reason);
+-   int last = g_exitTicketStateCountV1234 - 1;
++   ClearExitTicketPersistenceV1235(g_exitTicketStatesV1235[index].ticket);
++   int last = g_exitTicketStateCountV1235 - 1;
+    if(index != last)
+-      g_exitTicketStatesV1234[index] = g_exitTicketStatesV1234[last];
+-   g_exitTicketStateCountV1234 = last;
++      g_exitTicketStatesV1235[index] = g_exitTicketStatesV1235[last];
++   g_exitTicketStateCountV1235 = last;
++}
++
++// ---------------- V1.2.3.5 PERSISTENCIA DE ESTADO POR TICKET ----------------
++// Chave: login + simbolo + magic (via StateKey) + versao do estado + ticket.
++// Persistidos: peakMfeUsd, maeUsd, direitos/confirmacoes (bitmask), SL
++// confirmado e estado operacional. O SL real do servidor continua sendo a
++// fonte primaria de verdade na restauracao.
++string ExitTicketPersistKeyV1235(ulong ticket, string field)
++{
++   return StateKey("V1235T_" + TicketToStringV1235(ticket) + "_" + field);
++}
++
++void PersistExitTicketStateV1235(int index, string origem)
++{
++   if(index < 0 || index >= g_exitTicketStateCountV1235)
++      return;
++   ulong ticket = g_exitTicketStatesV1235[index].ticket;
++   double flags = 0.0;
++   if(g_exitTicketStatesV1235[index].beRight)        flags += 1.0;
++   if(g_exitTicketStatesV1235[index].lockRight)      flags += 2.0;
++   if(g_exitTicketStatesV1235[index].beConfirmed)    flags += 4.0;
++   if(g_exitTicketStatesV1235[index].lockConfirmed)  flags += 8.0;
++   GlobalVariableSet(ExitTicketPersistKeyV1235(ticket, "MFE"), g_exitTicketStatesV1235[index].peakMfeUsd);
++   GlobalVariableSet(ExitTicketPersistKeyV1235(ticket, "MAE"), g_exitTicketStatesV1235[index].maeUsd);
++   GlobalVariableSet(ExitTicketPersistKeyV1235(ticket, "FLAGS"), flags);
++   GlobalVariableSet(ExitTicketPersistKeyV1235(ticket, "SL"), g_exitTicketStatesV1235[index].confirmedServerSL);
++   GlobalVariableSet(ExitTicketPersistKeyV1235(ticket, "OPSTATE"), (double)g_exitTicketStatesV1235[index].opState);
++   g_exitTicketStatesV1235[index].lastPersistedMfe = g_exitTicketStatesV1235[index].peakMfeUsd;
++   LogThrottledV1232("v1235_persist_" + TicketToStringV1235(ticket),
++                     "[TICKET_STATE_PERSISTED] ticket=" + TicketToStringV1235(ticket) +
++                     " mfe=" + DoubleToString(g_exitTicketStatesV1235[index].peakMfeUsd, 2) +
++                     " mae=" + DoubleToString(g_exitTicketStatesV1235[index].maeUsd, 2) +
++                     " flags=" + DoubleToString(flags, 0) +
++                     " sl_confirmado=" + DoubleToString(g_exitTicketStatesV1235[index].confirmedServerSL, _Digits) +
++                     " estado=" + TicketOpStateToTextV1235(g_exitTicketStatesV1235[index].opState) +
++                     " origem=" + origem, 30);
++}
++
++// Restaura MFE/MAE/direitos persistidos. Chamada SOMENTE dentro do Sync, no ramo
++// de criacao de estado, quando o ticket EXISTE no servidor. As confirmacoes de
++// BE/Lock NUNCA sao restauradas cegamente: sao reconciliadas contra o
++// POSITION_SL real pelo proprio Sync (o servidor e a fonte primaria de verdade).
++bool RestoreExitTicketStateV1235(int index)
++{
++   if(index < 0 || index >= g_exitTicketStateCountV1235)
++      return false;
++   ulong ticket = g_exitTicketStatesV1235[index].ticket;
++   if(!GlobalVariableCheck(ExitTicketPersistKeyV1235(ticket, "MFE")))
++      return false;
++
++   double persisted_mfe = GlobalVariableGet(ExitTicketPersistKeyV1235(ticket, "MFE"));
++   double persisted_mae = (GlobalVariableCheck(ExitTicketPersistKeyV1235(ticket, "MAE"))
++                           ? GlobalVariableGet(ExitTicketPersistKeyV1235(ticket, "MAE")) : 0.0);
++   double persisted_flags = (GlobalVariableCheck(ExitTicketPersistKeyV1235(ticket, "FLAGS"))
++                             ? GlobalVariableGet(ExitTicketPersistKeyV1235(ticket, "FLAGS")) : 0.0);
++   int flags = (int)MathRound(persisted_flags);
++
++   // MFE monotonico sobrevive ao reinicio: nunca reduzido pela restauracao.
++   if(persisted_mfe > g_exitTicketStatesV1235[index].peakMfeUsd)
++      g_exitTicketStatesV1235[index].peakMfeUsd = persisted_mfe;
++   if(persisted_mae < g_exitTicketStatesV1235[index].maeUsd)
++      g_exitTicketStatesV1235[index].maeUsd = persisted_mae;
++   // Direitos por MFE sao permanentes e podem ser restaurados diretamente.
++   if((flags & 1) != 0) g_exitTicketStatesV1235[index].beRight = true;
++   if((flags & 2) != 0) g_exitTicketStatesV1235[index].lockRight = true;
++   // beConfirmed/lockConfirmed persistidos NAO viram protecao virtual: o Sync
++   // reconcilia com o POSITION_SL real e so mantem o que o servidor confirmar.
++   g_exitTicketStatesV1235[index].restoredFromPersistence = true;
++   g_exitStatesRestoredV1235++;
++   LogMessage("[TICKET_STATE_RESTORED] ticket=" + TicketToStringV1235(ticket) +
++              " mfe_restaurado=" + DoubleToString(g_exitTicketStatesV1235[index].peakMfeUsd, 2) +
++              " mae_restaurado=" + DoubleToString(g_exitTicketStatesV1235[index].maeUsd, 2) +
++              " be_right=" + (g_exitTicketStatesV1235[index].beRight ? "1" : "0") +
++              " lock_right=" + (g_exitTicketStatesV1235[index].lockRight ? "1" : "0") +
++              " flags_persistidos=" + IntegerToString(flags) +
++              " confirmacoes=pendentes_de_reconciliacao_com_sl_do_servidor");
++   return true;
++}
++
++void ClearExitTicketPersistenceV1235(ulong ticket)
++{
++   string fields[5] = {"MFE", "MAE", "FLAGS", "SL", "OPSTATE"};
++   for(int f = 0; f < 5; f++)
++   {
++      string key = ExitTicketPersistKeyV1235(ticket, fields[f]);
++      if(GlobalVariableCheck(key))
++         GlobalVariableDel(key);
++   }
+ }
+ 
+-// Sincroniza o estado por ticket com o servidor: cria estado para posicao nova,
+-// atualiza o MFE monotonico (peak = MathMax(peak, lucro_atual)) e limpa estado
+-// SOMENTE quando o ticket ja nao existe mais no servidor (confirmacao real de
+-// encerramento). BUY e SELL nunca compartilham estado: a chave e o ticket.
+-void SyncExitTicketStatesV1234()
++// OnInit: remove persistencia de tickets que o servidor confirma como
++// inexistentes. NUNCA restaura estado de um ticket que nao existe mais.
++void CleanupOrphanExitTicketPersistenceV1235()
++{
++   // Sem conexao nao ha como CONFIRMAR inexistencia no servidor: nao limpar.
++   if(!MQLInfoInteger(MQL_TESTER) && !TerminalInfoInteger(TERMINAL_CONNECTED))
++      return;
++   string prefix = StateKey("V1235T_");
++   int prefix_len = StringLen(prefix);
++   int removed = 0;
++   for(int i = GlobalVariablesTotal() - 1; i >= 0; i--)
++   {
++      string name = GlobalVariableName(i);
++      if(StringFind(name, prefix) != 0)
++         continue;
++      string rest = StringSubstr(name, prefix_len);
++      int sep = StringFind(rest, "_");
++      if(sep <= 0)
++      {
++         GlobalVariableDel(name);
++         removed++;
++         continue;
++      }
++      ulong ticket = (ulong)StringToInteger(StringSubstr(rest, 0, sep));
++      if(ticket == 0 || !PositionSelectByTicket(ticket))
++      {
++         GlobalVariableDel(name); // ticket confirmado inexistente no servidor
++         removed++;
++      }
++   }
++   if(removed > 0)
++      LogMessage("[TICKET_STATE_REMOVED] origem=limpeza_persistencia_orfa chaves_removidas=" +
++                 IntegerToString(removed));
++}
++
++void PersistAllExitTicketStatesV1235(string origem)
++{
++   for(int i = 0; i < g_exitTicketStateCountV1235; i++)
++      PersistExitTicketStateV1235(i, origem);
++}
++// -------------- FIM V1.2.3.5 PERSISTENCIA DE ESTADO POR TICKET --------------
++
++// Sincroniza o estado por ticket com o servidor: cria estado para posicao nova
++// (restaurando persistencia quando existir), atualiza MFE/MAE monotonicos,
++// RECONCILIA as confirmacoes BE/Lock com o POSITION_SL real a cada passagem e
++// limpa estado SOMENTE quando o ticket ja nao existe mais no servidor
++// (confirmacao real de encerramento). BUY e SELL nunca compartilham estado.
++void SyncExitTicketStatesV1235()
+ {
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+@@ -6473,97 +6806,167 @@
+          continue;
+ 
+       double profit = GetSelectedPositionProfitWithCosts();
+-      int idx = FindExitTicketStateV1234(ticket);
++      int idx = FindExitTicketStateV1235(ticket);
+       if(idx < 0)
+       {
+-         if(g_exitTicketStateCountV1234 >= EXIT_TICKET_STATE_MAX_V1234)
++         if(g_exitTicketStateCountV1235 >= EXIT_TICKET_STATE_MAX_V1235)
+          {
+-            LogMessage("[EXIT_ONLY_AUDIT] evento=tabela_estado_cheia ticket=" + IntegerToString((int)ticket));
++            LogMessage("[TICKET_STATE_CREATED] resultado=tabela_cheia ticket=" + TicketToStringV1235(ticket));
+             continue;
+          }
+-         idx = g_exitTicketStateCountV1234;
+-         g_exitTicketStateCountV1234++;
+-         g_exitTicketStatesV1234[idx].ticket = ticket;
+-         g_exitTicketStatesV1234[idx].symbol = PositionGetString(POSITION_SYMBOL);
+-         g_exitTicketStatesV1234[idx].magic = (long)PositionGetInteger(POSITION_MAGIC);
+-         g_exitTicketStatesV1234[idx].direction = (int)PositionGetInteger(POSITION_TYPE);
+-         g_exitTicketStatesV1234[idx].volume = PositionGetDouble(POSITION_VOLUME);
+-         g_exitTicketStatesV1234[idx].openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+-         g_exitTicketStatesV1234[idx].peakMfeUsd = MathMax(0.0, profit);
+-         g_exitTicketStatesV1234[idx].lastProfitUsd = profit;
+-         g_exitTicketStatesV1234[idx].beRight = false;
+-         g_exitTicketStatesV1234[idx].lockRight = false;
+-         g_exitTicketStatesV1234[idx].beConfirmed = false;
+-         g_exitTicketStatesV1234[idx].lockConfirmed = false;
+-         g_exitTicketStatesV1234[idx].lastRequestedSL = 0.0;
+-         g_exitTicketStatesV1234[idx].confirmedServerSL = 0.0;
+-         g_exitTicketStatesV1234[idx].lastModifyAttempt = 0;
+-         g_exitTicketStatesV1234[idx].modifyAttempts = 0;
+-         g_exitTicketStatesV1234[idx].lastCloseAttempt = 0;
+-         g_exitTicketStatesV1234[idx].closeAttempts = 0;
+-         g_exitTicketStatesV1234[idx].lastLoggedMfeUsd = MathMax(0.0, profit);
++         idx = g_exitTicketStateCountV1235;
++         g_exitTicketStateCountV1235++;
++         g_exitTicketStatesV1235[idx].ticket = ticket;
++         g_exitTicketStatesV1235[idx].symbol = PositionGetString(POSITION_SYMBOL);
++         g_exitTicketStatesV1235[idx].magic = (long)PositionGetInteger(POSITION_MAGIC);
++         g_exitTicketStatesV1235[idx].direction = (int)PositionGetInteger(POSITION_TYPE);
++         g_exitTicketStatesV1235[idx].volume = PositionGetDouble(POSITION_VOLUME);
++         g_exitTicketStatesV1235[idx].openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
++         g_exitTicketStatesV1235[idx].peakMfeUsd = MathMax(0.0, profit);
++         g_exitTicketStatesV1235[idx].maeUsd = MathMin(0.0, profit);
++         g_exitTicketStatesV1235[idx].lastProfitUsd = profit;
++         g_exitTicketStatesV1235[idx].beRight = false;
++         g_exitTicketStatesV1235[idx].lockRight = false;
++         g_exitTicketStatesV1235[idx].beConfirmed = false;
++         g_exitTicketStatesV1235[idx].lockConfirmed = false;
++         g_exitTicketStatesV1235[idx].lastRequestedSL = 0.0;
++         g_exitTicketStatesV1235[idx].confirmedServerSL = 0.0;
++         g_exitTicketStatesV1235[idx].lastModifyAttempt = 0;
++         g_exitTicketStatesV1235[idx].modifyAttempts = 0;
++         g_exitTicketStatesV1235[idx].lastCloseAttempt = 0;
++         g_exitTicketStatesV1235[idx].closeAttempts = 0;
++         g_exitTicketStatesV1235[idx].lastLoggedMfeUsd = MathMax(0.0, profit);
++         g_exitTicketStatesV1235[idx].opState = (int)TICKET_NEW;
++         g_exitTicketStatesV1235[idx].lastDecisionReason = "estado_criado";
++         g_exitTicketStatesV1235[idx].restoredFromPersistence = false;
++         g_exitTicketStatesV1235[idx].runnerLogged = false;
++         g_exitTicketStatesV1235[idx].lastPersistedMfe = -1.0;
++         g_exitTicketsCreatedV1235++;
++
++         // Reinicio/estado perdido: restaura MFE/MAE/direitos persistidos.
++         // O ticket comprovadamente existe (acabou de ser lido do servidor).
++         RestoreExitTicketStateV1235(idx);
+ 
+          // Reinicio do EA com posicao aberta: um SL ja existente no servidor e
+          // reconhecido como protecao confirmada equivalente (nunca sera piorado).
+          double existing_sl = PositionGetDouble(POSITION_SL);
+          if(existing_sl > 0.0)
+          {
+-            g_exitTicketStatesV1234[idx].confirmedServerSL = existing_sl;
+-            int dir = g_exitTicketStatesV1234[idx].direction;
++            g_exitTicketStatesV1235[idx].confirmedServerSL = existing_sl;
++            int dir = g_exitTicketStatesV1235[idx].direction;
+             double signed_dist = (dir == (int)POSITION_TYPE_BUY
+-                                  ? existing_sl - g_exitTicketStatesV1234[idx].openPrice
+-                                  : g_exitTicketStatesV1234[idx].openPrice - existing_sl);
+-            double sl_usd = PriceDistanceToUSDV1234(signed_dist, g_exitTicketStatesV1234[idx].volume);
++                                  ? existing_sl - g_exitTicketStatesV1235[idx].openPrice
++                                  : g_exitTicketStatesV1235[idx].openPrice - existing_sl);
++            double sl_usd = PriceDistanceToUSDV1235(signed_dist, g_exitTicketStatesV1235[idx].volume);
+             if(sl_usd >= ExitProtection_BEProfitUSD - 0.01)
+             {
+-               g_exitTicketStatesV1234[idx].beRight = true;
+-               g_exitTicketStatesV1234[idx].beConfirmed = true;
++               g_exitTicketStatesV1235[idx].beRight = true;
++               g_exitTicketStatesV1235[idx].beConfirmed = true;
+             }
+             if(sl_usd >= ExitProtection_LockProfitUSD - 0.01)
+             {
+-               g_exitTicketStatesV1234[idx].lockRight = true;
+-               g_exitTicketStatesV1234[idx].lockConfirmed = true;
++               g_exitTicketStatesV1235[idx].lockRight = true;
++               g_exitTicketStatesV1235[idx].lockConfirmed = true;
+             }
+          }
+-         LogMessage("[EXIT_ONLY_AUDIT] evento=estado_ticket_criado ticket=" + IntegerToString((int)ticket) +
+-                    " direcao=" + (g_exitTicketStatesV1234[idx].direction == (int)POSITION_TYPE_BUY ? "BUY" : "SELL") +
+-                    " volume=" + DoubleToString(g_exitTicketStatesV1234[idx].volume, 2) +
+-                    " abertura=" + DoubleToString(g_exitTicketStatesV1234[idx].openPrice, _Digits) +
++         if(g_exitTicketStatesV1235[idx].restoredFromPersistence)
++            LogMessage("[TICKET_STATE_RECONCILED] ticket=" + TicketToStringV1235(ticket) +
++                       " origem=restauracao sl_servidor=" + DoubleToString(existing_sl, _Digits) +
++                       " be_conf=" + (g_exitTicketStatesV1235[idx].beConfirmed ? "1" : "0") +
++                       " lock_conf=" + (g_exitTicketStatesV1235[idx].lockConfirmed ? "1" : "0") +
++                       " regra=servidor_e_fonte_primaria_sem_protecao_virtual");
++         LogMessage("[TICKET_STATE_CREATED] ticket=" + TicketToStringV1235(ticket) +
++                    " direcao=" + (g_exitTicketStatesV1235[idx].direction == (int)POSITION_TYPE_BUY ? "BUY" : "SELL") +
++                    " volume=" + DoubleToString(g_exitTicketStatesV1235[idx].volume, 2) +
++                    " abertura=" + DoubleToString(g_exitTicketStatesV1235[idx].openPrice, _Digits) +
+                     " lucro=" + DoubleToString(profit, 2) +
+-                    " mfe_inicial=" + DoubleToString(g_exitTicketStatesV1234[idx].peakMfeUsd, 2) +
+-                    " sl_existente=" + DoubleToString(existing_sl, _Digits));
++                    " mfe_inicial=" + DoubleToString(g_exitTicketStatesV1235[idx].peakMfeUsd, 2) +
++                    " mae_inicial=" + DoubleToString(g_exitTicketStatesV1235[idx].maeUsd, 2) +
++                    " sl_existente=" + DoubleToString(existing_sl, _Digits) +
++                    " restaurado=" + (g_exitTicketStatesV1235[idx].restoredFromPersistence ? "1" : "0"));
++         UpdateTicketOpStateV1235(idx, "criacao");
++         PersistExitTicketStateV1235(idx, "criacao");
+          continue;
+       }
+ 
+       // MFE MONOTONICO: nunca diminui enquanto o ticket existir.
+-      g_exitTicketStatesV1234[idx].lastProfitUsd = profit;
+-      g_exitTicketStatesV1234[idx].volume = PositionGetDouble(POSITION_VOLUME);
+-      if(profit > g_exitTicketStatesV1234[idx].peakMfeUsd)
++      // MAE MONOTONICO: nunca sobe enquanto o ticket existir.
++      g_exitTicketStatesV1235[idx].lastProfitUsd = profit;
++      g_exitTicketStatesV1235[idx].volume = PositionGetDouble(POSITION_VOLUME);
++      if(profit < g_exitTicketStatesV1235[idx].maeUsd)
++         g_exitTicketStatesV1235[idx].maeUsd = profit;
++      if(profit > g_exitTicketStatesV1235[idx].peakMfeUsd)
+       {
+-         g_exitTicketStatesV1234[idx].peakMfeUsd = profit;
+-         if(g_exitTicketStatesV1234[idx].peakMfeUsd - g_exitTicketStatesV1234[idx].lastLoggedMfeUsd >= 1.0)
++         g_exitTicketStatesV1235[idx].peakMfeUsd = profit;
++         if(g_exitTicketStatesV1235[idx].peakMfeUsd - g_exitTicketStatesV1235[idx].lastLoggedMfeUsd >= 1.0)
+          {
+-            g_exitTicketStatesV1234[idx].lastLoggedMfeUsd = g_exitTicketStatesV1234[idx].peakMfeUsd;
+-            LogMessage("[MFE_UPDATED] ticket=" + IntegerToString((int)ticket) +
+-                       " direcao=" + (g_exitTicketStatesV1234[idx].direction == (int)POSITION_TYPE_BUY ? "BUY" : "SELL") +
++            g_exitTicketStatesV1235[idx].lastLoggedMfeUsd = g_exitTicketStatesV1235[idx].peakMfeUsd;
++            LogMessage("[MFE_UPDATED] ticket=" + TicketToStringV1235(ticket) +
++                       " direcao=" + (g_exitTicketStatesV1235[idx].direction == (int)POSITION_TYPE_BUY ? "BUY" : "SELL") +
+                        " lucro_atual=" + DoubleToString(profit, 2) +
+-                       " mfe=" + DoubleToString(g_exitTicketStatesV1234[idx].peakMfeUsd, 2) +
+-                       " volume=" + DoubleToString(g_exitTicketStatesV1234[idx].volume, 2));
++                       " mfe=" + DoubleToString(g_exitTicketStatesV1235[idx].peakMfeUsd, 2) +
++                       " volume=" + DoubleToString(g_exitTicketStatesV1235[idx].volume, 2));
++         }
++         // Persistencia do MFE em avancos relevantes (anti-spam de 0.50 USD).
++         if(g_exitTicketStatesV1235[idx].peakMfeUsd - g_exitTicketStatesV1235[idx].lastPersistedMfe >= 0.50)
++            PersistExitTicketStateV1235(idx, "avanco_mfe");
++      }
++
++      // RECONCILIACAO CONTINUA COM O SERVIDOR: um SL real colocado por qualquer
++      // autoridade legitima (BE/Lock V1.2.3.5, ManageBreakEven, ManageSmartTrailing)
++      // e reconhecido aqui. Nada disso cria protecao virtual: exige POSITION_SL real.
++      double server_sl_now = PositionGetDouble(POSITION_SL);
++      if(server_sl_now > 0.0)
++      {
++         int dir_now = g_exitTicketStatesV1235[idx].direction;
++         double tolerance_now = ProtectionToleranceV1235();
++         double be_level = ProtectionDesiredSLV1235(dir_now, g_exitTicketStatesV1235[idx].openPrice,
++                                                    g_exitTicketStatesV1235[idx].volume, ExitProtection_BEProfitUSD);
++         double lock_level = ProtectionDesiredSLV1235(dir_now, g_exitTicketStatesV1235[idx].openPrice,
++                                                      g_exitTicketStatesV1235[idx].volume, ExitProtection_LockProfitUSD);
++         bool changed = false;
++         if(!g_exitTicketStatesV1235[idx].beConfirmed && be_level > 0.0 &&
++            ServerSLSatisfiesLevelV1235(dir_now, server_sl_now, be_level, tolerance_now))
++         {
++            g_exitTicketStatesV1235[idx].beRight = true;
++            g_exitTicketStatesV1235[idx].beConfirmed = true;
++            g_exitTicketStatesV1235[idx].confirmedServerSL = server_sl_now;
++            g_exitBeConfirmedV1235++;
++            changed = true;
++         }
++         if(!g_exitTicketStatesV1235[idx].lockConfirmed && lock_level > 0.0 &&
++            ServerSLSatisfiesLevelV1235(dir_now, server_sl_now, lock_level, tolerance_now))
++         {
++            g_exitTicketStatesV1235[idx].lockRight = true;
++            g_exitTicketStatesV1235[idx].lockConfirmed = true;
++            g_exitTicketStatesV1235[idx].beConfirmed = true;
++            g_exitTicketStatesV1235[idx].confirmedServerSL = server_sl_now;
++            g_exitLockConfirmedV1235++;
++            changed = true;
++         }
++         if(changed)
++         {
++            LogMessage("[TICKET_STATE_RECONCILED] ticket=" + TicketToStringV1235(ticket) +
++                       " origem=sl_real_no_servidor sl=" + DoubleToString(server_sl_now, _Digits) +
++                       " be_conf=" + (g_exitTicketStatesV1235[idx].beConfirmed ? "1" : "0") +
++                       " lock_conf=" + (g_exitTicketStatesV1235[idx].lockConfirmed ? "1" : "0"));
++            UpdateTicketOpStateV1235(idx, "reconciliacao_sl");
++            PersistExitTicketStateV1235(idx, "reconciliacao_sl");
+          }
+       }
+    }
+ 
+    // Limpeza: somente depois de confirmar no servidor que o ticket nao existe.
+-   for(int s = g_exitTicketStateCountV1234 - 1; s >= 0; s--)
++   for(int s = g_exitTicketStateCountV1235 - 1; s >= 0; s--)
+    {
+-      if(!PositionSelectByTicket(g_exitTicketStatesV1234[s].ticket))
+-         RemoveExitTicketStateV1234(s, "ticket_confirmado_encerrado_no_servidor");
++      if(!PositionSelectByTicket(g_exitTicketStatesV1235[s].ticket))
++         RemoveExitTicketStateV1235(s, "ticket_confirmado_encerrado_no_servidor");
+    }
+ }
+ 
+ // SL alvo que protege aproximadamente protect_usd, respeitando direcao, volume,
+ // tick size, tick value e contrato (via helper monetario existente).
+-double ProtectionDesiredSLV1234(int direction, double open_price, double volume, double protect_usd)
++double ProtectionDesiredSLV1235(int direction, double open_price, double volume, double protect_usd)
+ {
+    double distance = USDToPriceDistance(protect_usd, volume);
+    if(distance <= 0.0)
+@@ -6573,7 +6976,7 @@
+    return NormalizePrice(open_price - distance);
+ }
+ 
+-bool ServerSLSatisfiesLevelV1234(int direction, double server_sl, double desired_sl, double tolerance)
++bool ServerSLSatisfiesLevelV1235(int direction, double server_sl, double desired_sl, double tolerance)
+ {
+    if(server_sl <= 0.0 || desired_sl <= 0.0)
+       return false;
+@@ -6582,24 +6985,147 @@
+    return (server_sl <= desired_sl + tolerance);
+ }
+ 
++// ================= V1.2.3.5 PROTECAO REAL CONFIRMADA NO SERVIDOR =================
++// UNICA autoridade que decide se um ticket esta realmente protegido. Retorna
++// true SOMENTE quando TODAS as condicoes valem:
++//   1) PositionSelectByTicket(ticket) verdadeiro (ticket existe no servidor);
++//   2) POSITION_SL > 0 (SL real, lido agora do servidor);
++//   3) o SL esta no lado protetor correto e protege >= ExitProtection_BEProfitUSD
++//      (com tolerancia de tick), coerente com direcao, volume, tick size/value;
++//   4) beConfirmed ou lockConfirmed foi confirmado por leitura real do servidor.
++// NUNCA considera protegido por: beRight/lockRight sem confirmacao, lucro atual
++// positivo, MFE alto, side_class, pedido aceito ou retcode sem releitura.
++bool HasConfirmedProtectiveSLV1235(int state_index)
++{
++   if(state_index < 0 || state_index >= g_exitTicketStateCountV1235)
++      return false;
++
++   ulong ticket = g_exitTicketStatesV1235[state_index].ticket;
++   if(!PositionSelectByTicket(ticket))
++      return false;
++
++   double server_sl = PositionGetDouble(POSITION_SL);
++   if(server_sl <= 0.0)
++      return false;
++
++   int direction = (int)PositionGetInteger(POSITION_TYPE);
++   double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
++   double volume = PositionGetDouble(POSITION_VOLUME);
++   double desired_be = ProtectionDesiredSLV1235(direction, open_price, volume, ExitProtection_BEProfitUSD);
++   if(desired_be <= 0.0)
++      return false;
++   if(!ServerSLSatisfiesLevelV1235(direction, server_sl, desired_be, ProtectionToleranceV1235()))
++      return false;
++
++   // Confirmacao registrada por releitura real (RequestProtectionSLV1235 ou
++   // reconciliacao do Sync com o POSITION_SL). Sem flag confirmada = sem protecao.
++   if(!g_exitTicketStatesV1235[state_index].beConfirmed &&
++      !g_exitTicketStatesV1235[state_index].lockConfirmed)
++      return false;
++
++   g_exitTicketStatesV1235[state_index].confirmedServerSL = server_sl;
++   return true;
++}
++
++// RUNNER POR TICKET: lock confirmado + SL real protegendo o lucro do tier Lock
++// + ticket vivo no servidor. side_class == "RUNNER" NAO e autoridade (contexto).
++bool TicketRunnerConfirmedV1235(int state_index)
++{
++   if(state_index < 0 || state_index >= g_exitTicketStateCountV1235)
++      return false;
++   if(!g_exitTicketStatesV1235[state_index].lockConfirmed)
++      return false;
++
++   ulong ticket = g_exitTicketStatesV1235[state_index].ticket;
++   if(!PositionSelectByTicket(ticket))
++      return false;
++
++   double server_sl = PositionGetDouble(POSITION_SL);
++   if(server_sl <= 0.0)
++      return false;
++
++   int direction = (int)PositionGetInteger(POSITION_TYPE);
++   double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
++   double volume = PositionGetDouble(POSITION_VOLUME);
++   double desired_lock = ProtectionDesiredSLV1235(direction, open_price, volume, ExitProtection_LockProfitUSD);
++   if(desired_lock <= 0.0)
++      return false;
++   if(!ServerSLSatisfiesLevelV1235(direction, server_sl, desired_lock, ProtectionToleranceV1235()))
++      return false;
++
++   if(!g_exitTicketStatesV1235[state_index].runnerLogged)
++   {
++      g_exitTicketStatesV1235[state_index].runnerLogged = true;
++      g_exitRunnersConfirmedV1235++;
++      LogMessage("[RUNNER_TICKET_CONFIRMED] ticket=" + TicketToStringV1235(ticket) +
++                 " direcao=" + (direction == (int)POSITION_TYPE_BUY ? "BUY" : "SELL") +
++                 " sl_servidor=" + DoubleToString(server_sl, _Digits) +
++                 " lucro_protegido_min=" + DoubleToString(ExitProtection_LockProfitUSD, 2) +
++                 " lucro_atual=" + DoubleToString(g_exitTicketStatesV1235[state_index].lastProfitUsd, 2) +
++                 " mfe=" + DoubleToString(g_exitTicketStatesV1235[state_index].peakMfeUsd, 2) +
++                 " saida_permitida=sl_trailing_alvo_superior_ou_risco_soberano");
++   }
++   return true;
++}
++
++// Maquina de estados operacional por ticket (autoridade de saida). Os estados
++// de fechamento (CLOSE_REQUESTED/RECONCILING/CLOSED) sao atribuidos pelas
++// rotinas de fechamento; aqui recalculamos os estados de protecao.
++void UpdateTicketOpStateV1235(int index, string origem)
++{
++   if(index < 0 || index >= g_exitTicketStateCountV1235)
++      return;
++
++   int previous = g_exitTicketStatesV1235[index].opState;
++   int next;
++   if(TicketRunnerConfirmedV1235(index))
++      next = (int)TICKET_RUNNER_CONFIRMED;
++   else if(g_exitTicketStatesV1235[index].lockConfirmed)
++      next = (int)TICKET_LOCK_CONFIRMED;
++   else if(g_exitTicketStatesV1235[index].lockRight)
++      next = (int)TICKET_LOCK_ELIGIBLE;
++   else if(g_exitTicketStatesV1235[index].beConfirmed)
++      next = (int)TICKET_BE_CONFIRMED;
++   else if(g_exitTicketStatesV1235[index].beRight)
++      next = (int)TICKET_BE_ELIGIBLE;
++   else if(g_exitTicketStatesV1235[index].peakMfeUsd <= ExitProtection_WeakMaxMFEUSD)
++      next = (int)TICKET_UNPROTECTED_LOW_MFE;   // diagnostico; NAO desliga o teto absoluto
++   else
++      next = (int)TICKET_UNPROTECTED;
++
++   if(next == previous)
++      return;
++
++   g_exitTicketStatesV1235[index].opState = next;
++   LogThrottledV1232("v1235_opstate_" + TicketToStringV1235(g_exitTicketStatesV1235[index].ticket),
++                     "[TICKET_STATE_UPDATED] ticket=" + TicketToStringV1235(g_exitTicketStatesV1235[index].ticket) +
++                     " de=" + TicketOpStateToTextV1235(previous) +
++                     " para=" + TicketOpStateToTextV1235(next) +
++                     " mfe=" + DoubleToString(g_exitTicketStatesV1235[index].peakMfeUsd, 2) +
++                     " mae=" + DoubleToString(g_exitTicketStatesV1235[index].maeUsd, 2) +
++                     " origem=" + origem, 5);
++}
++// =============== FIM V1.2.3.5 PROTECAO REAL CONFIRMADA NO SERVIDOR ===============
++
+ // Solicita e CONFIRMA o SL do tier (Break-even ou Lock) no servidor.
+-// Fluxo obrigatorio: calcular -> normalizar -> preservar TP -> modificar pelo
+-// ticket -> ler retcode -> re-selecionar pelo ticket -> ler POSITION_SL ->
+-// comparar com tolerancia de tick. Flag interna SOMENTE apos a confirmacao.
+-bool RequestProtectionSLV1234(int index, bool lock_tier)
++// Fluxo obrigatorio: calcular -> normalizar -> validar stops/freeze -> preservar
++// TP -> PositionModify pelo ticket -> verificar retcode -> re-selecionar o
++// ticket -> ler POSITION_SL -> comparar com tolerancia. A flag interna do tier
++// liga SOMENTE apos essa confirmacao. Nunca piora ou afasta um SL ja melhor.
++bool RequestProtectionSLV1235(int index, bool lock_tier)
+ {
+-   if(index < 0 || index >= g_exitTicketStateCountV1234)
++   if(index < 0 || index >= g_exitTicketStateCountV1235)
+       return false;
+ 
+-   ulong ticket = g_exitTicketStatesV1234[index].ticket;
++   ulong ticket = g_exitTicketStatesV1235[index].ticket;
+    datetime now = TimeCurrent();
+    int cooldown = MathMax(1, ExitProtection_ModifyCooldownSeconds);
+    // Tentativas esgotadas viram backoff (cooldown x10), nunca bloqueio
+    // permanente nem loop por tick; o fallback de devolucao extrema fica armado.
+-   if(g_exitTicketStatesV1234[index].modifyAttempts >= MathMax(1, ExitProtection_MaxModifyAttempts))
++   if(g_exitTicketStatesV1235[index].modifyAttempts >= MathMax(1, ExitProtection_MaxModifyAttempts))
+       cooldown *= 10;
+-   if(g_exitTicketStatesV1234[index].lastModifyAttempt > 0 &&
+-      (int)(now - g_exitTicketStatesV1234[index].lastModifyAttempt) < cooldown)
++   if(g_exitTicketStatesV1235[index].lastModifyAttempt > 0 &&
++      (int)(now - g_exitTicketStatesV1235[index].lastModifyAttempt) < cooldown)
+       return false;
+ 
+    if(!PositionSelectByTicket(ticket))
+@@ -6611,35 +7137,38 @@
+    double server_sl = PositionGetDouble(POSITION_SL);
+    double server_tp = PositionGetDouble(POSITION_TP);
+    double protect_usd = (lock_tier ? ExitProtection_LockProfitUSD : ExitProtection_BEProfitUSD);
+-   double desired_sl = ProtectionDesiredSLV1234(direction, open_price, volume, protect_usd);
++   double desired_sl = ProtectionDesiredSLV1235(direction, open_price, volume, protect_usd);
+    if(desired_sl <= 0.0)
+       return false;
+ 
+-   double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+-   double tolerance = MathMax(tick_size, _Point) * MathMax(1.0, ToleranciaConfirmacaoSLTicks);
++   double tolerance = ProtectionToleranceV1235();
+ 
+    // SL ja existente igual ou melhor que o tier: confirmar sem nova modificacao.
+-   if(ServerSLSatisfiesLevelV1234(direction, server_sl, desired_sl, tolerance))
++   if(ServerSLSatisfiesLevelV1235(direction, server_sl, desired_sl, tolerance))
+    {
+-      g_exitTicketStatesV1234[index].confirmedServerSL = server_sl;
+-      g_exitTicketStatesV1234[index].modifyAttempts = 0;
++      g_exitTicketStatesV1235[index].confirmedServerSL = server_sl;
++      g_exitTicketStatesV1235[index].modifyAttempts = 0;
+       if(lock_tier)
+       {
+-         if(!g_exitTicketStatesV1234[index].lockConfirmed)
++         if(!g_exitTicketStatesV1235[index].lockConfirmed)
+          {
+-            g_exitTicketStatesV1234[index].lockConfirmed = true;
+-            g_exitTicketStatesV1234[index].beConfirmed = true;
+-            g_exitLockConfirmedV1234++;
+-            LogMessage("[SL_SERVER_CONFIRMED] ticket=" + IntegerToString((int)ticket) +
+-                       " tier=LOCK origem=sl_existente_ja_melhor sl_servidor=" + DoubleToString(server_sl, _Digits));
++            g_exitTicketStatesV1235[index].lockConfirmed = true;
++            g_exitTicketStatesV1235[index].beConfirmed = true;
++            g_exitLockConfirmedV1235++;
++            LogMessage("[LOCK_SERVER_CONFIRMED] ticket=" + TicketToStringV1235(ticket) +
++                       " origem=sl_existente_ja_melhor sl_servidor=" + DoubleToString(server_sl, _Digits));
++            UpdateTicketOpStateV1235(index, "lock_confirmado");
++            PersistExitTicketStateV1235(index, "lock_confirmado");
+          }
+       }
+-      else if(!g_exitTicketStatesV1234[index].beConfirmed)
++      else if(!g_exitTicketStatesV1235[index].beConfirmed)
+       {
+-         g_exitTicketStatesV1234[index].beConfirmed = true;
+-         g_exitBeConfirmedV1234++;
+-         LogMessage("[SL_SERVER_CONFIRMED] ticket=" + IntegerToString((int)ticket) +
+-                    " tier=BE origem=sl_existente_ja_melhor sl_servidor=" + DoubleToString(server_sl, _Digits));
++         g_exitTicketStatesV1235[index].beConfirmed = true;
++         g_exitBeConfirmedV1235++;
++         LogMessage("[BE_SERVER_CONFIRMED] ticket=" + TicketToStringV1235(ticket) +
++                    " origem=sl_existente_ja_melhor sl_servidor=" + DoubleToString(server_sl, _Digits));
++         UpdateTicketOpStateV1235(index, "be_confirmado");
++         PersistExitTicketStateV1235(index, "be_confirmado");
+       }
+       return true;
+    }
+@@ -6652,7 +7181,7 @@
+       if(MathAbs(clamped - server_sl) <= tolerance)
+       {
+          g_exitMonotonicBlocksV1234++;
+-         LogMessage("[SL_MONOTONIC_BLOCK] ticket=" + IntegerToString((int)ticket) +
++         LogMessage("[SL_MONOTONIC_BLOCK] ticket=" + TicketToStringV1235(ticket) +
+                     " tier=" + (lock_tier ? "LOCK" : "BE") +
+                     " sl_servidor=" + DoubleToString(server_sl, _Digits) +
+                     " sl_desejado=" + DoubleToString(desired_sl, _Digits) +
+@@ -6667,27 +7196,28 @@
+    {
+       // Nivel do tier ja cruzado pelo preco (pullback profundo, gap ou spread):
+       // impossivel colocar o SL agora. Conta tentativa e arma o fallback.
+-      g_exitTicketStatesV1234[index].lastModifyAttempt = now;
+-      g_exitTicketStatesV1234[index].modifyAttempts++;
++      g_exitTicketStatesV1235[index].lastModifyAttempt = now;
++      g_exitTicketStatesV1235[index].modifyAttempts++;
+       g_exitSlNotConfirmedV1234++;
+-      LogThrottledV1232("v1234_sl_invalid_" + IntegerToString((int)ticket),
+-                        "[SL_SERVER_NOT_CONFIRMED] ticket=" + IntegerToString((int)ticket) +
++      LogThrottledV1232("v1235_sl_invalid_" + TicketToStringV1235(ticket),
++                        "[SERVER_SL_CONFIRM_FAILED] ticket=" + TicketToStringV1235(ticket) +
+                         " tier=" + (lock_tier ? "LOCK" : "BE") +
+                         " motivo=nivel_ja_cruzado_ou_stops_level sl_desejado=" + DoubleToString(desired_sl, _Digits) +
++                        " sl_observado=" + DoubleToString(server_sl, _Digits) +
+                         " bid=" + DoubleToString(g_tick.bid, _Digits) +
+                         " ask=" + DoubleToString(g_tick.ask, _Digits) +
+-                        " tentativas=" + IntegerToString(g_exitTicketStatesV1234[index].modifyAttempts), 10);
++                        " tentativas=" + IntegerToString(g_exitTicketStatesV1235[index].modifyAttempts), 10);
+       return false;
+    }
+ 
+-   g_exitTicketStatesV1234[index].lastModifyAttempt = now;
+-   g_exitTicketStatesV1234[index].modifyAttempts++;
+-   g_exitTicketStatesV1234[index].lastRequestedSL = desired_sl;
++   g_exitTicketStatesV1235[index].lastModifyAttempt = now;
++   g_exitTicketStatesV1235[index].modifyAttempts++;
++   g_exitTicketStatesV1235[index].lastRequestedSL = desired_sl;
+ 
+    // ModifyPositionSL ja executa: pedido pelo ticket, retcode, re-selecao,
+    // leitura de POSITION_SL e comparacao com tolerancia de tick (logs
+    // SL_MODIFY_REQUEST / SL_MODIFY_RETCODE / SL_SERVER_CONFIRMED / NOT_CONFIRMED).
+-   string tier_reason = (lock_tier ? "lock_mfe_v1234" : "breakeven_mfe_v1234");
++   string tier_reason = (lock_tier ? "lock_mfe_v1235" : "breakeven_mfe_v1235");
+    bool confirmed = ModifyPositionSL(ticket, desired_sl, server_tp, tier_reason);
+ 
+    // Confirmacao propria adicional (independe do input ConfirmarSLNoServidor):
+@@ -6697,51 +7227,70 @@
+       if(!PositionSelectByTicket(ticket))
+          return false; // encerrada logo apos: tratado como encerramento pelo sync
+       double confirmed_sl = PositionGetDouble(POSITION_SL);
+-      if(!ServerSLSatisfiesLevelV1234(direction, confirmed_sl, desired_sl, tolerance))
++      if(!ServerSLSatisfiesLevelV1235(direction, confirmed_sl, desired_sl, tolerance))
+       {
+          g_exitSlNotConfirmedV1234++;
+-         LogMessage("[SL_SERVER_NOT_CONFIRMED] ticket=" + IntegerToString((int)ticket) +
++         LogMessage("[SERVER_SL_CONFIRM_FAILED] ticket=" + TicketToStringV1235(ticket) +
+                     " tier=" + (lock_tier ? "LOCK" : "BE") +
+                     " motivo=releitura_divergente esperado=" + DoubleToString(desired_sl, _Digits) +
+-                    " servidor=" + DoubleToString(confirmed_sl, _Digits));
++                    " sl_observado=" + DoubleToString(confirmed_sl, _Digits));
+          return false;
+       }
+-      g_exitTicketStatesV1234[index].confirmedServerSL = confirmed_sl;
+-      g_exitTicketStatesV1234[index].modifyAttempts = 0;
++      g_exitTicketStatesV1235[index].confirmedServerSL = confirmed_sl;
++      g_exitTicketStatesV1235[index].modifyAttempts = 0;
+       if(lock_tier)
+       {
+-         g_exitTicketStatesV1234[index].lockConfirmed = true;
+-         g_exitTicketStatesV1234[index].beConfirmed = true;
+-         g_exitLockConfirmedV1234++;
++         g_exitTicketStatesV1235[index].lockConfirmed = true;
++         g_exitTicketStatesV1235[index].beConfirmed = true;
++         g_exitLockConfirmedV1235++;
++         LogMessage("[LOCK_SERVER_CONFIRMED] ticket=" + TicketToStringV1235(ticket) +
++                    " sl_servidor=" + DoubleToString(confirmed_sl, _Digits) +
++                    " lucro_protegido=" + DoubleToString(ExitProtection_LockProfitUSD, 2));
++         UpdateTicketOpStateV1235(index, "lock_confirmado");
++         PersistExitTicketStateV1235(index, "lock_confirmado");
+       }
+       else
+       {
+-         g_exitTicketStatesV1234[index].beConfirmed = true;
+-         g_exitBeConfirmedV1234++;
++         g_exitTicketStatesV1235[index].beConfirmed = true;
++         g_exitBeConfirmedV1235++;
++         LogMessage("[BE_SERVER_CONFIRMED] ticket=" + TicketToStringV1235(ticket) +
++                    " sl_servidor=" + DoubleToString(confirmed_sl, _Digits) +
++                    " lucro_protegido=" + DoubleToString(ExitProtection_BEProfitUSD, 2));
++         UpdateTicketOpStateV1235(index, "be_confirmado");
++         PersistExitTicketStateV1235(index, "be_confirmado");
+       }
+       return true;
+    }
+ 
++   // Falha registrada com retcode/POSITION_SL pelos logs do ModifyPositionSL;
++   // nenhuma protecao virtual e marcada e a tentativa respeita o cooldown.
+    g_exitSlNotConfirmedV1234++;
++   LogThrottledV1232("v1235_sl_fail_" + TicketToStringV1235(ticket),
++                     "[SERVER_SL_CONFIRM_FAILED] ticket=" + TicketToStringV1235(ticket) +
++                     " tier=" + (lock_tier ? "LOCK" : "BE") +
++                     " motivo=modificacao_nao_confirmada sl_desejado=" + DoubleToString(desired_sl, _Digits) +
++                     " tentativas=" + IntegerToString(g_exitTicketStatesV1235[index].modifyAttempts), 10);
+    return false;
+ }
+ 
+ // Fecha SOMENTE o ticket informado, verifica retcode e confirma que a posicao
+ // deixou de existir. O estado por ticket e limpo apenas apos essa confirmacao
+-// (pelo SyncExitTicketStatesV1234 do proximo ciclo, que reconfirma no servidor).
+-bool CloseSingleTicketV1234(int index, string tag, string reason)
++// (pelo SyncExitTicketStatesV1235 do proximo ciclo, que reconfirma no servidor).
++// authority identifica a autoridade solicitante: TICKET_MAX_LOSS, WEAK_SIDE_CUT,
++// UNPROTECTED_GIVEBACK ou GENERIC_EXIT_SELECTIVE.
++bool CloseSingleTicketV1235(int index, string authority, string reason)
+ {
+-   if(index < 0 || index >= g_exitTicketStateCountV1234)
++   if(index < 0 || index >= g_exitTicketStateCountV1235)
+       return false;
+ 
+-   ulong ticket = g_exitTicketStatesV1234[index].ticket;
++   ulong ticket = g_exitTicketStatesV1235[index].ticket;
+    datetime now = TimeCurrent();
+    int base_cooldown = MathMax(1, ExitProtection_ModifyCooldownSeconds);
+    int cooldown = base_cooldown;
+-   if(g_exitTicketStatesV1234[index].closeAttempts >= MathMax(1, ExitProtection_MaxModifyAttempts))
++   if(g_exitTicketStatesV1235[index].closeAttempts >= MathMax(1, ExitProtection_MaxModifyAttempts))
+       cooldown = base_cooldown * 10; // backoff: mercado fechado, rejeicao, iliquidez
+-   if(g_exitTicketStatesV1234[index].lastCloseAttempt > 0 &&
+-      (int)(now - g_exitTicketStatesV1234[index].lastCloseAttempt) < cooldown)
++   if(g_exitTicketStatesV1235[index].lastCloseAttempt > 0 &&
++      (int)(now - g_exitTicketStatesV1235[index].lastCloseAttempt) < cooldown)
+       return false;
+ 
+    if(!PositionSelectByTicket(ticket))
+@@ -6751,9 +7300,11 @@
+    double volume = PositionGetDouble(POSITION_VOLUME);
+    int direction = (int)PositionGetInteger(POSITION_TYPE);
+    double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
++   double server_sl = PositionGetDouble(POSITION_SL);
+    double price_now = (direction == (int)POSITION_TYPE_BUY ? g_tick.bid : g_tick.ask);
++   string ticket_txt = TicketToStringV1235(ticket);
+ 
+-   LogMessage(tag + "_REQUEST] ticket=" + IntegerToString((int)ticket) +
++   LogMessage("[TICKET_CLOSE_REQUEST] ticket=" + ticket_txt +
+               " simbolo=" + _Symbol +
+               " magic=" + IntegerToString(MagicNumber) +
+               " direcao=" + (direction == (int)POSITION_TYPE_BUY ? "BUY" : "SELL") +
+@@ -6761,230 +7312,481 @@
+               " abertura=" + DoubleToString(open_price, _Digits) +
+               " preco_atual=" + DoubleToString(price_now, _Digits) +
+               " lucro=" + DoubleToString(profit, 2) +
+-              " mfe=" + DoubleToString(g_exitTicketStatesV1234[index].peakMfeUsd, 2) +
++              " mfe=" + DoubleToString(g_exitTicketStatesV1235[index].peakMfeUsd, 2) +
++              " mae=" + DoubleToString(g_exitTicketStatesV1235[index].maeUsd, 2) +
++              " sl_servidor=" + DoubleToString(server_sl, _Digits) +
++              " be_conf=" + (g_exitTicketStatesV1235[index].beConfirmed ? "1" : "0") +
++              " lock_conf=" + (g_exitTicketStatesV1235[index].lockConfirmed ? "1" : "0") +
++              " autoridade=" + authority +
+               " motivo=" + reason +
+               " obs=slippage_gap_ou_spread_podem_variar_o_valor_final");
+-
+-   g_exitTicketStatesV1234[index].lastCloseAttempt = now;
+-   g_exitTicketStatesV1234[index].closeAttempts++;
++   if(authority == "WEAK_SIDE_CUT")
++      LogMessage("[WEAK_SIDE_TICKET_CUT_REQUEST] ticket=" + ticket_txt +
++                 " lucro=" + DoubleToString(profit, 2) + " motivo=" + reason);
++   if(authority == "UNPROTECTED_GIVEBACK")
++      LogMessage("[UNPROTECTED_GIVEBACK_CLOSE_REQUEST] ticket=" + ticket_txt +
++                 " lucro=" + DoubleToString(profit, 2) +
++                 " mfe=" + DoubleToString(g_exitTicketStatesV1235[index].peakMfeUsd, 2) + " motivo=" + reason);
++
++   g_exitTicketStatesV1235[index].lastCloseAttempt = now;
++   g_exitTicketStatesV1235[index].closeAttempts++;
++   g_exitTicketStatesV1235[index].lastDecisionReason = authority + ":" + reason;
++   g_exitTicketStatesV1235[index].opState = (int)TICKET_CLOSE_REQUESTED;
+    g_exitCloseSentThisTickV1234 = true;
++   g_exitActionSentThisTickV1235 = true;
+ 
+    bool sent = trade.PositionClose(ticket, SlippagePoints);
+    uint retcode = trade.ResultRetcode();
+    if(!sent || !IsTradeRetcodeSuccessV122(retcode))
+    {
+-      g_exitWeakCloseFailsV1234++;
+-      LogMessage(tag + "_FAILED] ticket=" + IntegerToString((int)ticket) +
++      g_exitCloseFailsV1235++;
++      LogMessage("[TICKET_CLOSE_FAILED] ticket=" + ticket_txt +
++                 " autoridade=" + authority +
+                  " retcode=" + IntegerToString((int)retcode) +
+                  " desc=" + trade.ResultRetcodeDescription() +
+-                 " tentativas=" + IntegerToString(g_exitTicketStatesV1234[index].closeAttempts));
++                 " tentativas=" + IntegerToString(g_exitTicketStatesV1235[index].closeAttempts));
+       return false;
+    }
+ 
+    g_tradeStateDirty = true;
+    if(PositionSelectByTicket(ticket))
+    {
+-      // Envio aceito mas ticket ainda visivel: aguardar reconciliacao.
+-      LogMessage(tag + "_FAILED] ticket=" + IntegerToString((int)ticket) +
+-                 " motivo=aguardando_confirmacao_servidor retcode=" + IntegerToString((int)retcode));
++      // Envio aceito mas ticket ainda visivel: aguardar reconciliacao real.
++      g_exitTicketStatesV1235[index].opState = (int)TICKET_CLOSE_RECONCILING;
++      LogMessage("[TICKET_CLOSE_FAILED] ticket=" + ticket_txt +
++                 " autoridade=" + authority +
++                 " motivo=aguardando_confirmacao_servidor estado=TICKET_CLOSE_RECONCILING" +
++                 " retcode=" + IntegerToString((int)retcode));
+       return false;
+    }
+ 
+-   LogMessage(tag + "_CONFIRMED] ticket=" + IntegerToString((int)ticket) +
++   LogMessage("[TICKET_CLOSE_CONFIRMED] ticket=" + ticket_txt +
++              " autoridade=" + authority +
+               " lucro_no_pedido=" + DoubleToString(profit, 2) +
+               " retcode=" + IntegerToString((int)retcode) +
+               " posicao_inexistente_no_servidor=1");
+-   RemoveExitTicketStateV1234(index, "fechamento_confirmado_" + reason);
++   if(authority == "WEAK_SIDE_CUT")
++      LogMessage("[WEAK_SIDE_TICKET_CUT_CONFIRMED] ticket=" + ticket_txt +
++                 " lucro_no_pedido=" + DoubleToString(profit, 2) + " motivo=" + reason);
++   if(authority == "UNPROTECTED_GIVEBACK")
++      LogMessage("[UNPROTECTED_GIVEBACK_CLOSE_CONFIRMED] ticket=" + ticket_txt +
++                 " lucro_no_pedido=" + DoubleToString(profit, 2) + " motivo=" + reason);
++   RemoveExitTicketStateV1235(index, "fechamento_confirmado_" + reason);
+    return true;
+ }
+ 
+-// AUTORIDADE POR TICKET (ordem interna): 1) teto de perda WEAK; 2) direitos de
+-// BE/Lock por MFE (permanentes, imunes a pullback); 3) SL real do tier mais
+-// alto pendente; 4) fallback de devolucao extrema sem SL confirmado.
+-void ManageExitProtectionV1234()
++// AUTORIDADE POR TICKET (ordem interna): 1) TETO ABSOLUTO de perda do ticket
++// desprotegido (independe de side_class e de MFE); 2) direitos de BE/Lock por
++// MFE (permanentes, imunes a pullback); 3) SL real do tier mais alto pendente;
++// 4) fallback de devolucao extrema sem SL confirmado; 5) estado operacional.
++void ManageExitProtectionV1235()
+ {
+-   g_exitCloseSentThisTickV1234 = false;
+    if(!ExitProtection_Enable)
+       return;
+ 
+-   // MFE continua sendo atualizado mesmo durante fechamentos (somente leitura).
+-   SyncExitTicketStatesV1234();
++   // MFE/MAE continuam sendo atualizados mesmo durante fechamentos (leitura).
++   SyncExitTicketStatesV1235();
+ 
+-   if(g_exitTicketStateCountV1234 <= 0)
++   if(g_exitTicketStateCountV1235 <= 0)
+       return;
+ 
+    // Nao competir com um fechamento de cesta ja em andamento.
+    if(IsClosingScopeActiveV122() || g_FechamentoMFECestaEmAndamento)
+       return;
+ 
+-   // Classificacao existente por lado (criterios INALTERADOS).
++   // Classificacao existente por lado: criterios INALTERADOS e usada SOMENTE
++   // como contexto informativo nos logs. NAO e autoridade de corte individual.
+    string buy_class = ClassifySideV123(POSITION_TYPE_BUY);
+    string sell_class = ClassifySideV123(POSITION_TYPE_SELL);
+ 
+-   for(int idx = g_exitTicketStateCountV1234 - 1; idx >= 0; idx--)
++   for(int idx = g_exitTicketStateCountV1235 - 1; idx >= 0; idx--)
+    {
+-      ulong ticket = g_exitTicketStatesV1234[idx].ticket;
++      ulong ticket = g_exitTicketStatesV1235[idx].ticket;
+       if(!PositionSelectByTicket(ticket))
+          continue; // encerrada; sync do proximo ciclo confirma e limpa
+ 
+       double profit = GetSelectedPositionProfitWithCosts();
+       int direction = (int)PositionGetInteger(POSITION_TYPE);
++      double server_sl = PositionGetDouble(POSITION_SL);
+       string side_class = (direction == (int)POSITION_TYPE_BUY ? buy_class : sell_class);
+-      double peak = g_exitTicketStatesV1234[idx].peakMfeUsd;
++      double peak = g_exitTicketStatesV1235[idx].peakMfeUsd;
+ 
+-      // (1) TETO DE PERDA WEAK: classe existente WEAK + pouco ou nenhum MFE.
+-      if(side_class == "WEAK" &&
+-         profit <= -MathAbs(ExitProtection_WeakMaxLossUSD) &&
+-         peak <= ExitProtection_WeakMaxMFEUSD &&
+-         !g_exitCloseSentThisTickV1234)
+-      {
+-         LogMessage("[WEAK_MAX_LOSS_TRIGGER] ticket=" + IntegerToString((int)ticket) +
+-                    " classe=" + side_class +
++      // (1) TETO ABSOLUTO DE PERDA POR TICKET DESPROTEGIDO (V1.2.3.5).
++      // Dispara para QUALQUER ticket sem SL protetor real confirmado que atinja
++      // a perda maxima, INDEPENDENTEMENTE de: side_class, bias, classe agregada
++      // (RECOVERY/BALANCED/STRONG/RUNNER/PROTECTED), MFE (nenhuma faixa
++      // WeakMaxMFE..BETrigger desliga o teto), quantidade de posicoes, resultado
++      // da cesta, lucro do lado oposto, preco medio ou alvo da cesta.
++      // A execucao real pode ultrapassar por spread/gap/latencia/slippage
++      // (registrado no log de fechamento), mas a logica nunca autoriza o ticket
++      // a permanecer aberto alem do limite.
++      if(profit <= -MathAbs(ExitProtection_WeakMaxLossUSD) &&
++         !g_exitCloseSentThisTickV1234 &&
++         !g_exitActionSentThisTickV1235 &&
++         !HasConfirmedProtectiveSLV1235(idx))
++      {
++         LogMessage("[UNPROTECTED_TICKET_MAX_LOSS_TRIGGER] ticket=" + TicketToStringV1235(ticket) +
++                    " direcao=" + (direction == (int)POSITION_TYPE_BUY ? "BUY" : "SELL") +
++                    " volume=" + DoubleToString(g_exitTicketStatesV1235[idx].volume, 2) +
+                     " lucro=" + DoubleToString(profit, 2) +
+-                    " limite=" + DoubleToString(-MathAbs(ExitProtection_WeakMaxLossUSD), 2) +
+                     " mfe=" + DoubleToString(peak, 2) +
+-                    " mfe_max_permitido=" + DoubleToString(ExitProtection_WeakMaxMFEUSD, 2));
+-         LogMessage("[EXIT_AUTHORITY_DECISION] ticket=" + IntegerToString((int)ticket) +
+-                    " classe=" + side_class + " decisao=CLOSE autoridade=WEAK_MAX_LOSS");
+-         if(CloseSingleTicketV1234(idx, "[WEAK_CLOSE", "weak_max_loss"))
+-            g_exitWeakClosesV1234++;
++                    " mae=" + DoubleToString(g_exitTicketStatesV1235[idx].maeUsd, 2) +
++                    " side_class_informativa=" + side_class +
++                    " sl_atual=" + DoubleToString(server_sl, _Digits) +
++                    " be_conf=" + (g_exitTicketStatesV1235[idx].beConfirmed ? "1" : "0") +
++                    " lock_conf=" + (g_exitTicketStatesV1235[idx].lockConfirmed ? "1" : "0") +
++                    " limite=" + DoubleToString(-MathAbs(ExitProtection_WeakMaxLossUSD), 2) +
++                    " decisao=CLOSE autoridade=TICKET_MAX_LOSS");
++         LogMessage("[EXIT_AUTHORITY_DECISION] ticket=" + TicketToStringV1235(ticket) +
++                    " classe_contexto=" + side_class + " decisao=CLOSE autoridade=TICKET_MAX_LOSS");
++         if(CloseSingleTicketV1235(idx, "TICKET_MAX_LOSS", "teto_absoluto_ticket_desprotegido"))
++            g_exitCapClosesV1235++;
+          continue; // nunca fechar e modificar o mesmo ticket no mesmo ciclo
+       }
+ 
+       // (2) DIREITOS POR MFE: permanentes; pullback NAO cancela o direito.
+-      if(!g_exitTicketStatesV1234[idx].lockRight && peak >= ExitProtection_LockTriggerMFEUSD)
++      if(!g_exitTicketStatesV1235[idx].lockRight && peak >= ExitProtection_LockTriggerMFEUSD)
+       {
+-         g_exitTicketStatesV1234[idx].lockRight = true;
+-         g_exitTicketStatesV1234[idx].beRight = true;
+-         LogMessage("[LOCK_MFE_TRIGGER] ticket=" + IntegerToString((int)ticket) +
++         g_exitTicketStatesV1235[idx].lockRight = true;
++         g_exitTicketStatesV1235[idx].beRight = true;
++         LogMessage("[LOCK_RIGHT_GRANTED] ticket=" + TicketToStringV1235(ticket) +
+                     " mfe=" + DoubleToString(peak, 2) +
+                     " gatilho=" + DoubleToString(ExitProtection_LockTriggerMFEUSD, 2) +
+                     " lucro_atual=" + DoubleToString(profit, 2) +
+-                    " alvo_protegido=" + DoubleToString(ExitProtection_LockProfitUSD, 2));
++                    " alvo_protegido=" + DoubleToString(ExitProtection_LockProfitUSD, 2) +
++                    " obs=direito_interno_nao_e_protecao_real_ate_confirmar_sl");
+          if(profit < ExitProtection_LockTriggerMFEUSD)
+-            LogMessage("[PROFIT_MEMORY_PROTECTION] ticket=" + IntegerToString((int)ticket) +
++            LogMessage("[PROFIT_MEMORY_PROTECTION] ticket=" + TicketToStringV1235(ticket) +
+                        " mfe=" + DoubleToString(peak, 2) +
+                        " lucro_atual=" + DoubleToString(profit, 2) +
+                        " direito=LOCK mantido_apos_pullback=1");
++         UpdateTicketOpStateV1235(idx, "lock_right");
++         PersistExitTicketStateV1235(idx, "lock_right");
+       }
+-      if(!g_exitTicketStatesV1234[idx].beRight && peak >= ExitProtection_BETriggerMFEUSD)
++      if(!g_exitTicketStatesV1235[idx].beRight && peak >= ExitProtection_BETriggerMFEUSD)
+       {
+-         g_exitTicketStatesV1234[idx].beRight = true;
+-         LogMessage("[BE_MFE_TRIGGER] ticket=" + IntegerToString((int)ticket) +
++         g_exitTicketStatesV1235[idx].beRight = true;
++         LogMessage("[BE_RIGHT_GRANTED] ticket=" + TicketToStringV1235(ticket) +
+                     " mfe=" + DoubleToString(peak, 2) +
+                     " gatilho=" + DoubleToString(ExitProtection_BETriggerMFEUSD, 2) +
+                     " lucro_atual=" + DoubleToString(profit, 2) +
+-                    " alvo_protegido=" + DoubleToString(ExitProtection_BEProfitUSD, 2));
++                    " alvo_protegido=" + DoubleToString(ExitProtection_BEProfitUSD, 2) +
++                    " obs=direito_interno_nao_e_protecao_real_ate_confirmar_sl");
+          if(profit < ExitProtection_BETriggerMFEUSD)
+-            LogMessage("[PROFIT_MEMORY_PROTECTION] ticket=" + IntegerToString((int)ticket) +
++            LogMessage("[PROFIT_MEMORY_PROTECTION] ticket=" + TicketToStringV1235(ticket) +
+                        " mfe=" + DoubleToString(peak, 2) +
+                        " lucro_atual=" + DoubleToString(profit, 2) +
+                        " direito=BE mantido_apos_pullback=1");
++         UpdateTicketOpStateV1235(idx, "be_right");
++         PersistExitTicketStateV1235(idx, "be_right");
+       }
+ 
+       // (3) SL REAL DO TIER MAIS ALTO PENDENTE (progressao: BE -> Lock -> trailing).
+-      if(g_exitTicketStatesV1234[idx].lockRight && !g_exitTicketStatesV1234[idx].lockConfirmed)
+-         RequestProtectionSLV1234(idx, true);
+-      else if(g_exitTicketStatesV1234[idx].beRight && !g_exitTicketStatesV1234[idx].beConfirmed)
+-         RequestProtectionSLV1234(idx, false);
++      if(g_exitTicketStatesV1235[idx].lockRight && !g_exitTicketStatesV1235[idx].lockConfirmed)
++         RequestProtectionSLV1235(idx, true);
++      else if(g_exitTicketStatesV1235[idx].beRight && !g_exitTicketStatesV1235[idx].beConfirmed)
++         RequestProtectionSLV1235(idx, false);
+ 
+       // (4) DEVOLUCAO EXTREMA: somente sem NENHUM SL protetor confirmado,
+-      // com tentativas esgotadas e devolucao perigosa do lucro.
+-      if(g_exitTicketStatesV1234[idx].beRight &&
+-         !g_exitTicketStatesV1234[idx].beConfirmed &&
+-         !g_exitTicketStatesV1234[idx].lockConfirmed &&
++      // com tentativas esgotadas e devolucao perigosa do lucro. Direito sem
++      // confirmacao NUNCA preserva o ticket.
++      if(g_exitTicketStatesV1235[idx].beRight &&
++         !g_exitTicketStatesV1235[idx].beConfirmed &&
++         !g_exitTicketStatesV1235[idx].lockConfirmed &&
+          ExitProtection_EmergencyGivebackUSD > 0.0 &&
+-         g_exitTicketStatesV1234[idx].modifyAttempts >= MathMax(1, ExitProtection_MaxModifyAttempts) &&
+-         profit <= g_exitTicketStatesV1234[idx].peakMfeUsd - MathAbs(ExitProtection_EmergencyGivebackUSD) &&
+-         !g_exitCloseSentThisTickV1234)
++         g_exitTicketStatesV1235[idx].modifyAttempts >= MathMax(1, ExitProtection_MaxModifyAttempts) &&
++         profit <= g_exitTicketStatesV1235[idx].peakMfeUsd - MathAbs(ExitProtection_EmergencyGivebackUSD) &&
++         !g_exitCloseSentThisTickV1234 &&
++         !g_exitActionSentThisTickV1235)
+       {
+-         LogMessage("[EMERGENCY_GIVEBACK_TRIGGER] ticket=" + IntegerToString((int)ticket) +
+-                    " mfe=" + DoubleToString(g_exitTicketStatesV1234[idx].peakMfeUsd, 2) +
++         LogMessage("[UNPROTECTED_GIVEBACK_TRIGGER] ticket=" + TicketToStringV1235(ticket) +
++                    " mfe=" + DoubleToString(g_exitTicketStatesV1235[idx].peakMfeUsd, 2) +
+                     " lucro=" + DoubleToString(profit, 2) +
+-                    " devolucao=" + DoubleToString(g_exitTicketStatesV1234[idx].peakMfeUsd - profit, 2) +
++                    " devolucao=" + DoubleToString(g_exitTicketStatesV1235[idx].peakMfeUsd - profit, 2) +
+                     " limite=" + DoubleToString(MathAbs(ExitProtection_EmergencyGivebackUSD), 2) +
+-                    " tentativas_sl=" + IntegerToString(g_exitTicketStatesV1234[idx].modifyAttempts) +
++                    " tentativas_sl=" + IntegerToString(g_exitTicketStatesV1235[idx].modifyAttempts) +
+                     " sl_confirmado=0");
+-         LogMessage("[EXIT_AUTHORITY_DECISION] ticket=" + IntegerToString((int)ticket) +
+-                    " classe=" + side_class + " decisao=CLOSE autoridade=EMERGENCY_GIVEBACK");
+-         if(CloseSingleTicketV1234(idx, "[GIVEBACK_CLOSE", "emergency_giveback"))
+-            g_exitGivebackClosesV1234++;
++         LogMessage("[EXIT_AUTHORITY_DECISION] ticket=" + TicketToStringV1235(ticket) +
++                    " classe_contexto=" + side_class + " decisao=CLOSE autoridade=UNPROTECTED_GIVEBACK");
++         if(CloseSingleTicketV1235(idx, "UNPROTECTED_GIVEBACK", "devolucao_sem_sl_confirmado"))
++         {
++            g_exitGivebackClosesV1235++;
++            continue;
++         }
+       }
++
++      // (5) Estado operacional do ticket (autoridade de saida, nao a classe).
++      UpdateTicketOpStateV1235(idx, "gestao_protecao");
+    }
+ }
+ 
+-// Guard das saidas GENERICAS de cesta (linha dinamica >= US$5 e lock da cesta
+-// <= US$7): nao podem matar GOOD (+5..+10) nem RUNNER/PROTECTED nem ticket com
+-// direito de Lock por MFE. NAO bloqueia: alvo da cesta, fechamento forte por
+-// pico, extracao do lado fraco, DD, loss diario, emergencia ou fechamento manual.
+-bool BlockGenericBasketExitV1234(string trigger, double basket_profit)
++// ==================== V1.2.3.5 CORTE SELETIVO DO LADO FRACO ====================
++// Seleciona o pior ticket do lado fraco elegivel ao corte: negativo (quando
++// exigido), SEM SL protetor real confirmado e SEM BE/Lock confirmados.
++// Tickets protegidos sao preservados em QUALQUER lado.
++int SelectWeakSideCutCandidateV1235(int weak_direction, bool require_negative)
++{
++   int worst_index = -1;
++   double worst_profit = DBL_MAX;
++   for(int i = 0; i < g_exitTicketStateCountV1235; i++)
++   {
++      if(g_exitTicketStatesV1235[i].direction != weak_direction)
++         continue;
++      if(!PositionSelectByTicket(g_exitTicketStatesV1235[i].ticket))
++         continue;
++      double profit = GetSelectedPositionProfitWithCosts();
++      if(require_negative && profit >= 0.0)
++         continue;
++      if(g_exitTicketStatesV1235[i].beConfirmed || g_exitTicketStatesV1235[i].lockConfirmed)
++         continue; // BE/Lock confirmado nunca e cortado pela extracao
++      if(HasConfirmedProtectiveSLV1235(i))
++         continue; // SL protetor real confirmado: preservar
++      if(profit < worst_profit)
++      {
++         worst_profit = profit;
++         worst_index = i;
++      }
++   }
++   return worst_index;
++}
++
++// Corta no maximo UM ticket fraco por OnTick (anti corrida transacional) e
++// registra a preservacao dos tickets fortes/protegidos.
++bool CutOneWeakTicketV1235(int weak_direction, string trigger, string authority, bool require_negative)
+ {
+    if(!ExitProtection_Enable)
+       return false;
++   if(g_exitCloseSentThisTickV1234 || g_exitActionSentThisTickV1235)
++      return false; // no maximo um fechamento por tick
+ 
+-   string buy_class = ClassifySideV123(POSITION_TYPE_BUY);
+-   string sell_class = ClassifySideV123(POSITION_TYPE_SELL);
++   int idx = SelectWeakSideCutCandidateV1235(weak_direction, require_negative);
++   if(idx < 0)
++      return false;
+ 
+-   for(int i = PositionsTotal() - 1; i >= 0; i--)
++   ulong ticket = g_exitTicketStatesV1235[idx].ticket;
++   string side_txt = (weak_direction == (int)POSITION_TYPE_BUY ? "BUY" : "SELL");
++   double side_profit = (weak_direction == (int)POSITION_TYPE_BUY ? GetBuyBasketProfit() : GetSellBasketProfit());
++   double opposite_profit = (weak_direction == (int)POSITION_TYPE_BUY ? GetSellBasketProfit() : GetBuyBasketProfit());
++   string side_class = ClassifySideV123((ENUM_POSITION_TYPE)weak_direction);
++   LogMessage("[WEAK_SIDE_TICKET_SELECTED] ticket=" + TicketToStringV1235(ticket) +
++              " direcao=" + side_txt +
++              " side_class_contexto=" + side_class +
++              " side_profit=" + DoubleToString(side_profit, 2) +
++              " opposite_side_profit=" + DoubleToString(opposite_profit, 2) +
++              " basket_profit=" + DoubleToString(GetBasketProfit(), 2) +
++              " lucro=" + DoubleToString(g_exitTicketStatesV1235[idx].lastProfitUsd, 2) +
++              " mfe=" + DoubleToString(g_exitTicketStatesV1235[idx].peakMfeUsd, 2) +
++              " mae=" + DoubleToString(g_exitTicketStatesV1235[idx].maeUsd, 2) +
++              " sl_servidor=" + DoubleToString(g_exitTicketStatesV1235[idx].confirmedServerSL, _Digits) +
++              " be_conf=" + (g_exitTicketStatesV1235[idx].beConfirmed ? "1" : "0") +
++              " lock_conf=" + (g_exitTicketStatesV1235[idx].lockConfirmed ? "1" : "0") +
++              " motivo=" + trigger +
++              " autoridade=" + authority);
++
++   bool confirmed = CloseSingleTicketV1235(idx, authority, trigger);
++   bool request_sent = (g_exitActionSentThisTickV1235 || g_exitCloseSentThisTickV1234);
++   if(request_sent)
+    {
+-      ulong ticket = PositionGetTicket(i);
+-      if(ticket == 0)
+-         continue;
+-      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+-         continue;
+-      if((long)PositionGetInteger(POSITION_MAGIC) != MagicNumber)
+-         continue;
++      if(confirmed)
++         g_exitWeakSideCutsV1235++;
++      g_lastSideExtractionTimeV123 = TimeCurrent();
++      // Preservacao explicita dos tickets fortes com protecao real confirmada.
++      int opposite_direction = (weak_direction == (int)POSITION_TYPE_BUY
++                                ? (int)POSITION_TYPE_SELL : (int)POSITION_TYPE_BUY);
++      for(int s = 0; s < g_exitTicketStateCountV1235; s++)
++      {
++         if(g_exitTicketStatesV1235[s].direction != opposite_direction)
++            continue;
++         if(!HasConfirmedProtectiveSLV1235(s))
++            continue;
++         LogThrottledV1232("v1235_strong_preserved_" + TicketToStringV1235(g_exitTicketStatesV1235[s].ticket),
++                           "[STRONG_TICKET_PRESERVED] ticket=" + TicketToStringV1235(g_exitTicketStatesV1235[s].ticket) +
++                           " sl_servidor=" + DoubleToString(g_exitTicketStatesV1235[s].confirmedServerSL, _Digits) +
++                           " lucro=" + DoubleToString(g_exitTicketStatesV1235[s].lastProfitUsd, 2) +
++                           " mfe=" + DoubleToString(g_exitTicketStatesV1235[s].peakMfeUsd, 2) +
++                           " motivo=protecao_real_confirmada trigger=" + trigger, 10);
++      }
++   }
++   return request_sent;
++}
++
++// CORTE DO LADO FRACO EM TEMPO REAL (V1.2.3.5). Requisitos:
++// BUY e SELL abertos; lado forte CONFIRMADO por pelo menos um ticket com Lock
++// confirmado OU por ticket com BE confirmado e lucro do lado >=
++// LucroMinimoLadoForteV123. NAO exige lucro total positivo da cesta nem
++// basket_profit >= LucroMinimoCestaExtracaoV123. Respeita o cooldown
++// CooldownExtracaoLadoSegundosV123 (o teto absoluto por ticket roda ANTES e
++// nunca e bloqueado por esse cooldown). Fecha no maximo um ticket por tick.
++bool TryCutConfirmedWeakSideV1235()
++{
++   if(!ExitProtection_Enable)
++      return false;
++   if(!UsarExtracaoContinuaV123 || !PreservarLadoForteNaExtracaoV123)
++      return false; // chaves existentes da extracao continuam soberanas
++   if(g_exitCloseSentThisTickV1234 || g_exitActionSentThisTickV1235)
++      return false;
++   if(IsClosingScopeActiveV122() || g_FechamentoMFECestaEmAndamento)
++      return false;
++   if(CountBuyPositions() <= 0 || CountSellPositions() <= 0)
++      return false;
++   if(CooldownExtracaoLadoSegundosV123 > 0 && g_lastSideExtractionTimeV123 > 0 &&
++      (int)(TimeCurrent() - g_lastSideExtractionTimeV123) < CooldownExtracaoLadoSegundosV123)
++      return false;
+ 
+-      double profit = GetSelectedPositionProfitWithCosts();
+-      int direction = (int)PositionGetInteger(POSITION_TYPE);
+-      string side_class = (direction == (int)POSITION_TYPE_BUY ? buy_class : sell_class);
+-      int state_idx = FindExitTicketStateV1234(ticket);
+-      double peak = (state_idx >= 0 ? g_exitTicketStatesV1234[state_idx].peakMfeUsd : MathMax(0.0, profit));
+-      bool lock_right = (state_idx >= 0 && g_exitTicketStatesV1234[state_idx].lockRight);
+-
+-      // RUNNER/PROTECTED (classes vencedoras existentes) ou ticket com Lock por
+-      // MFE: imune a saida generica; so sai por SL real, trailing, alvo, risco.
+-      if(side_class == "RUNNER" || side_class == "PROTECTED" || lock_right)
+-      {
+-         g_exitRunnerBlocksV1234++;
+-         LogThrottledV1232("v1234_runner_block_" + trigger,
+-                           "[RUNNER_GENERIC_EXIT_BLOCKED] trigger=" + trigger +
+-                           " ticket=" + IntegerToString((int)ticket) +
+-                           " classe=" + side_class +
+-                           " lock_mfe=" + (lock_right ? "1" : "0") +
+-                           " lucro=" + DoubleToString(profit, 2) +
+-                           " mfe=" + DoubleToString(peak, 2) +
+-                           " cesta=" + DoubleToString(basket_profit, 2) +
+-                           " decisao=HOLD", 10);
+-         LogThrottledV1232("v1234_authority_runner_" + trigger,
+-                           "[EXIT_AUTHORITY_DECISION] trigger=" + trigger +
+-                           " decisao=HOLD autoridade=RUNNER_PRESERVATION", 10);
+-         return true;
++   // Lado forte pela CONFIRMACAO real (leitura existente usada como contexto).
++   int buy_lock = 0, buy_be = 0, sell_lock = 0, sell_be = 0;
++   for(int i = 0; i < g_exitTicketStateCountV1235; i++)
++   {
++      if(g_exitTicketStatesV1235[i].direction == (int)POSITION_TYPE_BUY)
++      {
++         if(g_exitTicketStatesV1235[i].lockConfirmed) buy_lock++;
++         else if(g_exitTicketStatesV1235[i].beConfirmed) buy_be++;
++      }
++      else
++      {
++         if(g_exitTicketStatesV1235[i].lockConfirmed) sell_lock++;
++         else if(g_exitTicketStatesV1235[i].beConfirmed) sell_be++;
+       }
++   }
++
++   double buy_profit = GetBuyBasketProfit();
++   double sell_profit = GetSellBasketProfit();
++   double strong_min = MathMax(0.0, LucroMinimoLadoForteV123);
++   bool buy_strong = (buy_lock > 0) || (buy_be > 0 && buy_profit >= strong_min);
++   bool sell_strong = (sell_lock > 0) || (sell_be > 0 && sell_profit >= strong_min);
++
++   int strong_direction;
++   if(buy_strong && sell_strong)
++      strong_direction = (buy_profit >= sell_profit ? (int)POSITION_TYPE_BUY : (int)POSITION_TYPE_SELL);
++   else if(buy_strong)
++      strong_direction = (int)POSITION_TYPE_BUY;
++   else if(sell_strong)
++      strong_direction = (int)POSITION_TYPE_SELL;
++   else
++      return false; // nenhum lado forte CONFIRMADO: nada a cortar por divergencia
++
++   int weak_direction = (strong_direction == (int)POSITION_TYPE_BUY
++                         ? (int)POSITION_TYPE_SELL : (int)POSITION_TYPE_BUY);
++   string strong_txt = (strong_direction == (int)POSITION_TYPE_BUY ? "BUY" : "SELL");
++   LogThrottledV1232("v1235_strong_side_" + strong_txt,
++                     "[STRONG_SIDE_CONFIRMED] lado=" + strong_txt +
++                     " lock_confirmados=" + IntegerToString(strong_direction == (int)POSITION_TYPE_BUY ? buy_lock : sell_lock) +
++                     " be_confirmados=" + IntegerToString(strong_direction == (int)POSITION_TYPE_BUY ? buy_be : sell_be) +
++                     " side_profit=" + DoubleToString(strong_direction == (int)POSITION_TYPE_BUY ? buy_profit : sell_profit, 2) +
++                     " opposite_side_profit=" + DoubleToString(strong_direction == (int)POSITION_TYPE_BUY ? sell_profit : buy_profit, 2) +
++                     " basket_profit=" + DoubleToString(GetBasketProfit(), 2) +
++                     " bias_contexto=" + BiasToTextV122(g_directionalBiasV122) +
++                     " classe_buy_contexto=" + g_buySideStateV123 +
++                     " classe_sell_contexto=" + g_sellSideStateV123, 10);
++
++   return CutOneWeakTicketV1235(weak_direction, "REALTIME_DIVERGENCE", "WEAK_SIDE_CUT", true);
++}
++// ================== FIM V1.2.3.5 CORTE SELETIVO DO LADO FRACO ==================
++
++// ==================== V1.2.3.5 SAIDA GENERICA SELETIVA ====================
++// Substitui BlockGenericBasketExitV1234. Para triggers comuns (PRICE_LINE,
++// BASKET_MFE_LOCK, alvo monetario comum da cesta):
++//  A) preserva APENAS tickets com SL real protetor confirmado no servidor;
++//  B) fecha individualmente tickets nao protegidos (um por tick);
++//  C) NAO bloqueia a cesta por lockRight/beRight sem confirmacao, lucro GOOD,
++//     side_class RUNNER ou side_class PROTECTED;
++//  D) sem nenhum ticket realmente protegido, permite o fechamento normal;
++//  E) com protegido + desprotegido: fecha o fraco, preserva o forte e
++//     interrompe o fluxo do tick;
++//  F) nunca preserva ticket negativo sem SL real apenas por classe lateral.
++// NAO e chamada pelas saidas soberanas de risco (DD, loss diario, emergencia).
++int HandleGenericExitSelectiveV1235(string trigger, double basket_profit)
++{
++   if(!ExitProtection_Enable)
++      return (int)GENERIC_EXIT_ALLOW_FULL_CLOSE;
+ 
+-      // GOOD: lucro atual na faixa +5..+10; precisa respirar para virar RUNNER.
+-      if(profit >= ExitProtection_GoodProfitMinUSD && profit <= ExitProtection_GoodProfitMaxUSD)
++   int protected_count = 0;
++   int unprotected_count = 0;
++   int worst_unprotected = -1;
++   double worst_profit = DBL_MAX;
++
++   for(int i = 0; i < g_exitTicketStateCountV1235; i++)
++   {
++      if(!PositionSelectByTicket(g_exitTicketStatesV1235[i].ticket))
++         continue;
++      double profit = GetSelectedPositionProfitWithCosts();
++      if(HasConfirmedProtectiveSLV1235(i))
+       {
+-         g_exitGoodBlocksV1234++;
+-         LogThrottledV1232("v1234_good_block_" + trigger,
+-                           "[GOOD_SMALL_PROFIT_EXIT_BLOCKED] trigger=" + trigger +
+-                           " ticket=" + IntegerToString((int)ticket) +
+-                           " classe=" + side_class +
++         protected_count++;
++         TicketRunnerConfirmedV1235(i); // log de runner por ticket quando aplicavel
++         LogThrottledV1232("v1235_gen_hold_" + TicketToStringV1235(g_exitTicketStatesV1235[i].ticket) + "_" + trigger,
++                           "[GENERIC_EXIT_PROTECTED_HOLD] trigger=" + trigger +
++                           " ticket=" + TicketToStringV1235(g_exitTicketStatesV1235[i].ticket) +
++                           " sl_servidor=" + DoubleToString(g_exitTicketStatesV1235[i].confirmedServerSL, _Digits) +
+                            " lucro=" + DoubleToString(profit, 2) +
+-                           " mfe=" + DoubleToString(peak, 2) +
++                           " mfe=" + DoubleToString(g_exitTicketStatesV1235[i].peakMfeUsd, 2) +
++                           " estado=" + TicketOpStateToTextV1235(g_exitTicketStatesV1235[i].opState) +
+                            " cesta=" + DoubleToString(basket_profit, 2) +
+-                           " motivo_original=" + trigger +
+-                           " decisao=HOLD", 10);
+-         LogThrottledV1232("v1234_authority_good_" + trigger,
+-                           "[EXIT_AUTHORITY_DECISION] trigger=" + trigger +
+-                           " decisao=HOLD autoridade=GOOD_PRESERVATION", 10);
+-         return true;
++                           " decisao=HOLD autoridade=SL_REAL_CONFIRMADO", 10);
++      }
++      else
++      {
++         // GOOD por lucro atual, beRight/lockRight sem confirmacao e classes
++         // laterais NAO protegem: ticket segue elegivel ao fechamento generico.
++         unprotected_count++;
++         if(profit < worst_profit)
++         {
++            worst_profit = profit;
++            worst_unprotected = i;
++         }
+       }
+    }
+ 
+-   return false;
++   if(protected_count <= 0)
++   {
++      g_exitFullClosesAllowedV1235++;
++      LogMessage("[GENERIC_EXIT_FULL_CLOSE_ALLOWED] trigger=" + trigger +
++                 " cesta=" + DoubleToString(basket_profit, 2) +
++                 " desprotegidos=" + IntegerToString(unprotected_count) +
++                 " motivo=nenhum_ticket_com_sl_real_confirmado");
++      LogMessage("[GENERIC_EXIT_SELECTIVE_DECISION] trigger=" + trigger +
++                 " decisao=ALLOW_FULL_CLOSE protegidos=0 desprotegidos=" +
++                 IntegerToString(unprotected_count) +
++                 " cesta=" + DoubleToString(basket_profit, 2));
++      return (int)GENERIC_EXIT_ALLOW_FULL_CLOSE;
++   }
++
++   g_exitProtectedHoldsV1235 += protected_count;
++
++   if(unprotected_count > 0 && worst_unprotected >= 0 &&
++      !g_exitCloseSentThisTickV1234 && !g_exitActionSentThisTickV1235)
++   {
++      ulong target_ticket = g_exitTicketStatesV1235[worst_unprotected].ticket;
++      LogMessage("[GENERIC_EXIT_UNPROTECTED_CLOSE] trigger=" + trigger +
++                 " ticket=" + TicketToStringV1235(target_ticket) +
++                 " lucro=" + DoubleToString(worst_profit, 2) +
++                 " mfe=" + DoubleToString(g_exitTicketStatesV1235[worst_unprotected].peakMfeUsd, 2) +
++                 " be_conf=0 lock_conf=0 sl_confirmado=0" +
++                 " motivo=saida_generica_executa_somente_no_subconjunto_desprotegido");
++      LogMessage("[GENERIC_EXIT_SELECTIVE_DECISION] trigger=" + trigger +
++                 " decisao=SELECTIVE_CLOSE protegidos=" + IntegerToString(protected_count) +
++                 " desprotegidos=" + IntegerToString(unprotected_count) +
++                 " ticket_alvo=" + TicketToStringV1235(target_ticket) +
++                 " cesta=" + DoubleToString(basket_profit, 2) +
++                 " limite=um_fechamento_por_tick");
++      if(CloseSingleTicketV1235(worst_unprotected, "GENERIC_EXIT_SELECTIVE", trigger))
++         g_exitSelectiveClosesV1235++;
++      if(g_exitActionSentThisTickV1235 || g_exitCloseSentThisTickV1234)
++         return (int)GENERIC_EXIT_SELECTIVE_CLOSE_SENT;
++      // Cooldown transacional segurou o envio: manter preservacao e aguardar.
++      return (int)GENERIC_EXIT_NO_ACTION;
++   }
++
++   LogThrottledV1232("v1235_gen_decision_hold_" + trigger,
++                     "[GENERIC_EXIT_SELECTIVE_DECISION] trigger=" + trigger +
++                     " decisao=HOLD_PROTECTED protegidos=" + IntegerToString(protected_count) +
++                     " desprotegidos=" + IntegerToString(unprotected_count) +
++                     " cesta=" + DoubleToString(basket_profit, 2) +
++                     " motivo=somente_tickets_com_sl_real_confirmado_restantes", 10);
++   return (int)GENERIC_EXIT_NO_ACTION;
+ }
+-// ========================== FIM V1.2.3.4 EXIT MFE SERVER SL FIX ==========================
++// ================== FIM V1.2.3.5 SAIDA GENERICA SELETIVA ==================
++// ============== FIM V1.2.3.5 BIDIRECTIONAL TICKET EXIT AUTHORITY ==============
+ 
+ void DrawBasketLines()
+ {
+@@ -7054,7 +7856,7 @@
+ 
+    string panel =
+       EA_NAME + "\n" +
+-      "Versao: V1.2.3.4 EXIT MFE SERVER SL FIXED + FLEXIBLE LOT\n" +
++      "Versao: V1.2.3.5 BIDIRECTIONAL TICKET EXIT AUTHORITY + FLEXIBLE LOT\n" +
+       "Simbolo: " + _Symbol + "\n" +
+       "Timeframe: " + EnumToString((ENUM_TIMEFRAMES)_Period) + "\n" +
+       "Conta: " + (IsHedgingAccount() ? "HEDGE" : "NETTING") + "\n" +
+@@ -7089,7 +7891,11 @@
+       "Motor agressivo: " + (UsarMotorAgressivoV121 ? "ON" : "OFF") + "\n" +
+       "Presenca bilateral: " + (ManterPresencaBilateralV122 ? "ON" : "OFF") + "\n" +
+       "Bias V122: " + BiasToTextV122(g_directionalBiasV122) + " conf " + DoubleToString(GetBiasConfidenceV122(), 1) + "\n" +
+-      "Estado BUY/SELL V123: " + g_buySideStateV123 + "/" + g_sellSideStateV123 + "\n" +
++      "Estado BUY/SELL V123: " + g_buySideStateV123 + "/" + g_sellSideStateV123 + " (contexto)\n" +
++      "Autoridade ticket V1235: estados=" + IntegerToString(g_exitTicketStateCountV1235) +
++      " teto=" + IntegerToString(g_exitCapClosesV1235) +
++      " cortes=" + IntegerToString(g_exitWeakSideCutsV1235) +
++      " runners=" + IntegerToString(g_exitRunnersConfirmedV1235) + "\n" +
+       "Extracao continua V123: " + (UsarExtracaoContinuaV123 ? "ON" : "OFF") + "\n" +
+       "Alocacao alvo: BUY " + IntegerToString(GetTargetBuySlotsV122()) + " / SELL " + IntegerToString(GetTargetSellSlotsV122()) + "\n" +
+       "Tempo sem BUY/SELL: " + IntegerToString(GetSecondsWithoutBuyV122()) + "/" + IntegerToString(GetSecondsWithoutSellV122()) + "s\n" +
+@@ -7875,6 +8681,7 @@
+    if(!IsSLValid(type, new_sl))
+       return false;
+ 
++   // V1.2.3.5: logs de ticket em 64 bits (TicketToStringV1235); logica intacta.
+    // V1.2.3.4 EXIT MFE SERVER SL FIX: guarda monotonica estrutural valida para
+    // TODAS as chamadas. BUY nunca reduz o SL real; SELL nunca aumenta. Impede
+    // que qualquer rotina troque uma protecao melhor por uma pior ou recue SL.
+@@ -7889,7 +8696,7 @@
+       if(worsens)
+       {
+          g_exitMonotonicBlocksV1234++;
+-         LogMessage("[SL_MONOTONIC_BLOCK] ticket=" + IntegerToString((int)ticket) +
++         LogMessage("[SL_MONOTONIC_BLOCK] ticket=" + TicketToStringV1235(ticket) +
+                     " direcao=" + (type == POSITION_TYPE_BUY ? "BUY" : "SELL") +
+                     " sl_atual=" + DoubleToString(existing_sl, _Digits) +
+                     " sl_solicitado=" + DoubleToString(requested_sl, _Digits) +
+@@ -7900,7 +8707,7 @@
+ 
+    // V1.2.3.4 EXIT MFE SERVER SL FIX: TP atual e preservado integralmente e o
+    // retcode e verificado; PositionModify()==true sozinho nao confirma nada.
+-   LogMessage("[SL_MODIFY_REQUEST] ticket=" + IntegerToString((int)ticket) +
++   LogMessage("[SL_MODIFY_REQUEST] ticket=" + TicketToStringV1235(ticket) +
+               " direcao=" + (type == POSITION_TYPE_BUY ? "BUY" : "SELL") +
+               " sl_atual=" + DoubleToString(existing_sl, _Digits) +
+               " sl_solicitado=" + DoubleToString(requested_sl, _Digits) +
+@@ -7908,13 +8715,13 @@
+               " motivo=" + reason);
+    bool sent = trade.PositionModify(ticket, requested_sl, current_tp);
+    uint retcode = trade.ResultRetcode();
+-   LogMessage("[SL_MODIFY_RETCODE] ticket=" + IntegerToString((int)ticket) +
++   LogMessage("[SL_MODIFY_RETCODE] ticket=" + TicketToStringV1235(ticket) +
+               " retcode=" + IntegerToString((int)retcode) +
+               " desc=" + trade.ResultRetcodeDescription() +
+               " enviado=" + (sent ? "true" : "false"));
+    if(!sent || !IsTradeRetcodeSuccessV122(retcode))
+    {
+-      LogMessage("[SL_SERVER_NOT_CONFIRMED] ticket=" + IntegerToString((int)ticket) +
++      LogMessage("[SL_SERVER_NOT_CONFIRMED] ticket=" + TicketToStringV1235(ticket) +
+                  " motivo=retcode_invalido retcode=" + IntegerToString((int)retcode));
+       return false;
+    }
+@@ -7924,7 +8731,7 @@
+       if(!PositionSelectByTicket(ticket))
+       {
+          // Posicao inexistente apos a modificacao = encerramento, nao falha de SL.
+-         LogMessage("[SL_SERVER_NOT_CONFIRMED] ticket=" + IntegerToString((int)ticket) +
++         LogMessage("[SL_SERVER_NOT_CONFIRMED] ticket=" + TicketToStringV1235(ticket) +
+                     " motivo=posicao_encerrada_durante_modificacao");
+          return false;
+       }
+@@ -7936,14 +8743,14 @@
+       if(MathAbs(server_sl - requested_sl) > tolerance)
+       {
+          g_exitSlNotConfirmedV1234++;
+-         LogMessage("[SL_SERVER_NOT_CONFIRMED] ticket=" + IntegerToString((int)ticket) +
++         LogMessage("[SL_SERVER_NOT_CONFIRMED] ticket=" + TicketToStringV1235(ticket) +
+                     " esperado=" + DoubleToString(requested_sl, _Digits) +
+                     " servidor=" + DoubleToString(server_sl, _Digits) +
+                     " tolerancia=" + DoubleToString(tolerance, _Digits));
+          return false;
+       }
+ 
+-      LogMessage("[SL_SERVER_CONFIRMED] ticket=" + IntegerToString((int)ticket) +
++      LogMessage("[SL_SERVER_CONFIRMED] ticket=" + TicketToStringV1235(ticket) +
+                  " sl_servidor=" + DoubleToString(server_sl, _Digits) +
+                  " tp_servidor=" + DoubleToString(PositionGetDouble(POSITION_TP), _Digits) +
+                  " motivo=" + reason);

@@ -1,0 +1,532 @@
+================================================================================
+IA FUNDED GOLD V1.2.3.5 BIDIRECTIONAL TICKET EXIT AUTHORITY - AUDIT REPORT
+Data: 2026-07-12
+Base auditada : IA_FUNDED_GOLD_V1.2.3.4_EXIT_MFE_SERVER_SL_FIXED_FLEXIBLE_LOT.mq5 (8193 linhas)
+Arquivo gerado: IA_FUNDED_GOLD_V1.2.3.5_BIDIRECTIONAL_TICKET_EXIT_AUTHORITY_FIXED_FLEXIBLE_LOT.mq5 (9000 linhas)
+Diff          : v1235_ticket_exit_authority_diff.txt (+1143 / -336 linhas)
+Compilacao    : v1235_ticket_exit_authority_compile.log (validacao estatica; MetaEditor indisponivel no ambiente)
+================================================================================
+
+--------------------------------------------------------------------------------
+1. AUDITORIA FORENSE - CAUSAS RAIZ CONFIRMADAS NO ARQUIVO-BASE (com prova)
+--------------------------------------------------------------------------------
+Todas as linhas abaixo referem-se ao ARQUIVO-BASE V1.2.3.4.
+
+A) CONFIRMADA - ClassifySideV123() classifica o CONJUNTO, nao cada ticket.
+   Prova: linhas 5844-5873. A funcao usa apenas agregados do lado:
+   5846 `int count = (direction==POSITION_TYPE_BUY ? CountBuyPositions() : CountSellPositions());`
+   5850 `double side_profit = (direction==POSITION_TYPE_BUY ? GetBuyBasketProfit() : GetSellBasketProfit());`
+   Nenhuma leitura por ticket. O retorno ("WEAK"/"RECOVERY"/"BALANCED"/"STRONG"/
+   "RUNNER"/"PROTECTED") vale para todos os tickets do lado.
+
+B) CONFIRMADA - ManageExitProtectionV1234() condiciona o teto de perda a
+   side_class == "WEAK".
+   Prova: linhas 6836-6839:
+      if(side_class == "WEAK" &&
+         profit <= -MathAbs(ExitProtection_WeakMaxLossUSD) &&
+         peak <= ExitProtection_WeakMaxMFEUSD &&
+         !g_exitCloseSentThisTickV1234)
+   Um ticket individual em grande perda sobrevive se o lado agregado estiver
+   RECOVERY/BALANCED/STRONG/RUNNER/PROTECTED (qualquer classe != WEAK).
+
+C) CONFIRMADA - ExitProtection_WeakMaxLossUSD NAO e teto individual absoluto.
+   Prova: mesma condicao das linhas 6836-6839 (item B): o teto so dispara com
+   classe agregada WEAK e com MFE baixo; nunca e aplicado por ticket isolado.
+
+D) CONFIRMADA - Existe faixa sem autoridade entre WeakMaxMFE e BETrigger.
+   Prova: teto exige peak <= ExitProtection_WeakMaxMFEUSD (linha 6838, default
+   5.00 - input linha 224); direito de BE exige peak >= ExitProtection_BETriggerMFEUSD
+   (linha 6870, default 8.00 - input linha 225). Ticket com MFE em (5.00, 8.00):
+   sem teto de perda e sem direito de BE -> completamente descoberto.
+
+E) CONFIRMADA - BlockGenericBasketExitV1234() bloqueia a CESTA INTEIRA usando
+   classe lateral, lockRight e faixa GOOD.
+   Prova: linha 6947 `if(side_class == "RUNNER" || side_class == "PROTECTED" || lock_right)`
+   -> `return true` (linha 6962); linha 6966
+   `if(profit >= ExitProtection_GoodProfitMinUSD && profit <= ExitProtection_GoodProfitMaxUSD)`
+   -> `return true` (linha 6981). O retorno true aborta o fechamento generico de
+   TODAS as posicoes (chamadas nas linhas 6016 e 6373).
+
+F) CONFIRMADA - lockRight/beRight sao apenas direitos internos, sem prova de SL real.
+   Prova: linha 6943 `bool lock_right = (state_idx >= 0 && g_exitTicketStatesV1234[state_idx].lockRight);`
+   usado na linha 6947 para bloquear a cesta. Nenhuma leitura de POSITION_SL na
+   decisao. O direito e concedido na linha 6855-6857 apenas por MFE.
+
+G) CONFIRMADA - GOOD e inferido somente por lucro atual em faixa monetaria.
+   Prova: linha 6966 (item E). Nenhuma exigencia de SL confirmado; um ticket
+   GOOD com POSITION_SL == 0 bloqueia a saida generica da cesta inteira.
+
+H) CONFIRMADA - RUNNER derivado da classe agregada do lado.
+   Prova: linhas 6925-6926 + 6940 (side_class calculada por ClassifySideV123 e
+   aplicada a cada ticket do lado) + linha 6947 (uso como autoridade).
+
+I) CONFIRMADA - Uma unica posicao bloqueia o fechamento de toda a cesta.
+   Prova: `return true` dentro do loop por posicao (linhas 6962 e 6981) - o
+   primeiro ticket que casar com RUNNER/PROTECTED/lockRight/GOOD aborta a saida
+   de TODAS as posicoes.
+
+J) CONFIRMADA - Apos CloseSingleTicketV1234() o OnTick continua no mesmo tick.
+   Prova: g_exitCloseSentThisTickV1234 e ligado na linha 6770, mas NUNCA e
+   verificado no OnTick. Fluxo do OnTick (base): ManageExitProtectionV1234()
+   na linha 984 -> segue para ManageBreakEven (988), ManageSmartTrailing (989),
+   saidas de cesta (991-1013), ManageFlatPairReopenV122 (1036),
+   ManageBilateralPresenceV122 (1044), entradas (1054-1062) e pendentes
+   (1064-1066) NO MESMO TICK do fechamento.
+
+K) CONFIRMADA - Logs truncam o ticket com cast para int.
+   Prova (exemplos): linhas 6447, 6481, 6528, 6547, 6633, 6641, 6655, 6673-6674,
+   6703, 6756, 6777, 6788, 6793, 6841, 6847, 6859, 6865, 6873, 6879, 6901, 6908,
+   6951, 6971 (bloco V1234) e 7892, 7903, 7911, 7917, 7927, 7939, 7946
+   (ModifyPositionSL): todos usam IntegerToString((int)ticket) sobre ulong.
+
+L) CONFIRMADA - MFE e direitos por ticket NAO sobrevivem ao reinicio.
+   Prova: PersistBasketState() (linhas 8052-8072) persiste apenas MFE/MAE da
+   CESTA e estado de entrada; nenhum campo de ExitTicketStateV1234 e persistido.
+   No reinicio, SyncExitTicketStatesV1234 recria o estado com
+   `peakMfeUsd = MathMax(0.0, profit)` (linha 6492) - o MFE acumulado e perdido;
+   somente um SL ja existente e reconhecido (linhas 6506-6527).
+
+--------------------------------------------------------------------------------
+2. PATCH APLICADO - RESUMO POR CAUSA RAIZ
+--------------------------------------------------------------------------------
+Linhas abaixo referem-se ao ARQUIVO NOVO V1.2.3.5.
+
+A/B/C) TETO ABSOLUTO POR TICKET DESPROTEGIDO - ManageExitProtectionV1235()
+   (def. linha 7382; teto nas linhas 7420-7462): dispara com
+   `profit <= -MathAbs(ExitProtection_WeakMaxLossUSD)` e
+   `!HasConfirmedProtectiveSLV1235(idx)`. side_class REMOVIDA da condicao
+   (aparece apenas como campo informativo `side_class_informativa` no log).
+   Log: [UNPROTECTED_TICKET_MAX_LOSS_TRIGGER] com ticket 64 bits, direcao,
+   volume, lucro, MFE, MAE, side_class informativa, SL atual, beConfirmed,
+   lockConfirmed, limite, decisao=CLOSE, autoridade=TICKET_MAX_LOSS.
+
+D) FAIXA MFE NEUTRALIZADA - condicao `peak <= WeakMaxMFEUSD` removida do teto.
+   WeakMaxMFE segue apenas em diagnostico (estado TICKET_UNPROTECTED_LOW_MFE,
+   linha 7092). OnInit registra uma unica vez [EXIT_CONFIG_GAP_NEUTRALIZED]
+   (linhas 948-952) sem alterar inputs.
+
+E/F/G/H/I) SAIDA GENERICA SELETIVA - BlockGenericBasketExitV1234 REMOVIDA e
+   substituida por HandleGenericExitSelectiveV1235(trigger, basket_profit)
+   (def. linha 7698) com tres resultados: GENERIC_EXIT_ALLOW_FULL_CLOSE /
+   GENERIC_EXIT_SELECTIVE_CLOSE_SENT / GENERIC_EXIT_NO_ACTION.
+   - Preserva SOMENTE tickets com HasConfirmedProtectiveSLV1235() true;
+   - Fecha individualmente (um por tick) tickets nao protegidos - inclusive
+     GOOD sem SL e lockRight/beRight sem confirmacao;
+   - Sem nenhum protegido -> full close normal ([GENERIC_EXIT_FULL_CLOSE_ALLOWED]);
+   - Nunca preserva ticket negativo sem SL real por classe lateral.
+   Call sites: BASKET_TARGET (linha 6108), PRICE_LINE (linha 6172),
+   BASKET_MFE_LOCK (linha 6531).
+   RUNNER por ticket: TicketRunnerConfirmedV1235() (def. linha 7032) exige
+   lockConfirmed + POSITION_SL real protegendo o tier Lock + ticket vivo.
+
+F/G adicional) PROTECAO REAL - HasConfirmedProtectiveSLV1235(state_index)
+   (def. linha 6998): PositionSelectByTicket + POSITION_SL > 0 + SL no lado
+   protetor cobrindo >= ExitProtection_BEProfitUSD com tolerancia + flag
+   beConfirmed/lockConfirmed confirmada por releitura real. NAO aceita:
+   beRight/lockRight, lucro atual, MFE, side_class, retcode sem releitura.
+
+J) BLOQUEIO DE MESMO TICK - flags g_exitCloseSentThisTickV1234 (preservada) e
+   g_exitActionSentThisTickV1235 (nova, linha 579) zeradas no inicio do OnTick
+   (linhas 1037-1038); ligadas em CloseSingleTicketV1235 (linhas 7345-7346) e
+   nos tres fechamentos de cesta (CloseAllBasket 5882, CloseBuyBasket 5916,
+   CloseSellBasket 5950). Guardas do OnTick: apos a autoridade por ticket
+   (linhas 1095-1107, exatamente o snippet exigido com DrawBasketLines/
+   UpdatePanel/PersistBasketState/return) e antes de flat-reopen/presenca/
+   entradas/pendentes (linhas 1161-1175). Log [EXIT_SAME_TICK_ENTRY_BLOCK]
+   nas duas guardas.
+
+K) TICKETS 64 BITS - TicketToStringV1235() = StringFormat("%I64u", ticket)
+   (def. linha 6597). Todos os IntegerToString((int)ticket) das rotinas novas/
+   alteradas removidos (bloco V1235 inteiro + ModifyPositionSL, 7 ocorrencias).
+   Casts remanescentes existem SOMENTE em rotinas de PENDENTES nao alteradas
+   (ex.: linhas 1575, 1583, 2447, 2861, 2914, 5329-5387), fora do escopo
+   autorizado do patch.
+
+L) PERSISTENCIA POR TICKET - chave StateKey("V1235T_<ticket>_<campo>") =
+   login+simbolo+magic+versao+ticket (ExitTicketPersistKeyV1235, linha 6659).
+   Campos: MFE, MAE, FLAGS (beRight/lockRight/beConfirmed/lockConfirmed em
+   bitmask), SL confirmado, OPSTATE. Persistencia em: criacao, avanco de MFE
+   >= 0.50 USD, concessao de direito, confirmacao de SL, mudanca de estado e
+   OnDeinit (PersistAllExitTicketStatesV1235, linha 999). Restauracao SOMENTE
+   dentro do Sync com o ticket existente no servidor (RestoreExitTicketStateV1235,
+   linha 6698): MFE nunca reduzido, direitos restaurados, CONFIRMACOES nunca
+   restauradas cegamente - reconciliadas com POSITION_SL real ([TICKET_STATE_
+   RECONCILED]). Limpeza SOMENTE apos confirmacao de encerramento no servidor
+   (RemoveExitTicketStateV1235 -> ClearExitTicketPersistenceV1235) + limpeza de
+   orfaos no OnInit com guarda de conexao (CleanupOrphanExitTicketPersistenceV1235,
+   linha 6768).
+
+ORDEM DO ONTICK (nova, linhas 1017-1236):
+   1 tick/simbolo -> 2 risco diario (RefreshDailyState/ManageDailyRisk) ->
+   3 reconciliar transacoes -> 4 rebuild se dirty -> 5 saidas soberanas
+   (ManageDailyRisk/ManageDailyProfitTarget/ManageBasketDrawdown movido para
+   linha 1074 + retorno imediato se escopo de fechamento ativo) ->
+   6-10 ManageExitProtectionV1235 (Sync -> teto absoluto -> direitos BE/LOCK ->
+   SL real -> giveback) -> 11 TryCutConfirmedWeakSideV1235 -> guarda de mesmo
+   tick -> 12 ManageBreakEven/ManageSmartTrailing -> 13 saidas seletivas de
+   cesta -> 14 reconciliar estado -> 15 guarda final; somente sem nenhum
+   fechamento: flat reopen, presenca bilateral, entradas, pendentes.
+
+CORTE DO LADO FRACO EM TEMPO REAL - TryCutConfirmedWeakSideV1235() (linha 7620):
+   exige BUY e SELL abertos; lado forte confirmado por >=1 ticket LOCK
+   confirmado OU >=1 BE confirmado com lucro do lado >= LucroMinimoLadoForteV123;
+   NAO exige cesta positiva nem LucroMinimoCestaExtracaoV123; respeita
+   CooldownExtracaoLadoSegundosV123 (o teto absoluto roda ANTES e nao e
+   bloqueado pelo cooldown); fecha no maximo UM ticket por tick (negativo, sem
+   SL confirmado, sem BE/LOCK confirmado); preserva todo ticket protegido
+   ([STRONG_TICKET_PRESERVED]); nao reabre nada no mesmo tick (guardas J).
+   TryExtractWeakSideV123 (linha 6039) foi REFEITA: manteve todos os gates de
+   contexto existentes (bias, cooldown, LucroMinimoCestaExtracaoV123,
+   LucroMinimoLadoForteV123, logs V123_STRONG_SIDE_HOLD/V123_WEAK_SIDE_CUT) mas
+   a acao deixou de ser CloseSellBasket()/CloseBuyBasket() (que derrubava o lado
+   inteiro, inclusive tickets protegidos) e passou a ser o corte seletivo de UM
+   ticket desprotegido via CutOneWeakTicketV1235 (linha 7555).
+
+REABERTURA/COSTURA - INALTERADA: reabertura exclusivamente pelos motores
+   existentes (ManageFlatPairReopenV122, ManageBilateralPresenceV122,
+   SelectAndExecuteCandidatesV121, ManageDirectionalAdditionalEntries,
+   OpenBuySellPair, Pending Lifecycle, Market Handoff). Fluxo apos corte:
+   g_tradeStateDirty=true (CloseSingleTicketV1235) -> OnTradeTransaction ->
+   sync confirma desaparecimento -> persistencia limpa -> tick encerrado ->
+   tick seguinte repoe o lado ausente pelas regras atuais.
+
+SAIDAS DE RISCO SOBERANAS - INTOCADAS EM AUTORIDADE: ManageDailyRisk,
+   ManageBasketDrawdown, meta diaria, DDFechamentoObrigatorioUSD,
+   Loss_for_closing, Maximum_allowed_loss e fechamento forte por pico continuam
+   fechando TUDO via CloseAllBasket() sem passar pela autoridade seletiva
+   (nenhuma chamada de HandleGenericExitSelectiveV1235 nesses caminhos).
+   Fechamento por alvo de UMA direcao (Profit_for_closing_1_direction) tambem
+   permanece full close (alvo superior de direcao unica; nao ha lado fraco/forte
+   com um unico lado aberto).
+
+--------------------------------------------------------------------------------
+3. FUNCOES ALTERADAS x NAO ALTERADAS
+--------------------------------------------------------------------------------
+ALTERADAS (escopo integral do diff):
+   - Cabecalho #property (versao/descricao)                       linhas 1-3
+   - Novos enums ENUM_EXIT_TICKET_OPSTATE_V1235 /
+     ENUM_GENERIC_EXIT_DECISION_V1235                             314-343
+   - struct ExitTicketStateV1235 (evolucao; campos V1234 preservados
+     + maeUsd, opState, lastDecisionReason, restoredFromPersistence,
+     runnerLogged, lastPersistedMfe) + globais/contadores V1235   539-599
+   - Prototipos do bloco de saida                                 758-783
+   - OnInit (log EXIT_V1235_CONFIG, EXIT_CONFIG_GAP_NEUTRALIZED,
+     limpeza de persistencia orfa)                                932-955
+   - OnDeinit (PersistAll + EXIT_V1235_SUMMARY)                   997-1016
+   - OnTick (flags, risco soberano antecipado, autoridade V1235,
+     corte seletivo, guardas de mesmo tick)                       1019-1236
+   - CloseAllBasket/CloseBuyBasket/CloseSellBasket (flag +1 linha) 5878/5912/5946
+   - TryExtractWeakSideV123 (acao seletiva por ticket)            6039-6083
+   - ManageBasketClosing (BASKET_TARGET seletivo)                 6085-6129
+   - ManagePriceBasedBasketClosing (PRICE_LINE seletivo)          6131-6183
+   - GerenciarProtecaoLucroCestaMFE (BASKET_MFE_LOCK seletivo)    6476-6563
+   - Bloco V1234 -> V1235 completo (todas as autoridades por
+     ticket, persistencia, corte seletivo, saida generica)        6576-7793
+   - UpdatePanel (linha de versao + linha da autoridade V1235)    7856-7898
+   - ModifyPositionSL (APENAS formatacao de ticket 64 bits nos
+     logs; logica, guarda monotonica e confirmacao intactas)      8672-8760
+
+NAO ALTERADAS (zero hunks no diff; base 1034-5738 byte a byte identica):
+   Toda a logica de entrada e gestao: OpenBuySellPair, CanOpenNewPair,
+   CanOpenAdditionalPair, CanOpenNewPairAntiOvertrade, ManageDirectional-
+   AdditionalEntries, CanOpenDirectionalEntry, OpenDirectionalOrder,
+   SelectAndExecuteCandidatesV121 e todo o motor V121 (scores, thresholds,
+   geometrias, cooldowns), ManageFlatPairReopenV122, ManageBilateralPresenceV122,
+   Rebalance (Build/CanExecute/Execute), bias V122, alocacao de slots,
+   presenca bilateral, Pending Lifecycle V1231/V1233 completo, Market Handoff
+   V1232, ManageDynamicPendingOrders/Place/Reposition/CancelInvalid/CancelAll,
+   contadores/limites (Count*/Limit*/HasExposureRoom*/HasDirectionalSlotRoom),
+   filtros (spread, horario, noticias, Price Action, fluxo de volume, ATR,
+   regime, compressor de zonas), ManageBreakEven, ManageSmartTrailing,
+   ManageBasketDrawdown, ManageDailyRisk, ManageDailyProfitTarget,
+   AtualizarPicoLucroCesta/ResetarPicoLucroCesta, GerenciarProtecaoLucroCestaMFE
+   (exceto o call-site seletivo), CloseAllBasket/CloseBuy/CloseSell (exceto a
+   flag), GetBasketProfit e todos os agregados, ClassifySideV123,
+   UpdateSideIdentificationV123, DirectionalBiasSignV123, USDToPriceDistance,
+   NormalizeVolume, NormalizePrice, IsSLValid, RebuildExposureStateFromServer,
+   PersistBasketState/RestoreBasketState/StateKey, OnTradeTransaction.
+
+--------------------------------------------------------------------------------
+4. PROVAS DE PRESERVACAO
+--------------------------------------------------------------------------------
+LOTE FLEXIVEL (identico):
+   - NormalizeVolume(FixedLot): 15 ocorrencias na base, 15 no novo arquivo;
+   - Logs [FLEXIBLE_LOT_ACCEPTED]/[FLEXIBLE_LOT_NORMALIZED]/[FLEXIBLE_LOT_INVALID]:
+     3 na base, 3 no novo (OnInit linhas 863-892, inalteradas);
+   - Validacao SYMBOL_VOLUME_MIN/MAX/STEP inalterada (OnInit 861-866 +
+     NormalizeVolume 8060-8087);
+   - Nenhum lote diferente por lado, nenhum martingale, nenhuma multiplicacao
+     (unica mencao a "martingale" e o comentario original negando o uso);
+   - FixedLot/MaxExposicaoLiquidaLotes/MaxDesequilibrioDirecional/
+     MaxBuyPositions/MaxSellPositions/MaxOpenPositions: inputs intocados.
+
+ENTRADAS (identicas):
+   - Diff sem nenhum hunk entre as linhas 1034 e 5738 da base - regiao que
+     contem TODO o maquinario de entrada, pendentes, rebalance, handoff,
+     filtros, scores, distancias e cooldowns;
+   - Numero de entradas, scores, distancias, cooldowns, filtros e limites:
+     bytes identicos aos da base;
+   - Nenhum input novo, nenhum input alterado (o SET da V1.2.3.4 e aceito sem
+     mudanca; nenhum parametro foi adicionado ou renomeado).
+
+AUTORIDADE POR TICKET (nova, prova de codigo):
+   - Teto: ManageExitProtectionV1235 linhas 7420-7462 (sem side_class, sem MFE);
+   - Protecao real: HasConfirmedProtectiveSLV1235 linhas 6998-7030 (releitura
+     de POSITION_SL + nivel BE + flag confirmada);
+   - Corte seletivo: TryCutConfirmedWeakSideV1235 7620-7696 + CutOneWeakTicket-
+     V1235 7555-7618 + SelectWeakSideCutCandidateV1235 7527-7553;
+   - Saida generica seletiva: HandleGenericExitSelectiveV1235 7698-7793;
+   - SL real: RequestProtectionSLV1235 7115-7279 (calcular -> normalizar ->
+     validar stops -> preservar TP -> modificar -> retcode -> re-selecionar ->
+     reler POSITION_SL -> comparar tolerancia -> so entao confirmar; nunca
+     piora SL - clamp monotonico proprio + guarda estrutural do ModifyPositionSL).
+
+BLOQUEIO DE ENTRADA NO MESMO TICK (prova):
+   - OnTick linhas 1093-1107 (guarda pos-autoridade, snippet exigido) e
+     1161-1175 (guarda pre-reabertura); flags ligadas em TODOS os caminhos de
+     fechamento (individual: 7345-7346; cesta: 5882/5916/5950). Entradas,
+     presenca bilateral, flat reopen e pendentes ficam inalcancaveis no tick
+     de qualquer fechamento.
+
+NAO DUPLICACAO DE AUTORIDADES DE SL (auditoria §15):
+   - ManageBreakEven/ManageSmartTrailing: INALTERADOS; ambos passam por
+     ModifyPositionSL, que mantem a guarda monotonica estrutural (BUY nunca
+     reduz SL, SELL nunca aumenta - linhas 8691-8705) e a confirmacao no
+     servidor; portanto nenhuma rotina afrouxa/remove SL confirmado;
+   - Trailing continua avancando depois do Lock (apenas melhora o SL; o Sync
+     V1235 reconcilia e reconhece o SL melhorado - linhas 6919-6957);
+   - TP preservado em todas as modificacoes (RequestProtectionSLV1235 usa
+     server_tp; ModifyPositionSL recebe current_tp).
+
+--------------------------------------------------------------------------------
+5. LISTA EXATA DE NOVOS LOGS (V1.2.3.5)
+--------------------------------------------------------------------------------
+Novos:
+   [EXIT_V1235_CONFIG]                       (OnInit, linha 935)
+   [EXIT_CONFIG_GAP_NEUTRALIZED]             (OnInit, linha 950)
+   [TICKET_STATE_CREATED]                    (Sync, linhas 6822/6889)
+   [TICKET_STATE_UPDATED]                    (UpdateTicketOpStateV1235, linha 7104)
+   [TICKET_STATE_PERSISTED]                  (PersistExitTicketStateV1235, linha 6688)
+   [TICKET_STATE_RESTORED]                   (RestoreExitTicketStateV1235, linha 6728)
+   [TICKET_STATE_RECONCILED]                 (Sync, linhas 6873/6949)
+   [TICKET_STATE_REMOVED]                    (Remove/limpeza orfa, linhas 6645/6780)
+   [UNPROTECTED_TICKET_MAX_LOSS_TRIGGER]     (teto absoluto, linha 7428)
+   [TICKET_CLOSE_REQUEST]                    (CloseSingleTicketV1235, linha 7307)
+   [TICKET_CLOSE_FAILED]                     (CloseSingleTicketV1235, linhas 7351/7364)
+   [TICKET_CLOSE_CONFIRMED]                  (CloseSingleTicketV1235, linha 7371)
+   [BE_RIGHT_GRANTED]                        (direito BE, linha 7469)
+   [BE_SERVER_CONFIRMED]                     (SL BE confirmado, linhas 7168/7256)
+   [LOCK_RIGHT_GRANTED]                      (direito Lock, linha 7452)
+   [LOCK_SERVER_CONFIRMED]                   (SL Lock confirmado, linhas 7158/7246)
+   [RUNNER_TICKET_CONFIRMED]                 (TicketRunnerConfirmedV1235, linha 7060)
+   [SERVER_SL_CONFIRM_FAILED]                (RequestProtectionSLV1235, linhas 7196/7226/7272)
+   [STRONG_SIDE_CONFIRMED]                   (TryCutConfirmedWeakSideV1235, linha 7672)
+   [WEAK_SIDE_TICKET_SELECTED]               (CutOneWeakTicketV1235, linha 7571)
+   [WEAK_SIDE_TICKET_CUT_REQUEST]            (CloseSingleTicketV1235, linha 7327)
+   [WEAK_SIDE_TICKET_CUT_CONFIRMED]          (CloseSingleTicketV1235, linha 7375)
+   [STRONG_TICKET_PRESERVED]                 (CutOneWeakTicketV1235, linha 7603)
+   [UNPROTECTED_GIVEBACK_TRIGGER]            (giveback, linha 7502)
+   [UNPROTECTED_GIVEBACK_CLOSE_REQUEST]      (CloseSingleTicketV1235, linha 7330)
+   [UNPROTECTED_GIVEBACK_CLOSE_CONFIRMED]    (CloseSingleTicketV1235, linha 7378)
+   [GENERIC_EXIT_SELECTIVE_DECISION]         (HandleGenericExitSelectiveV1235, linhas 7747/7766/7781)
+   [GENERIC_EXIT_PROTECTED_HOLD]             (idem, linha 7718)
+   [GENERIC_EXIT_UNPROTECTED_CLOSE]          (idem, linha 7760)
+   [GENERIC_EXIT_FULL_CLOSE_ALLOWED]         (idem, linha 7743)
+   [EXIT_SAME_TICK_ENTRY_BLOCK]              (OnTick, linhas 1099/1166)
+   [EXIT_V1235_SUMMARY]                      (OnDeinit, linha 1001)
+Mantidos/ajustados (agora com ticket 64 bits):
+   [MFE_UPDATED], [PROFIT_MEMORY_PROTECTION], [SL_MONOTONIC_BLOCK],
+   [EXIT_AUTHORITY_DECISION], [V123_STRONG_SIDE_HOLD], [V123_WEAK_SIDE_CUT]
+   (agora com modo=seletivo_por_ticket_v1235), [SL_MODIFY_REQUEST],
+   [SL_MODIFY_RETCODE], [SL_SERVER_CONFIRMED], [SL_SERVER_NOT_CONFIRMED].
+Removidos (autoridades extintas):
+   [EXIT_ONLY_AUDIT] (config/resumo/estados), [WEAK_MAX_LOSS_TRIGGER],
+   [WEAK_CLOSE_*], [GIVEBACK_CLOSE_*], [EMERGENCY_GIVEBACK_TRIGGER],
+   [BE_MFE_TRIGGER], [LOCK_MFE_TRIGGER], [RUNNER_GENERIC_EXIT_BLOCKED],
+   [GOOD_SMALL_PROFIT_EXIT_BLOCKED].
+O resumo do deinit ([EXIT_V1235_SUMMARY]) mostra: tickets criados, estados
+restaurados, cortes por teto individual, cortes seletivos do lado fraco,
+falhas de fechamento, BE confirmados, Lock confirmados, runners confirmados,
+falhas de confirmacao de SL, givebacks, saidas seletivas, full closes
+liberados, holds protegidos, entradas bloqueadas no mesmo tick, bloqueios
+monotonicos e estados ativos.
+
+--------------------------------------------------------------------------------
+6. TABELA REQUISITO | FUNCAO | LINHA (arquivo novo) | PROVA | STATUS
+--------------------------------------------------------------------------------
+req 1  Estado individual por ticket (struct evoluida + enum de estado)
+       | ExitTicketStateV1235 / ENUM_EXIT_TICKET_OPSTATE_V1235 | 314-599
+       | campos V1234 preservados + maeUsd/opState/motivo/persistencia; 11 estados
+       | ATENDIDO
+req 2  Teto absoluto de perda por ticket desprotegido, sem side_class
+       | ManageExitProtectionV1235 | 7420-7462
+       | condicao: profit<=-|WeakMaxLossUSD| && !HasConfirmedProtectiveSLV1235;
+         log UNPROTECTED_TICKET_MAX_LOSS_TRIGGER com todos os campos exigidos
+       | ATENDIDO
+req 3  Faixa MFE sem protecao eliminada + log de gap
+       | ManageExitProtectionV1235 / OnInit | 7420-7462 / 948-952
+       | teto independente do MFE; EXIT_CONFIG_GAP_NEUTRALIZED unico no OnInit;
+         inputs intactos
+       | ATENDIDO
+req 4  Protecao real confirmada no servidor (helper unico)
+       | HasConfirmedProtectiveSLV1235 | 6998-7030
+       | exige select + POSITION_SL>0 + lado protetor + >=BEProfitUSD com
+         tolerancia + flag confirmada por releitura; fluxo obrigatorio completo
+         em RequestProtectionSLV1235 (7115-7279)
+       | ATENDIDO
+req 5  BE/LOCK/RUNNER por ticket; GOOD sem autoridade
+       | ManageExitProtectionV1235 / TicketRunnerConfirmedV1235 /
+         HandleGenericExitSelectiveV1235 | 7444-7487 / 7032-7072 / 7698-7793
+       | direitos por MFE; confirmacao so com SL relido; runner exige
+         lockConfirmed+SL real; GOOD sem SL = nao preserva, nao bloqueia
+       | ATENDIDO
+req 6  Falha de SL e devolucao
+       | RequestProtectionSLV1235 / ManageExitProtectionV1235 | 7186-7278 / 7489-7521
+       | retries com cooldown/backoff, sem protecao virtual, logs
+         SERVER_SL_CONFIRM_FAILED com retcode+POSITION_SL, giveback fecha com
+         tentativas>=max e devolucao>=EmergencyGivebackUSD
+       | ATENDIDO
+req 7  Corte do lado fraco em tempo real
+       | TryCutConfirmedWeakSideV1235 / CutOneWeakTicketV1235 /
+         SelectWeakSideCutCandidateV1235 | 7620-7696 / 7555-7618 / 7527-7553
+       | exige BUY+SELL; lado forte por LOCK confirmado ou BE confirmado +
+         LucroMinimoLadoForteV123; sem exigencia de cesta positiva; cooldown so
+         para cortes por divergencia; 1 ticket/tick; preserva protegidos;
+         interrompe OnTick; nao reabre no mesmo tick
+       | ATENDIDO
+req 8  Saida generica seletiva (sem bloqueio total)
+       | HandleGenericExitSelectiveV1235 + call sites | 7698-7793 / 6108 / 6172 / 6531
+       | ALLOW_FULL/SELECTIVE_SENT/NO_ACTION; preserva so SL real confirmado;
+         fecha desprotegidos individualmente; sem bloqueio por lockRight/beRight/
+         GOOD/RUNNER/PROTECTED laterais; full close normal sem protegidos
+       | ATENDIDO
+req 9  Saidas de risco soberanas
+       | ManageDailyRisk / ManageBasketDrawdown / GerenciarProtecaoLucroCestaMFE
+         (hard close) | 6376-6415 / 6337-6374 / 6494-6520
+       | nenhuma passa pela autoridade seletiva; fecham tudo como antes;
+         ManageBasketDrawdown movido para ANTES da autoridade por ticket
+       | ATENDIDO
+req 10 Ordem exata no OnTick + flag global
+       | OnTick / g_exitActionSentThisTickV1235 | 1019-1236 / 579
+       | ordem 1-15 implementada; snippet da guarda identico ao exigido
+         (linhas 1095-1107); guarda final 1161-1175
+       | ATENDIDO
+req 11 Reabertura pelos motores existentes
+       | (nenhuma rotina nova de entrada) | diff sem hunks em 1034-5738 (base)
+       | fluxo corta->confirma->reconcilia->reabre->costura preservado
+       | ATENDIDO
+req 12 Persistencia de MFE e estado por ticket
+       | PersistExitTicketStateV1235 / RestoreExitTicketStateV1235 /
+         ClearExitTicketPersistenceV1235 / CleanupOrphanExitTicketPersistenceV1235
+         | 6664-6790
+       | chave simbolo+magic+ticket+versao; persiste MFE/MAE/direitos/
+         confirmacoes/SL/estado; restaura so com ticket vivo; limpa so apos
+         confirmacao; servidor = fonte primaria
+       | ATENDIDO
+req 13 Identificadores de ticket 64 bits
+       | TicketToStringV1235 | 6597-6600 + 37 usos
+       | StringFormat("%I64u"); zero casts (int)ticket nas rotinas novas/alteradas
+       | ATENDIDO
+req 14 Compatibilidade lote flexivel
+       | OnInit/NormalizeVolume (inalterados) | 861-892 / 8060-8087
+       | contagens identicas (15/15 NormalizeVolume(FixedLot); 3/3 logs);
+         teste I exige Strategy Tester (ver secao 8)
+       | ATENDIDO (validacao runtime pendente de MetaTrader)
+req 15 Nao duplicar autoridades de SL
+       | ModifyPositionSL (guarda monotonica) + RequestProtectionSLV1235 +
+         Sync reconcile | 8669-8760 / 7115-7279 / 6919-6957
+       | nenhuma rotina afrouxa/recua/remove SL; TP preservado; trailing
+         continua apos Lock; SL mais protetor prevalece
+       | ATENDIDO
+req 16 Logs obrigatorios + resumo deinit
+       | (secao 5 deste relatorio) | multiplas
+       | 32/32 tags presentes (verificacao automatizada)
+       | ATENDIDO
+req 17 Testes A-J
+       | (secao 8) | -
+       | analise estatica de fluxo completa; execucao em Strategy Tester
+         pendente (sem MetaTrader neste ambiente)
+       | ANALISE OK / EXECUCAO PENDENTE
+req 18 Compilacao 0/0
+       | v1235_ticket_exit_authority_compile.log | -
+       | validacao estatica limpa; compilacao MetaEditor deve ser executada
+         pelo usuario (indisponivel neste ambiente Linux)
+       | PENDENTE DE METAEDITOR
+
+--------------------------------------------------------------------------------
+7. AUTORIDADES E COMPORTAMENTO RESULTANTE (resumo operacional)
+--------------------------------------------------------------------------------
+side_class (ClassifySideV123)  = CONTEXTO (painel, logs, entrada, bias, rebalance)
+ticket_state (opState V1235)   = AUTORIDADE DE SAIDA
+Fluxo garantido:
+BUY/SELL -> leitura por ticket (Sync+MFE/MAE) -> corte do desprotegido (teto
+absoluto) -> protecao real do forte (BE/Lock com SL relido) -> preservacao
+seletiva (saida generica por subconjunto desprotegido) -> reconciliacao
+(OnTradeTransaction + Sync + persistencia) -> reabertura (motores existentes,
+tick seguinte) -> costura continua.
+
+--------------------------------------------------------------------------------
+8. TESTES A-J - ANALISE DE FLUXO NO CODIGO (roteiro para Strategy Tester)
+--------------------------------------------------------------------------------
+IMPORTANTE: este container nao possui MetaTrader 5, entao os testes abaixo foram
+validados por rastreamento estatico do fluxo no codigo (linhas citadas do
+arquivo novo). A execucao em Strategy Tester/conta demo deve reproduzir os
+resultados descritos.
+
+TESTE A (perdedor escondido pelo lado agregado): 4 BUY caem alem de
+   -WeakMaxLossUSD com ClassifySide(BUY) != WEAK. Teto absoluto (7420) ignora a
+   classe -> cada BUY desprotegido fecha individualmente, 1 por tick
+   (g_exitCloseSentThisTickV1234 verificado na condicao); SELL protegido intacto
+   (HasConfirmedProtectiveSLV1235 true impede o teto e as saidas genericas);
+   guarda 1095 impede entrada no mesmo tick; presenca bilateral repoe BUY no
+   tick seguinte apos reconciliacao (1178+). RESULTADO ESPERADO: OK.
+TESTE B (faixa 5<MFE<8): teto nao depende mais de MFE (7420-7423) -> fecha;
+   [EXIT_CONFIG_GAP_NEUTRALIZED] registrado no OnInit (950). OK.
+TESTE C (lockRight sem confirmacao, SL=0): HasConfirmedProtectiveSLV1235
+   retorna false (7009-7011) -> nao preserva; HandleGenericExitSelective nao
+   bloqueia cesta por lockRight (loop 7710 usa apenas protecao confirmada);
+   tentativas de SL continuam (7444-7449); atingindo teto/giveback, fecha. OK.
+TESTE D (GOOD sem SL): GOOD nao aparece em nenhuma condicao de preservacao;
+   ticket cai no ramo desprotegido do HandleGenericExitSelective (7730-7739);
+   sem nenhum protegido a cesta fecha normalmente (7741-7752). OK.
+TESTE E (runner real): lockConfirmed + SL real >= tier Lock ->
+   TicketRunnerConfirmedV1235 true (7032) + log unico; saidas genericas
+   preservam (7710-7728); trailing continua melhorando SL (ModifyPositionSL
+   monotonico); sai apenas por SL/trailing/alvo superior/risco soberano. OK.
+TESTE F (1 forte protegido + 3 fracos, PRICE_LINE): TryExtractWeakSideV123
+   pode cortar 1 fraco (6076); senao HandleGenericExitSelective("PRICE_LINE")
+   fecha 1 desprotegido por tick (7754-7771) e preserva o protegido
+   ([GENERIC_EXIT_PROTECTED_HOLD]); cesta nunca bloqueada inteira. OK.
+TESTE G (risco soberano): Daily Loss (6403-6415) e DD obrigatorio (6360-6366)
+   chamam CloseAllBasket() direto - sem autoridade seletiva no caminho; runners
+   nao sao preservados. OK.
+TESTE H (reinicio): OnInit limpa apenas orfaos confirmados (6768, com guarda de
+   conexao); primeiro Sync recria estado + RestoreExitTicketStateV1235 (MFE/MAE/
+   direitos) + reconciliacao com POSITION_SL real (6849-6885); MFE nao zera;
+   nenhuma protecao virtual. OK.
+TESTE I (lote flexivel 0.01/0.02/0.05): OnInit/NormalizeVolume inalterados;
+   entradas continuam por NormalizeVolume(FixedLot) (15 call sites identicos);
+   patch de saida nao toca lote. OK (executar no tester para confirmacao final).
+TESTE J (nao abrir no mesmo tick): apos qualquer CloseSingleTicketV1235, a
+   guarda 1093-1107 encerra o OnTick antes de trailing/saidas/reabertura/
+   entradas/pendentes, com log [EXIT_SAME_TICK_ENTRY_BLOCK]; fechamentos de
+   cesta tambem ligam a flag (5882/5916/5950) e a guarda final 1161-1175 cobre
+   as saidas genericas; reabertura ocorre apenas em tick posterior, apos
+   reconciliacao. OK.
+
+--------------------------------------------------------------------------------
+9. RESUMO FINAL
+--------------------------------------------------------------------------------
+CODIGO: APROVADO. Todas as 12 causas raiz (A-L) confirmadas com prova na base e
+corrigidas com patch minimo e rastreavel; criterios 2-16 dos criterios de
+aprovacao verificados por prova de codigo e validacao estatica automatizada
+(estrutura balanceada, simbolos integros, logs completos, regioes de entrada e
+lote flexivel byte a byte identicas a base).
+
+PENDENTE (impossivel neste ambiente, sem MetaTrader/MetaEditor): criterio 1
+(compilacao MetaEditor 0 errors/0 warnings) e a execucao dos testes A-J em
+Strategy Tester. O veredito "APROVADO" do pacote completo fica condicionado a
+essas duas etapas, que devem ser executadas pelo usuario conforme o
+v1235_ticket_exit_authority_compile.log. Nenhuma alegacao de "100% corrigido"
+e feita sem essas provas de execucao.
+================================================================================

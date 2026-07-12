@@ -1,0 +1,91 @@
+============================================================
+IA FUNDED GOLD V1.2.3.5 BIDIRECTIONAL TICKET EXIT AUTHORITY
+LOG DE COMPILACAO / VALIDACAO
+Data: 2026-07-12
+Arquivo: IA_FUNDED_GOLD_V1.2.3.5_BIDIRECTIONAL_TICKET_EXIT_AUTHORITY_FIXED_FLEXIBLE_LOT.mq5
+Base:    IA_FUNDED_GOLD_V1.2.3.4_EXIT_MFE_SERVER_SL_FIXED_FLEXIBLE_LOT.mq5
+============================================================
+
+STATUS: COMPILACAO METAEDITOR NAO EXECUTADA NESTE AMBIENTE.
+
+Motivo (declarado honestamente, sem inventar resultado):
+Este patch foi produzido em um container Linux remoto sem MetaTrader 5 /
+MetaEditor / Wine instalados. Nao existe compilador MQL5 disponivel aqui,
+portanto:
+
+  - NAO foi gerado o arquivo .ex5;
+  - NAO existe log real "0 errors / 0 warnings" do MetaEditor para anexar;
+  - NAO foi executado backtest de validacao.
+
+VERIFICACOES ESTATICAS REALIZADAS EM SUBSTITUICAO (todas OK):
+
+  1. Balanceamento estrutural do arquivo inteiro, apos remocao de strings e
+     comentarios por um parser dedicado:
+        chaves { }        -> saldo 0  OK
+        parenteses ( )    -> saldo 0  OK
+        colchetes [ ]     -> saldo 0  OK
+        aspas por linha   -> nenhuma linha com contagem impar  OK
+
+  2. Prototipos x definicoes x usos das 25 funcoes V1.2.3.5:
+        PriceDistanceToUSDV1235, TicketToStringV1235, TicketOpStateToTextV1235,
+        FindExitTicketStateV1235, RemoveExitTicketStateV1235,
+        ExitTicketPersistKeyV1235, PersistExitTicketStateV1235,
+        RestoreExitTicketStateV1235, ClearExitTicketPersistenceV1235,
+        CleanupOrphanExitTicketPersistenceV1235, PersistAllExitTicketStatesV1235,
+        SyncExitTicketStatesV1235, ProtectionDesiredSLV1235,
+        ServerSLSatisfiesLevelV1235, ProtectionToleranceV1235,
+        HasConfirmedProtectiveSLV1235, TicketRunnerConfirmedV1235,
+        UpdateTicketOpStateV1235, RequestProtectionSLV1235,
+        CloseSingleTicketV1235, ManageExitProtectionV1235,
+        SelectWeakSideCutCandidateV1235, CutOneWeakTicketV1235,
+        TryCutConfirmedWeakSideV1235, HandleGenericExitSelectiveV1235
+     Resultado: cada uma com exatamente 1 prototipo + 1 definicao e pelo menos
+     1 uso (exceto helper de texto usado em logs). Nenhum problema.
+
+  3. Simbolos REMOVIDOS da V1.2.3.4 sem nenhuma referencia restante no codigo
+     (fora de comentarios): g_exitTicketStatesV1234, g_exitTicketStateCountV1234,
+     EXIT_TICKET_STATE_MAX_V1234, g_exitWeakClosesV1234, g_exitWeakCloseFailsV1234,
+     g_exitBeConfirmedV1234, g_exitLockConfirmedV1234, g_exitGoodBlocksV1234,
+     g_exitRunnerBlocksV1234, g_exitGivebackClosesV1234, PriceDistanceToUSDV1234,
+     FindExitTicketStateV1234, RemoveExitTicketStateV1234, SyncExitTicketStatesV1234,
+     ProtectionDesiredSLV1234, ServerSLSatisfiesLevelV1234, RequestProtectionSLV1234,
+     CloseSingleTicketV1234, ManageExitProtectionV1234, BlockGenericBasketExitV1234.
+     Resultado: zero referencias pendentes -> sem "undeclared identifier".
+
+  4. Simbolos V1.2.3.4 INTENCIONALMENTE preservados (usados por codigo nao
+     alterado e/ou exigidos pelo prompt): g_exitCloseSentThisTickV1234,
+     g_exitSlNotConfirmedV1234, g_exitMonotonicBlocksV1234. Declarados 1 vez,
+     usados de forma consistente (22 referencias).
+
+  5. StringFormat novo: apenas "%I64u" com 1 especificador / 1 argumento
+     (TicketToStringV1235). OK.
+
+  6. Todas as APIs usadas pelas rotinas novas sao built-ins MQL5 padrao:
+     PositionSelectByTicket, PositionGetDouble/Integer/String, PositionGetTicket,
+     PositionsTotal, GlobalVariableSet/Get/Check/Del, GlobalVariablesTotal,
+     GlobalVariableName, StringFormat, StringFind, StringSubstr, StringLen,
+     StringToInteger, MathMax, MathMin, MathAbs, MathRound, TimeCurrent,
+     SymbolInfoDouble, TerminalInfoInteger, MQLInfoInteger, DBL_MAX,
+     trade.PositionClose / trade.PositionModify / trade.ResultRetcode.
+     Nenhum include novo, nenhuma macro nova alem de EXIT_TICKET_STATE_MAX_V1235.
+
+  7. Tags de log obrigatorias presentes (32/32) - ver lista exata no
+     v1235_ticket_exit_authority_audit_report.txt, secao 5.
+
+  8. Diff restrito as regioes autorizadas: nenhum hunk entre as linhas 1034 e
+     5738 da base (todo o maquinario de entradas, candidatos V121, presenca
+     bilateral, pendentes V1231/V1232/V1233 e limites permanece byte a byte
+     identico). Prova adicional: contagens identicas de NormalizeVolume(FixedLot)
+     (15/15), logs FLEXIBLE_LOT_ (3/3) e chamadas dos motores de entrada.
+
+ACAO NECESSARIA DO USUARIO:
+  1. Abrir IA_FUNDED_GOLD_V1.2.3.5_BIDIRECTIONAL_TICKET_EXIT_AUTHORITY_FIXED_FLEXIBLE_LOT.mq5
+     no MetaEditor.
+  2. Compilar (F7). Resultado esperado: 0 errors / 0 warnings.
+  3. O .ex5 sera gerado pelo MetaEditor.
+  4. Se aparecer qualquer erro, ele estara restrito as linhas do patch
+     (ver v1235_ticket_exit_authority_diff.txt).
+  5. Validar os testes A-J no Strategy Tester conforme roteiro da secao 8 do
+     audit report (os testes exigem mercado/servidor e nao podem ser executados
+     neste container).
+============================================================

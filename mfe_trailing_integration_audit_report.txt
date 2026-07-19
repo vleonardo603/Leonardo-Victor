@@ -1,0 +1,429 @@
+====================================================================
+RELATORIO TECNICO - CORRECAO CIRURGICA DO MFE TRAILING
+PREDATOR FLOW AI V.2 MFE TRAILING -> PREDATOR_FLOW_AI_V2_MFE_TRAILING_INTEGRATION_FIXED.mq5
+Data: 2026-07-19
+====================================================================
+
+A. VEREDITO DA AUDITORIA INICIAL
+--------------------------------------------------------------------
+O EA original possui um motor MFE por posicao bem construido
+(POSITION_IDENTIFIER como chave, OrderCalcProfit para conversao,
+modificacao por ticket com verificacao de retcode e releitura do SL,
+persistencia por identifier, monotonia via IsMFEStopMoreProtective).
+A arquitetura NAO precisava ser reescrita. Os defeitos reais eram de
+INTEGRACAO e PRIORIDADE:
+  1. o trailing legado e o BE disputavam autoridade com o MFE
+     (vencia o SL "mais protetor", entao o trailing por candle
+     antecipava a curva monetaria solicitada);
+  2. o gate dos modulos legados usava lucro com a comissao de saida
+     re-adicionada (dupla contagem de sinal invertido);
+  3. o bloqueio de DD da cesta era pegajoso: uma vez em
+     -Maximum_allowed_loss com Close_loss_by_drawdown=false, todas
+     as entradas (inclusive reforco estrutural no lado dominante)
+     ficavam bloqueadas ate a cesta zerar, sem histerese e sem
+     nivel soft;
+  4. o processamento por tick era pesado ANTES da gestao das
+     posicoes: HistorySelect(0,agora) por posicao por chamada via
+     GetPositionCommissionByIdentifier, lucro da cesta recalculado
+     ~10x por tick, painel reconstruido a cada tick, e o MFE rodava
+     DEPOIS de tudo isso (inclusive depois de um return antecipado
+     do fechamento de cesta);
+  5. persistencia sem quantizacao (9 GlobalVariableSet por novo
+     maximo de MFE, a cada tick de avanco) e conversao monetaria
+     sem backoff (48 iteracoes cegas, repetidas a cada tick em
+     falha);
+  6. inviabilidade fisica (stops/freeze level) resultava em
+     S/L = 0.00 silencioso, sem estado de espera visivel, sem
+     ativacao viavel calculada e sem motivo no painel.
+Os contadores simultaneos ja eram separados do historico (posicoes
+vivas + pendentes) e os tetos 6/2-5/3-4/4 ja eram tratados como
+tetos, nao metas; o congelamento observado (4 BUY / 0 SELL / sem SL)
+e explicado pelos itens 1-4, nao por contador historico.
+
+B. CAUSAS-RAIZ CONFIRMADAS (com correcao aplicada)
+--------------------------------------------------------------------
+[4.1] BLOQUEIO DE DD CONGELANDO A CESTA - CONFIRMADA
+  Funcao: ManageBasketDrawdown (orig. linha 3865); BaseDirectionalEntryFiltersOK
+          (orig. 2512); BaseEntryFiltersOK (orig. 4744); IsPendingFiltersOK (orig. 4890).
+  Problema comprovado: g_basketDDBlocked=true em -600 USD; liberacao
+          somente com cesta zerada; bloqueava ate o reforco estrutural
+          do lado dominante; sem nivel soft; sem histerese.
+  Correcao aplicada: maquina de estados BASKET_DD_NORMAL/SOFT/HARD.
+          SOFT (default 60% do hard = 360 USD, configuravel por
+          SoftBasketDDUSD; fracao documentada em
+          SOFT_BASKET_DD_AUTO_FRACTION): bloqueia pares neutros,
+          taticas contra o fluxo e expansao do lado fraco; permite
+          somente entrada estrutural unitaria no lado dominante com
+          TODAS as regras normais (cadencia, distancia, tetos, teto
+          global, daily). HARD (-600): modo HARD_DD_MANAGEMENT_ONLY -
+          nenhuma entrada nova, gestao de SL/MFE/BE continua;
+          liberacao APENAS com histerese (HardDDReleaseRatio=0.85 ->
+          recuperar acima de ~-510) e NUNCA com daily block ativo.
+          Close_loss_by_drawdown=true continua fechando a cesta como antes.
+  Requisito atendido: prompt secoes 4.1, 11.1, 11.2, bloco final 6 e 7.
+  Risco de regressao: baixo; com SoftBasketDDUSD=0 e cesta acima de
+          -360 o comportamento e identico ao original.
+  Teste correspondente: Testes 13 e 14 da matriz.
+
+[4.2] BLOQUEIO DIARIO - CONFIRMADA COMO AUTORIDADE (sem defeito funcional)
+  Funcao: RefreshDailyState / ActivateDailyLossBlock / ManageDailyRisk.
+  Problema comprovado: autoridade correta e persistida ate o proximo
+          dia do servidor; faltava telemetria padronizada e clareza
+          do motivo no painel.
+  Correcao aplicada: eventos [DAILY_BLOCK_ENTER] e
+          [DAILY_BLOCK_RELEASE]; painel "AUTORIDADE DE RISCO" com
+          Daily Block ATIVO/INATIVO e motivo por bloqueio; hard DD
+          nao pode ser liberado enquanto o daily estiver ativo.
+          Nenhuma mudanca na regra de risco em si.
+  Requisito: 4.2, 11.3. Risco: nenhum. Teste: 15.
+
+[4.3] TRAILING LEGADO CONCORRENDO COM O MFE - CONFIRMADA
+  Funcao: ManageUnifiedProfitStopProtection (orig. 6346-6374).
+  Problema comprovado: candidatos BE e SmartTrailing entravam na
+          disputa mesmo com EnableAdaptiveMoneyMFE=true; o trailing
+          por candle (Trailing_type=1) podia produzir SL mais
+          apertado que a curva 2->1 e encerrar a posicao antes da
+          logica monetaria.
+  Correcao aplicada: nova autoridade unica
+          ProfitStopAuthority (padrao PROFIT_STOP_MFE_WITH_BE_FLOOR):
+          - antes do MFE armar: BE pode atuar somente se o SL
+            candidato cobrir custos + buffer em termos LIQUIDOS
+            (validado com CalculateMFEPositionNetProfit; bloqueio
+            logado como MFE_BE_COST_FLOOR_BLOCK);
+          - depois do MFE armar (net_mfe >= ativacao): BE e trailing
+            legado ficam sem autoridade sobre a posicao; o SL BE ja
+            confirmado permanece como piso (monotonia impede recuo);
+          - PROFIT_STOP_LEGACY_UNIFIED reproduz o comportamento
+            antigo; PROFIT_STOP_MFE_ONLY desliga o BE tambem antes
+            de armar. Com EnableAdaptiveMoneyMFE=false o EA se
+            comporta como o legado independente da autoridade.
+          BE e Smart Trailing NAO foram removidos.
+  Requisito: 4.3, secao 6, bloco final 5. Risco: baixo - modo legado
+          preservado por input. Teste: 7 e 8.
+
+[4.4] DUPLA CONTABILIZACAO DE COMISSAO NO GATE LEGADO - CONFIRMADA
+  Funcao: ManageUnifiedProfitStopProtection (orig. linha 6343).
+  Problema comprovado: legacy_profit = current_net_profit -
+          estimated_exit_commission. Como estimated_exit_commission
+          e NEGATIVA (linha 5432: -exit_per_lot*volume) e JA esta
+          somada dentro de current_net_profit (linha 5475-5478),
+          a subtracao re-adicionava |comissao de saida|, inflando o
+          lucro usado pelos gates de BE/trailing.
+  Correcao aplicada: unified_net_profit = current_net_profit
+          (definicao unica de lucro liquido: bruto + swap +
+          comissao de entrada + comissao estimada de saida, com
+          negativos somados como negativos). Cada custo contado
+          exatamente uma vez em TODAS as decisoes.
+  Tabela de auditoria (exemplo SIMULADO, XAUUSD 0.05 lote BUY,
+  abertura 4000.00, bid 4000.80, tick value 1 USD/0.01 lote/0.01):
+      Lucro bruto:                +4.00
+      Swap:                       -0.12
+      Comissao de entrada:        -0.18   (DEAL_COMMISSION, negativa)
+      Comissao estimada de saida: -0.18   (-3.50/lote * 0.05)
+      Lucro liquido:              +3.52   (cada componente 1x)
+      ANTES (bug): gate legado via 3.52 - (-0.18) = 3.70 (otimista)
+      DEPOIS:      gate legado ve 3.52 (correto)
+  Requisito: 4.4, 5.3, bloco final 10. Risco: BE/trailing armam
+          ~|comissao de saida| mais tarde (mais conservador, nunca
+          menos protegido). Teste: 8 e matriz item 20.
+
+[4.5] PROCESSAMENTO PESADO ANTES DO MFE - CONFIRMADA
+  Funcoes: OnTick (orig. 614-689), GetPositionCommissionByIdentifier
+          (orig. 4523: HistorySelect(0,agora) POR POSICAO POR
+          CHAMADA), GetBasketProfit e derivadas (~10 chamadas/tick),
+          GetTodayClosedProfit (>=3 HistorySelect/tick), UpdatePanel
+          (reconstruido a cada tick), retorno antecipado de
+          GerenciarProtecaoLucroCestaMFE pulando a gestao de SL.
+  Correcao aplicada:
+          - OnTick reordenado: tick valido -> InvalidateMoneySnapshots
+            -> RefreshDailyState -> ManageUnifiedProfitStopProtection
+            (MFE PRIMEIRO) -> autoridades de risco -> fechamentos de
+            cesta -> entradas. NENHUM return de entrada/fechamento
+            impede mais a gestao das posicoes abertas; spread,
+            horario, candle, fluxo neutro, slots, cooldown e
+            extensao nao tocam o MFE.
+          - cache de comissao por POSITION_IDENTIFIER
+            (COMMISSION_CACHE_SIZE=32), invalidado por deal em
+            OnTradeTransaction: o HistorySelect completo passa a
+            ocorrer 1x por posicao (miss) em vez de ~10x por tick
+            por posicao.
+          - snapshot monetario por tick (g_moneySnapshotCycle) para
+            GetBasketProfit/Buy/Sell: 1 recalculo por tick,
+            invalidado em aberturas, fechamentos e transacoes.
+          - GetTodayClosedProfit com cache sujo (dirty) invalidado
+            por transacao e virada de dia: HistorySelect diario
+            somente quando algo mudou.
+          - painel e linhas do grafico com throttle de ~1 s
+            (GetTickCount), mantendo o refresh de 1 s do OnTimer.
+            A gestao do MFE continua tick a tick.
+  Requisito: 4.5, secoes 9 e 10. Risco: painel/linhas atrasam ate
+          1 s (visual apenas). Teste: 18.
+
+[4.6] PERSISTENCIA EXCESSIVA - CONFIRMADA
+  Funcao: ManageUnifiedProfitStopProtection (orig. 6325) +
+          PersistMFEPositionState.
+  Problema comprovado: 9 GlobalVariableSet a cada novo maximo de
+          MFE, ou seja, praticamente a cada tick favoravel.
+  Correcao aplicada: persistencia quantizada - so persiste em novo
+          degrau do quantum (MFEProtectionQuantumNetMoney) ou
+          mudanca do lock desejado (last_persisted_mfe_quantum /
+          last_persisted_lock); persistencia integral mantida em
+          transicoes de estado, confirmacao de SL, transacoes,
+          OnDeinit; adicionada persistencia periodica leve de 60 s
+          no OnTimer (MFE_PERIODIC_PERSIST_SECONDS).
+  Requisito: 4.6, 10.3. Risco: em queda de energia perde-se no
+          maximo 1 quantum (0.25 USD) de MFE nao persistido -
+          mitigado pelo timer de 60 s. Teste: 12 e 18.
+
+[4.7] REPETICAO DE OrderCalcProfit SEM BACKOFF - CONFIRMADA
+  Funcao: ConvertMFENetLockToPrice (orig. 5573, 48 iteracoes cegas)
+          + chamada em 6376-6440 repetida em todo tick de falha.
+  Correcao aplicada: backoff tecnico por posicao
+          (conversion_backoff_until = agora + MFEConversionBackoffSeconds,
+          padrao 3 s). Nova tentativa SOMENTE quando: lock desejado
+          mudou (>=0.005), preco avancou >=1 tick da ultima
+          tentativa, backoff expirou, nova transacao da posicao
+          (OnTradeTransaction zera o backoff) ou ticket/volume
+          reconciliado. Busca binaria com early-exit quando o
+          intervalo <= tick_size/2 e teto reduzido de 48 para 32
+          iteracoes (justificativa: bracket inicial XAUUSD < 10 USD
+          de faixa converge para < 1 tick em ~17-20 bisseccoes;
+          32 da folga de seguranca; o early-exit torna o teto
+          raramente atingido).
+  Requisito: 4.7, 5.6, 10.4. Risco: atraso maximo de 3 s ou 1 tick
+          para retomar apos falha - a protecao ja confirmada nunca
+          e afetada. Teste: 9, 11, 18.
+
+[4.8] ATIVACAO FISICAMENTE INVIAVEL SILENCIOSA - CONFIRMADA
+  Funcao: ConvertMFENetLockToPrice + gerenciador unificado.
+  Correcao aplicada: a conversao agora devolve fail_reason
+          (PRICE/DISTANCE/CALC); o estado por posicao guarda
+          wait_reason e o painel deriva textos deterministicos:
+          DISARMED, ARMED_WAITING_PRICE,
+          ARMED_WAITING_SERVER_DISTANCE, CONVERSION_BACKOFF,
+          MODIFY_PENDING, MODIFY_REJECTED, PROTECTED_PARTIAL,
+          PROTECTED_FULL, CLOSED. Para posicoes armadas em espera o
+          painel exibe ativacao configurada vs ativacao viavel
+          estimada (lock inicial + custo monetario da distancia
+          minima do servidor + buffer, via
+          EstimateMFEServerDistanceCostMoney) e o motivo
+          (STOPS_LEVEL/FREEZE_LEVEL/SPREAD_TICK). Logs:
+          MFE_SERVER_DISTANCE_BLOCK, MFE_PARTIAL_LOCK (protecao
+          parcial aceita), MFE_PRICE_CONVERSION_FAILED com motivo e
+          backoff. O valor configurado (2.00) NUNCA e alterado
+          silenciosamente; o MFE fica armado em espera e aplica o
+          SL assim que fisicamente possivel, sem perder o maximo.
+          Protecao parcial so e aceita se
+          lock_efetivo >= MFEMinimumNetLockMoney +
+          MFEExecutionBufferMoney (0.05 + 0.10 padrao).
+  Requisito: 4.8, secoes 5.5, 7, 8. Risco: nenhum comportamental;
+          estimativa de viabilidade e informativa (painel).
+          Teste: 9 e 10.
+
+[4.9] LIMITES DIRECIONAIS COMO TETOS - JA CORRETO NO ORIGINAL
+  Funcao: GetDynamicBuyLimit/GetDynamicSellLimit +
+          CanOpenAdaptiveUnitEntry.
+  Comprovacao: usados apenas como tetos simultaneos; nao existe
+          reposicao para completar proporcao nem fechamento por
+          mudanca de regime. Nada foi alterado na logica.
+  Correcao aplicada (telemetria apenas): painel relabelado
+          "TETOS ATUAIS BUY/SELL (simultaneos)" + exposicao atual +
+          slots livres + "Entrada estrutural autorizada" com motivo.
+  Teste: 19.
+
+[4.10] CONTADORES HISTORICOS vs SLOTS - JA SEPARADOS NO ORIGINAL
+  Comprovacao: exposicao simultanea = posicoes vivas + pendentes
+          (CountPotential*); posicao fechada libera o slot
+          naturalmente; g_tacticalEntryCount e cumulativo POR
+          EPISODIO e mantem "maximo 1 tatica por episodio" mesmo
+          apos o fechamento da tatica (resetado apenas em
+          EndTacticalEpisodeReason) - regra preservada; cadencia
+          estrutural independente (g_lastPairOpenTime, distancia,
+          candle). O sintoma relatado decorre de 4.1.
+  Correcao aplicada: log padronizado [STRUCTURAL_SLOT_RELEASED] no
+          fechamento rastreado pelo MFE (FinalizeMFEPositionState) e
+          telemetria de slots no painel. Sem reposicao instantanea:
+          as regras de cadencia/distancia existentes continuam
+          obrigatorias para a proxima entrada.
+  Teste: 16 e 17.
+
+C. ARQUIVO CORRIGIDO
+--------------------------------------------------------------------
+PREDATOR_FLOW_AI_V2_MFE_TRAILING_INTEGRATION_FIXED.mq5
+O arquivo original foi preservado intacto como
+PREDATOR_FLOW_AI_V2_MFE_TRAILING_ORIGINAL.mq5
+(md5 6839d6ac46a5ace480845c394dc4ba38, identico ao upload).
+
+D. RESUMO DO DIFF (mfe_trailing_integration_diff.txt)
+--------------------------------------------------------------------
+701 linhas adicionadas, 109 removidas (arquivo de 6578 -> 7178
+linhas; ~90% intacto). 47 blocos de substituicao, todos ancorados em
+texto unico e aplicados exatamente 1 vez.
+
+INPUTS ADICIONADOS (nenhum input existente alterado):
+  MFELockMode = MFE_LOCK_STEPPED_2_TO_1            (novo, padrao exigido)
+  ProfitStopAuthority = PROFIT_STOP_MFE_WITH_BE_FLOOR (novo, padrao exigido)
+  MFEMinimumNetLockMoney = 0.05
+  MFEExecutionBufferMoney = 0.10
+  MFEConversionBackoffSeconds = 3
+  SoftBasketDDUSD = 0.0   (0 = 60% do Maximum_allowed_loss)
+  HardDDReleaseRatio = 0.85
+
+ENUMS/DEFINES NOVOS: ENUM_MFE_LOCK_MODE, ENUM_PROFIT_STOP_AUTHORITY,
+  ENUM_BASKET_DD_STATE, MFE_WAIT_*, MFE_CONVERT_FAIL_*.
+
+CAMPOS NOVOS EM MFEPositionState: wait_reason, last_modify_retcode,
+  last_conversion_attempt_lock, last_conversion_price,
+  conversion_backoff_until, last_persisted_mfe_quantum,
+  last_persisted_lock. Struct novo: CommissionCacheEntry.
+
+FUNCOES CRIADAS (7): InvalidateMoneySnapshots,
+  InvalidateCommissionCache, GetSoftBasketDDThresholdUSD,
+  BasketDDStateText, MFEProtectionStateText,
+  EstimateMFEServerDistanceCostMoney, MFEDistanceBlockReasonText.
+FUNCOES REMOVIDAS: nenhuma.
+
+FUNCOES ALTERADAS (18): OnTick (reordenado), OnTimer (persistencia
+  periodica), OnTradeTransaction (invalidacao de caches),
+  ManageUnifiedProfitStopProtection (autoridade + comissao unica +
+  backoff + persistencia quantizada), UpdateDesiredMFENetLock (modo
+  2->1), ConvertMFENetLockToPrice (fail_reason, early-exit, pisos de
+  lock), SubmitUnifiedPositionStop (captura retcode),
+  ReconcileMFEPositionIdentity e HandleMFETradeTransaction (reset de
+  backoff), PersistMFEPositionState (carimbos), FinalizeMFEPositionState
+  (log de slot), ManageBasketDrawdown (soft/hard/histerese),
+  BaseDirectionalEntryFiltersOK, CanOpenAdditionalPair,
+  IsPendingFiltersOK (gates DD), ComputePanelStatus, UpdatePanel
+  (blocos MFE/risco + throttle), DrawBasketLines (throttle),
+  GetBasketProfit/Buy/Sell, GetTodayClosedProfit,
+  GetPositionCommissionByIdentifier (caches), RefreshDailyState,
+  ActivateDailyLossBlock (eventos), CloseAllBasket/CloseBuyBasket/
+  CloseSellBasket/CloseNewestPositionOfType/OpenBuySellPair/
+  OpenAdaptiveUnitPosition (invalidacao de snapshot),
+  MFE_PRICE_SEARCH_ITERATIONS 48 -> 32 (com early-exit por tick).
+
+E. COMPILACAO
+--------------------------------------------------------------------
+BLOCKED - ver mfe_trailing_integration_compile.log. MetaEditor nao
+existe neste ambiente Linux. NAO se declara compilacao executada.
+Verificacao estatica substituta: balanceamento, assinaturas,
+declaracoes e chamadas conferidos (0 inconsistencias).
+
+F. MATRIZ DE TESTES
+--------------------------------------------------------------------
+Ver mfe_trailing_integration_test_matrix.txt. Resumo honesto:
+  - PASS (estatico/matematico): curva 2->1 (validada numericamente,
+    12 casos + monotonia continua), separacao de contadores,
+    preservacao de invariantes, ordem do OnTick, autoridade unica.
+  - BLOCKED (exigem MT5/Strategy Tester): todos os 19 cenarios de
+    runtime. Nenhum resultado de execucao foi inventado.
+
+G. INVARIANTES PRESERVADAS (verificadas por comparacao de funcao)
+--------------------------------------------------------------------
+Intactas byte a byte: leitura estrutural e tatica completa
+(ApplyStructuralFlowSignal, UpdateTactical/StructuralFlowOnClosedBar,
+DetectClosedTacticalCorrectionSignal, GetClosedStructuralSignal,
+RebuildAdaptiveFlowStateFromClosedBars, EndTacticalEpisodeReason),
+ManageAsymmetricAdaptiveEntries, GetDynamicBuyLimit/SellLimit (6/2,
+5/3, 4/4), GerenciarProtecaoLucroCestaMFE, ManageBasketClosing,
+ManageDailyRisk, CalculateMFEPositionNetProfit,
+ResolveMFEPositionCosts, ConfirmMFEServerStop,
+IsMFEStopMoreProtective (monotonia), LoadMFEPositionState,
+RebuildMFEStateFromOpenPositions, BuildBreakEvenSLCandidate,
+BuildSmartTrailingSLCandidate, GetMFERetentionStage,
+QuantizeMFENetLock. Preservados: lote fixo 0.01, Magic 20260710,
+maximo global 8, tetos assimetricos, 1 tatica por episodio, par
+bilateral inicial, comentarios de ordem, filtros de spread/horario,
+timeframe M5, persistencia por identifier, modificacao por ticket,
+sem martingale, sem grid, sem reposicao instantanea.
+
+H. RISCOS RESIDUAIS E LIMITACOES
+--------------------------------------------------------------------
+1. COMPILACAO NAO EXECUTADA neste ambiente (bloqueio de ferramenta).
+   Risco de erro de sintaxe residual apesar da verificacao estatica.
+2. Posicoes perdedoras continuam SEM Stop Loss inicial de perda -
+   comportamento original preservado deliberadamente (bloco final 8:
+   proibido criar novo sistema de SL de perda fora do escopo).
+   Documentado como risco residual; a protecao da conta permanece a
+   cargo de daily/hard DD.
+3. BE/trailing legado armam ~|comissao de saida| mais tarde por
+   causa da correcao 4.4 (mais conservador; nunca menos protetor).
+4. A estimativa de "ativacao viavel" do painel e informativa
+   (recalculada por refresh de 1 s), nao um gate.
+5. MFE_MAX_TRACKED_POSITIONS=16 >= 8 posicoes maximas - folga 2x
+   preservada do original.
+6. Protecao parcial exige lock >= 0.15 USD liquido (0.05+0.10) -
+   valores novos e conservadores; ajustaveis por input.
+7. Comportamento em contas netting permanece o mesmo do original
+   (alerta e aviso), fora do escopo.
+8. Forward test em demo e obrigatorio antes de qualquer conta real:
+   confirmacao de retcodes reais do servidor, freeze em noticia,
+   spread real, reinicios de VPS.
+
+DECLARACAO DE HONESTIDADE OBRIGATORIA
+--------------------------------------------------------------------
+O que foi comprovado por codigo: todas as causas-raiz da secao B
+  (leitura direta do fonte, linhas citadas); preservacao das
+  invariantes da secao G (comparacao automatizada de funcoes);
+  aplicacao exata dos 47 blocos de patch (ancoras unicas).
+O que foi comprovado por compilacao: NADA - compilador indisponivel
+  (etapa BLOCKED, sem resultados inventados).
+O que foi comprovado por teste: somente a curva 2->1 e sua
+  monotonia, validadas numericamente fora do MT5 (12 casos + varredura
+  continua 0..20 USD); verificacao estatica de consistencia do fonte.
+O que nao pode ser comprovado: compilacao com zero erros; todos os
+  19 cenarios de runtime da matriz; comportamento real de retcodes,
+  stops/freeze level e persistencia em reinicio de terminal.
+O que ainda exige forward test em demo: tudo da matriz de testes,
+  em especial confirmacao real de SL no servidor, rejeicoes,
+  reinicializacao, soft/hard DD ao vivo e performance por tick.
+
+I. VEREDITO FINAL
+--------------------------------------------------------------------
+APROVADO ESTATICAMENTE
+
+Condicionantes explicitas: (1) compilar no MetaEditor com zero erros
+antes de qualquer teste; (2) executar a matriz completa no Strategy
+Tester (XAUUSD, M5, hedge, Every tick based on real ticks, lote do
+arquivo, sem otimizacao); (3) somente depois disso o veredito maximo
+permitido passa a ser APROVADO COM RESSALVAS PARA FORWARD TEST EM
+DEMO. Este patch NAO esta aprovado para conta real ou FTMO.
+
+TABELA DE ALTERACOES FORA DO ESCOPO
+--------------------------------------------------------------------
+Nenhuma alteracao fora do escopo. Duas observacoes de fronteira,
+ambas dentro do escopo de telemetria/performance previsto no prompt:
+  - Rotulos de status/painel novos ("HARD_DD_MANAGEMENT_ONLY",
+    "TETOS ATUAIS", blocos MFE/risco) - exigidos pelas secoes 11 e 13.
+  - Throttle de 1 s no painel e nas linhas do grafico - exigido pela
+    secao 10.5 (somente visual; decisoes continuam tick a tick).
+
+RELATORIO DE PERFORMANCE (estimativa estatica, antes -> depois)
+--------------------------------------------------------------------
+Cenario de referencia: 8 posicoes abertas, tick tipico sem novo
+degrau de MFE e sem modificacao de SL.
+  HistorySelect completos (0..agora) por tick:
+    antes: ~10 chamadas de cesta x 8 posicoes = ~80
+    depois: 0 (cache por identifier; miss unico por posicao nova)
+  HistorySelect diarios por tick:
+    antes: >=3 (RefreshDailyState + ManageDailyRisk +
+           ManageDailyProfitTarget, + painel)
+    depois: 0 em regime (cache dirty; recomputa apenas apos deal ou
+           virada de dia)
+  Recalculos do lucro da cesta por tick: ~10 -> 1 (snapshot por ciclo)
+  OrderCalcProfit por posicao armada nao protegida:
+    antes: ate ~55 por tick (48 iteracoes + bordas), repetidos
+           mesmo em falha
+    depois: 2 no pre-check barato; busca completa (<=32 com
+           early-exit, tipicamente ~18-20) apenas quando lock mudou,
+           preco moveu >=1 tick ou backoff expirou
+  GlobalVariableSet por novo maximo de MFE:
+    antes: 9 por tick de avanco
+    depois: 9 por degrau de 0.25 USD ou mudanca de lock, + lote
+           periodico de 60 s
+  PositionModify: inalterado no caminho feliz (ja havia gate por
+    ciclo + monotonia + backoff de modificacao); NO_CHANGES continua
+    tratado como rejeicao com backoff (sem spam).
+  Painel/linhas: reconstrucao por tick -> no maximo 1x/s.
+Medicao real por tick (Teste 18) permanece BLOCKED sem MT5.
+====================================================================

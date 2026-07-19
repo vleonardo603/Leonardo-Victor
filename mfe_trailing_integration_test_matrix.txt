@@ -1,0 +1,242 @@
+====================================================================
+MATRIZ DE TESTES - PREDATOR_FLOW_AI_V2_MFE_TRAILING_INTEGRATION_FIXED.mq5
+Data: 2026-07-19
+Ambiente de execucao exigido: MT5 Strategy Tester, XAUUSD, M5, conta
+hedge, "Every tick based on real ticks", lote do arquivo (0.01), sem
+otimizacao. Este ambiente (Linux, sem MT5) NAO executa o EA: cenarios
+de runtime estao BLOCKED com a evidencia estatica correspondente.
+Nenhum resultado de execucao foi inventado.
+====================================================================
+
+ID: T01 | BUY simples
+Cenario: BUY armando e protegendo pela curva monetaria.
+Pre-condicao: EA compilado; 1 BUY aberta; EnableAdaptiveMoneyMFE=true;
+  MFELockMode=STEPPED; ProfitStopAuthority=MFE_WITH_BE_FLOOR.
+Passos: (1) lucro liquido < 2 -> conferir painel DISARMED;
+  (2) alcancar 2.00 -> conferir MFE_ARMED e lock desejado 1.00;
+  (3) conferir MFE_SL_REQUEST + MFE_SL_CONFIRMED por ticket e S/L real
+  no terminal; (4) recuar o preco; (5) fechamento proximo do lock.
+Resultado esperado: SL BUY abaixo do Bid, subindo apenas; saida
+  EXIT_BY_MFE_SL com realized_net ~ +1.00 (menos derrapagem).
+Resultado obtido: analise estatica favoravel (fluxo ARMED->CONVERT->
+  SUBMIT->CONFIRM integralmente preservado do original; curva nova
+  validada numericamente). Execucao nao realizada.
+Evidencia: linhas 6842-6849, 6913-7029, 7031-7045 do FIXED;
+  validacao numerica da curva (relatorio, secao F).
+Status: BLOCKED (runtime)
+
+ID: T02 | SELL simples
+Cenario: espelho do T01 para SELL (SL acima do Ask, descendo apenas).
+Pre-condicao/passos: como T01 com SELL.
+Resultado esperado: simetrico; MFE_SL_CONFIRMED; EXIT_BY_MFE_SL.
+Resultado obtido: analise estatica favoravel (tratamento SELL separado
+  em ConvertMFENetLockToPrice e IsMFEStopMoreProtective, intactos).
+Status: BLOCKED (runtime)
+
+ID: T03 | Degraus 2->1
+Cenario: MFE 2->lock 1; 4->2; 6->3; 8->4; 10->5.
+Resultado esperado: exatamente a tabela da secao 5.4 do prompt.
+Resultado obtido: PASS ESTATICO/MATEMATICO - formula implementada em
+  UpdateDesiredMFENetLock (modo STEPPED) reproduzida numericamente:
+  12 casos de borda (1.99/2.00/3.99/4.00/5.99/6.00/7.99/8.00/9.99/
+  10.00/11.99/12.00) todos corretos + varredura continua 0..20 USD
+  sem regressao do lock. Sem retencao percentual no modo padrao
+  (percentuais preservados apenas no modo opcional ADAPTIVE_HYBRID).
+Evidencia: saida da validacao numerica (sessao), linhas 5995-6006.
+Status: PASS (estatico) / BLOCKED (confirmacao em runtime)
+
+ID: T04 | MFE nao diminui
+Cenario: recuo de preco apos maximo.
+Resultado esperado: net_mfe mantem o maximo (monotonico).
+Resultado obtido: analise estatica - atualizacao exclusivamente por
+  "if(current_net > net_mfe + eps) net_mfe = current_net" (linha
+  6822-6824, inalterada); persistencia + reconstrucao com MathMax
+  (LoadMFEPositionState linha ~5610, intacta).
+Status: BLOCKED (runtime; invariante de codigo verificada)
+
+ID: T05 | SL monotonico
+Cenario: nenhuma reducao/zeragem de SL por nenhum modulo.
+Resultado obtido: analise estatica - todo SL passa por
+  IsMFEStopMoreProtective contra current_sl E final_sl (BE linha
+  6875, trailing 6905-6906, MFE 6987-6988, submit 5912); funcao
+  intacta; nenhuma rota escreve SL=0.
+Status: BLOCKED (runtime; invariante de codigo verificada)
+
+ID: T06 | Multiplas posicoes
+Cenario: varias BUY e SELL simultaneas com estados individuais.
+Resultado obtido: analise estatica - estado por POSITION_IDENTIFIER
+  (FindMFEPositionState), modificacao somente por ticket da posicao
+  reconciliada (trade_request.position = ticket, linha ~6510),
+  filtros de simbolo+magic+identifier antes de qualquer request
+  (linhas 6504-6512), tudo preservado do original.
+Status: BLOCKED (runtime)
+
+ID: T07 | Trailing legado nao antecipa apos MFE armado
+Cenario: posicao armada; candle forte moveria o trailing legado.
+Resultado esperado: nenhuma modificacao com source LEGACY_TRAILING
+  apos armar; sem fechamento antecipado pelo trailing.
+Resultado obtido: analise estatica - allow_legacy_trailing e falso
+  com EnableAdaptiveMoneyMFE=true fora do modo LEGACY_UNIFIED
+  (linhas 6861-6862); candidato legado nem e construido.
+Status: BLOCKED (runtime; gate verificado no codigo)
+
+ID: T08 | Break Even cobre custos
+Cenario: BE atinge gatilho antes do MFE armar.
+Resultado esperado: BE so aplica se lock liquido no SL candidato >=
+  0.15 USD (min + buffer); nunca fechamento liquido negativo por BE;
+  bloqueio logado como MFE_BE_COST_FLOOR_BLOCK.
+Resultado obtido: analise estatica - validacao com
+  CalculateMFEPositionNetProfit no candidato (linhas 6877-6893);
+  gate legado agora usa lucro liquido unico (correcao 4.4).
+Status: BLOCKED (runtime)
+
+ID: T09 | Stops level inviabiliza lock
+Cenario: forcar SYMBOL_TRADE_STOPS_LEVEL alto (simbolo de teste).
+Resultado esperado: estado ARMED_WAITING_SERVER_DISTANCE no painel,
+  ativacao viavel + motivo exibidos, log MFE_SERVER_DISTANCE_BLOCK
+  unico por transicao, backoff sem spam, aplicacao quando viavel.
+Resultado obtido: analise estatica - fail_reason DISTANCE mapeado
+  para wait_reason + painel (linhas 7011-7016, MFEProtectionStateText);
+  backoff impede recalculo cego (linhas 6943-6950).
+Status: BLOCKED (runtime)
+
+ID: T10 | Freeze level
+Cenario: equivalente ao T09 com freeze.
+Resultado obtido: analise estatica - MinTradeDistancePrice usa
+  max(stops, freeze)+2 (intacta); motivo FREEZE_LEVEL no painel via
+  MFEDistanceBlockReasonText.
+Status: BLOCKED (runtime)
+
+ID: T11 | Rejeicao do servidor
+Cenario: retcode invalido em PositionModify (ex.: INVALID_STOPS).
+Resultado esperado: MFE_MODIFY_REJECTED com retcode + descricao,
+  failure_count++, backoff de modificacao, nova tentativa condicionada,
+  painel exibe rc=<motivo>.
+Resultado obtido: analise estatica - caminho de rejeicao original
+  preservado (linhas ~6560-6595) + captura de last_modify_retcode
+  (linha 6556) exibida no painel.
+Status: BLOCKED (runtime)
+
+ID: T12 | Reinicializacao
+Cenario: posicao protegida; reiniciar EA / trocar timeframe /
+  recompilar.
+Resultado esperado: net_mfe e SL preservados; nenhum afrouxamento;
+  MFE_REBUILD logado; estados orfaos limpos.
+Resultado obtido: analise estatica - persistencia e reconstrucao
+  intactas (LoadMFEPositionState, RebuildMFEStateFromOpenPositions,
+  InitializeMFEPositionFromSelection com MathMax e piso no SL real);
+  persistencia quantizada nao remove nenhum ponto de persistencia de
+  transicao; timer de 60 s adiciona seguranca.
+Status: BLOCKED (runtime)
+
+ID: T13 | Soft DD
+Cenario: cesta atinge -360 USD (60% de 600) sem atingir -600.
+Resultado esperado: SOFT_DD_ENTER logado; pares neutros bloqueados;
+  tatica contra o fluxo bloqueada; somente reforco estrutural
+  unitario no lado dominante, respeitando cadencia/distancia/tetos/
+  daily; lote original; liberacao com histerese (acima de -306).
+Resultado obtido: analise estatica - gates em
+  BaseDirectionalEntryFiltersOK (direcao == fluxo estrutural
+  obrigatoria), CanOpenAdditionalPair (pares bloqueados),
+  IsPendingFiltersOK (pendentes bloqueadas); reforco passa por
+  CanOpenAdaptiveUnitEntry inalterado (todas as regras normais).
+  Sem qualquer logica de recuperacao/averaging adicionada.
+Status: BLOCKED (runtime)
+
+ID: T14 | Hard DD
+Cenario: cesta atinge -600 USD com Close_loss_by_drawdown=false.
+Resultado esperado: HARD_DD_ENTER; nenhuma entrada nova de qualquer
+  tipo; MFE/BE/SL continuam gerindo; painel HARD_DD_MANAGEMENT_ONLY;
+  liberacao somente acima de ~-510 (0.85) e nunca com daily ativo;
+  com Close_loss_by_drawdown=true, fechamento preservado.
+Resultado obtido: analise estatica - ManageBasketDrawdown novo
+  (linhas 4018-4105); ManageUnifiedProfitStopProtection roda antes
+  e sem nenhum gate de DD; ordem do OnTick garante gestao.
+Status: BLOCKED (runtime)
+
+ID: T15 | Daily block
+Cenario: perda diaria atinge -700; cesta depois recupera.
+Resultado esperado: nenhuma entrada liberada pela recuperacao da
+  cesta enquanto o daily estiver ativo; hard DD tampouco libera;
+  reset apenas na virada do dia do servidor.
+Resultado obtido: analise estatica - daily checado antes do DD em
+  BaseDirectionalEntryFiltersOK; liberacao do hard exige
+  !g_dailyLossBlocked (linha ~4064); persistencia diaria intacta.
+Status: BLOCKED (runtime)
+
+ID: T16 | Liberacao de slot estrutural
+Cenario: SELL estrutural fecha pelo MFE.
+Resultado esperado: [STRUCTURAL_SLOT_RELEASED] logado; contadores
+  simultaneos refletem o fechamento; nova SELL exige nova condicao
+  de cadencia (tempo minimo, distancia, candle); sem reposicao no
+  mesmo evento.
+Resultado obtido: analise estatica - contadores baseados em posicoes
+  vivas (CountPotential*); log adicionado em FinalizeMFEPositionState;
+  entradas ocorrem apenas no fluxo de OnTick apos reconciliacao e
+  cadencia (MinSecondsBetweenAdditionalPairs etc., intactos).
+Status: BLOCKED (runtime)
+
+ID: T17 | Episodio tatico
+Cenario: BUY tatica em microcorrecao dentro de fluxo SELL; fecha
+  pelo MFE; tentar segunda tatica no mesmo episodio.
+Resultado esperado: slot simultaneo liberado; segunda tatica NEGADA
+  (ALREADY_CONSUMED) ate o fim legitimo do episodio.
+Resultado obtido: analise estatica - g_tacticalEntryCount e
+  TACTICAL_MAX_PROGRESSIVE_ENTRIES=1 intactos; reset apenas em
+  EndTacticalEpisodeReason (funcao intacta byte a byte).
+Status: BLOCKED (runtime)
+
+ID: T18 | Performance
+Cenario: instrumentar HistorySelect/OrderCalcProfit/GlobalVariableSet/
+  PositionModify por tick e tempo do OnTick.
+Resultado esperado: sem loops historicos completos por posicao em
+  todos os ticks; conversoes limitadas por backoff; persistencia
+  quantizada.
+Resultado obtido: estimativa estatica no relatorio (secao
+  performance): ~80 HistorySelect completos/tick -> ~0 em regime;
+  cesta ~10 -> 1 recalculo/tick; conversao <=32 iteracoes com
+  early-exit e backoff. Medicao real nao executada.
+Status: BLOCKED (runtime)
+
+ID: T19 | Regressao bilateral
+Cenario: cesta zerada abre 1 BUY + 1 SELL; fluxo SELL reforca so
+  SELL; microcorrecao BUY permite no maximo 1 tatica; fim da
+  correcao retoma SELL; espelhado para BUY; maximo 8; tetos 6/2,
+  5/3, 4/4; sem martingale/grid/pares repetidos.
+Resultado obtido: analise estatica - todo o motor de entradas,
+  fluxo e episodios comparado funcao a funcao com o original:
+  ManageAsymmetricAdaptiveEntries, OpenBuySellPair (exceto
+  invalidacao de cache), CanOpenNewPair, limites e cadencia
+  INTACTOS; lote fixo e unico caminho de volume inalterado.
+Status: BLOCKED (runtime; equivalencia de codigo verificada)
+
+ID: T20 | Auditoria de comissao (bloco final, item 10)
+Cenario: exemplo simulado 0.05 lote BUY XAUUSD (declarado como
+  simulado; nenhum dado real disponivel neste ambiente).
+Passos/valores: bruto +4.00; swap -0.12; comissao entrada -0.18;
+  comissao estimada saida -0.18; liquido +3.52.
+Resultado esperado: cada componente contado exatamente 1 vez;
+  negativos somados como negativos; gate legado ve 3.52 (nao 3.70).
+Resultado obtido: PASS ESTATICO - CalculateMFEPositionNetProfit soma
+  cada termo uma unica vez (funcao intacta); a re-adicao
+  "- estimated_exit_commission" foi removida do gerenciador
+  (unified_net_profit = current_net_profit, linha 6857).
+Status: PASS (estatico) / BLOCKED (confirmacao em runtime)
+
+--------------------------------------------------------------------
+CRITERIOS DE FALHA IMEDIATA (bloco final, item 15) - checagem estatica:
+  SL MFE reduzido ......................... sem rota no codigo (T05)
+  SL apagado .............................. sem rota no codigo (T05)
+  posicao errada modificada ............... filtros por identifier/ticket (T06)
+  comissao contada 2x ..................... corrigido (T20)
+  MFE reiniciado incorretamente ........... persistencia/MathMax (T04/T12)
+  segunda tatica no mesmo episodio ........ regra intacta (T17)
+  posicao fechada ocupando slot ........... contadores vivos (T16)
+  hard DD permitindo entrada .............. gate universal (T14)
+  daily block ignorado .................... prioridade preservada (T15)
+  trailing legado encerrando pos-armado ... gate de autoridade (T07)
+  PositionModify sem verificar retcode .... caminho original preservado (T11)
+  estado protegido sem SL confirmado ...... ConfirmMFEServerStop intacta
+  resultado de teste inventado ............ nenhum (tudo BLOCKED honesto)
+  alteracao de lote / maximo 8 / estrutura  nenhuma (secao G do relatorio)
+====================================================================

@@ -1,0 +1,44 @@
+================================================================
+COMPILE LOG - PREDATOR_FLOW_AI_V2_MFE_TRAILING_INTEGRATION_FIXED.mq5
+================================================================
+data: 2026-07-19
+arquivo alvo: PREDATOR_FLOW_AI_V2_MFE_TRAILING_INTEGRATION_FIXED.mq5
+
+erros:      NAO VERIFICADO - COMPILACAO NAO EXECUTADA
+warnings:   NAO VERIFICADO - COMPILACAO NAO EXECUTADA
+compilador: INDISPONIVEL NESTE AMBIENTE
+
+STATUS: BLOCKED
+
+MOTIVO DO BLOQUEIO (declaracao honesta, sem resultados inventados):
+Este patch foi produzido em um container Linux x86_64 (kernel 6.18.5)
+sem MetaEditor, sem MetaTrader 5 e sem Wine. O compilador MQL5
+(metaeditor64.exe /compile) e exclusivo do ecossistema
+MetaTrader/Windows e nao pode ser executado aqui. Nenhuma
+declaracao de compilacao com zero erros e feita.
+
+VERIFICACAO ESTATICA EXECUTADA EM SUBSTITUICAO (nao substitui o
+compilador, apenas reduz risco de erro sintatico):
+  - chaves { }        : 596 abre / 596 fecha  -> balanceado
+  - parenteses ( )    : 3696 abre / 3696 fecha -> balanceado
+  - colchetes [ ]     : 502 abre / 502 fecha  -> balanceado
+  - aspas por linha   : nenhuma linha com numero impar
+  - definicoes de funcao: 205 unicas, 0 duplicadas, 0 removidas
+    (198 originais + 7 auxiliares novas)
+  - ConvertMFENetLockToPrice: 3 ocorrencias (protótipo, definicao,
+    unica chamada), todas com a nova assinatura de 6 parametros
+  - todos os identificadores novos declarados E utilizados
+  - handlers OnInit/OnDeinit/OnTick/OnTimer/OnTradeTransaction:
+    exatamente 1 definicao cada
+  - fim de linha CRLF preservado (padrao MetaEditor)
+  - md5 do arquivo original preservado e identico ao upload:
+    6839d6ac46a5ace480845c394dc4ba38
+
+PROCEDIMENTO PARA COMPILAR NO AMBIENTE DO USUARIO (Windows/MT5):
+  1. Copiar PREDATOR_FLOW_AI_V2_MFE_TRAILING_INTEGRATION_FIXED.mq5
+     para MQL5\Experts\ do terminal.
+  2. Abrir no MetaEditor e pressionar F7, ou via linha de comando:
+       metaeditor64.exe /compile:"MQL5\Experts\PREDATOR_FLOW_AI_V2_MFE_TRAILING_INTEGRATION_FIXED.mq5" /log
+  3. Conferir 0 erros no log. Em caso de erro, reportar a linha
+     exata para correcao pontual.
+================================================================

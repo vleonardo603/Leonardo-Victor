@@ -1,0 +1,1290 @@
+--- PREDATOR_FLOW_AI_V2_MFE_TRAILING_ORIGINAL.mq5	2026-07-19 13:12:37.117312159 +0000
++++ PREDATOR_FLOW_AI_V2_MFE_TRAILING_INTEGRATION_FIXED.mq5	2026-07-19 13:34:42.614202788 +0000
+@@ -2,6 +2,9 @@
+ #property version   "1.00"
+ #property description "IA FUNDED GOLD V1 - Expert Advisor autoral para MT5 hedge."
+ // TACTICAL_PRECISION_FINAL_FIX 2026-07-17: patch restrito ao motor tatico; sem lote, risco ou gestao.
++// MFE_TRAILING_INTEGRATION_FIX 2026-07-19: patch cirurgico da gestao MFE/BE/trailing, soft/hard DD,
++// comissao unica, backoff de conversao, persistencia quantizada e telemetria; sem alteracao de
++// entradas, lote, fluxo estrutural, tetos direcionais ou arquitetura bilateral.
+ 
+ #include <Trade/Trade.mqh>
+ 
+@@ -50,6 +53,36 @@
+    MFE_SL_SOURCE_ADAPTIVE_MFE = 3
+ };
+ 
++enum ENUM_MFE_LOCK_MODE
++{
++   MFE_LOCK_STEPPED_2_TO_1 = 0,  // Curva monetaria fixa: +2 de MFE => +1 de lock
++   MFE_LOCK_ADAPTIVE_HYBRID = 1  // Curva legada com retencao percentual por estagio
++};
++
++enum ENUM_PROFIT_STOP_AUTHORITY
++{
++   PROFIT_STOP_MFE_ONLY = 0,          // Somente o MFE governa o SL de lucro
++   PROFIT_STOP_MFE_WITH_BE_FLOOR = 1, // BE atua como piso antes do MFE armar
++   PROFIT_STOP_LEGACY_UNIFIED = 2     // Comportamento legado BE + trailing + MFE
++};
++
++enum ENUM_BASKET_DD_STATE
++{
++   BASKET_DD_NORMAL = 0,
++   BASKET_DD_SOFT = 1,
++   BASKET_DD_HARD = 2
++};
++
++#define MFE_WAIT_NONE 0
++#define MFE_WAIT_PRICE 1
++#define MFE_WAIT_SERVER_DISTANCE 2
++#define MFE_WAIT_BACKOFF 3
++
++#define MFE_CONVERT_FAIL_NONE 0
++#define MFE_CONVERT_FAIL_PRICE 1
++#define MFE_CONVERT_FAIL_DISTANCE 2
++#define MFE_CONVERT_FAIL_CALC 3
++
+ struct MFEPositionState
+ {
+    bool used;
+@@ -89,6 +122,20 @@
+    ulong last_exit_deal;
+    int last_exit_reason;
+    double last_exit_price;
++   int wait_reason;
++   uint last_modify_retcode;
++   double last_conversion_attempt_lock;
++   double last_conversion_price;
++   datetime conversion_backoff_until;
++   int last_persisted_mfe_quantum;
++   double last_persisted_lock;
++};
++
++struct CommissionCacheEntry
++{
++   long identifier;
++   double commission;
++   bool valid;
+ };
+ 
+ input group "=== GERAL ==="
+@@ -179,6 +226,11 @@
+ input double MFEEstimatedClosingCommissionPerLot = 3.50; // Fallback conservador por lote e lado
+ input bool MFEPersistState = true; // Persistir estado individual por identifier
+ input bool MFELogStateChanges = true; // Registrar somente transicoes relevantes
++input ENUM_MFE_LOCK_MODE MFELockMode = MFE_LOCK_STEPPED_2_TO_1; // Curva do lock monetario
++input ENUM_PROFIT_STOP_AUTHORITY ProfitStopAuthority = PROFIT_STOP_MFE_WITH_BE_FLOOR; // Autoridade unica de protecao
++input double MFEMinimumNetLockMoney = 0.05; // Lock liquido minimo aceito como protecao
++input double MFEExecutionBufferMoney = 0.10; // Buffer monetario para protecao parcial e BE
++input int MFEConversionBackoffSeconds = 3; // Backoff apos falha da conversao dinheiro-preco
+ 
+ input group "=== ORDENS PENDENTES DINAMICAS ==="
+ input bool UseDynamicPendingOrders = true; // Usar ordens pendentes dinamicas
+@@ -204,6 +256,8 @@
+ input double Maximum_allowed_loss = 600.0; // Perda maxima da cesta em USD
+ input bool Close_loss_by_drawdown = false; // Fechar cesta ao atingir DD maximo
+ input double Loss_for_closing = 600.0; // Loss para fechamento da cesta
++input double SoftBasketDDUSD = 0.0; // Soft DD da cesta em USD (0 = 60 pct do DD maximo)
++input double HardDDReleaseRatio = 0.85; // Histerese de liberacao do hard DD
+ 
+ input group "=== META DIARIA ==="
+ input double DailyProfitTargetUSD = 200.0; // Meta diaria em USD
+@@ -260,7 +314,11 @@
+ const int TACTICAL_ORDER_PENDING_TIMEOUT_SECONDS = 30;
+ #define MFE_MAX_TRACKED_POSITIONS 16
+ const int MFE_STATE_SCHEMA_VERSION = 1;
+-const int MFE_PRICE_SEARCH_ITERATIONS = 48;
++const int MFE_PRICE_SEARCH_ITERATIONS = 32;
++const int MFE_PERIODIC_PERSIST_SECONDS = 60;
++const double SOFT_BASKET_DD_AUTO_FRACTION = 0.60;
++const double SOFT_BASKET_DD_RELEASE_RATIO = 0.85;
++#define COMMISSION_CACHE_SIZE 32
+ const int MFE_MODIFY_TIMEOUT_SECONDS = 15;
+ const int MFE_MODIFY_BACKOFF_SECONDS = 5;
+ const int MFE_COMMISSION_LOOKBACK_DAYS = 90;
+@@ -342,6 +400,22 @@
+ bool g_mfeSkipSubmissionAfterRebuild = false;
+ double g_mfeObservedClosingCommissionPerLot = 0.0;
+ bool g_mfeObservedCommissionInitialized = false;
++ENUM_BASKET_DD_STATE g_basketDDState = BASKET_DD_NORMAL;
++ulong g_moneySnapshotCycle = 1;
++ulong g_basketProfitCacheCycle = 0;
++double g_basketProfitCache = 0.0;
++ulong g_buyBasketProfitCacheCycle = 0;
++double g_buyBasketProfitCache = 0.0;
++ulong g_sellBasketProfitCacheCycle = 0;
++double g_sellBasketProfitCache = 0.0;
++bool g_todayClosedProfitDirty = true;
++double g_todayClosedProfitCache = 0.0;
++datetime g_todayClosedProfitDay = 0;
++datetime g_lastMfePeriodicPersist = 0;
++uint g_lastPanelRefreshMs = 0;
++uint g_lastBasketLinesRefreshMs = 0;
++CommissionCacheEntry g_commissionCache[COMMISSION_CACHE_SIZE];
++int g_commissionCacheCursor = 0;
+ 
+ int OnInit();
+ void OnDeinit(const int reason);
+@@ -543,7 +617,7 @@
+ double QuantizeMFENetLock(double value);
+ double UpdateDesiredMFENetLock(int index);
+ double NormalizeMFEPriceToTick(double price, bool round_up);
+-bool ConvertMFENetLockToPrice(int index, double desired_net_lock, double &sl_price, double &effective_net_lock, bool &distance_clamped);
++bool ConvertMFENetLockToPrice(int index, double desired_net_lock, double &sl_price, double &effective_net_lock, bool &distance_clamped, int &fail_reason);
+ bool IsMFEStopMoreProtective(ENUM_POSITION_TYPE type, double candidate_sl, double reference_sl);
+ bool IsMFEStopMatchingRequest(ENUM_POSITION_TYPE type, double actual_sl, double requested_sl);
+ bool IsMFETradeModificationAllowed();
+@@ -556,6 +630,13 @@
+ void RebuildMFEStateFromOpenPositions();
+ void FinalizeMFEPositionState(int index, double realized_net_profit, string close_reason);
+ void HandleMFETradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result);
++void InvalidateMoneySnapshots();
++void InvalidateCommissionCache(long position_id);
++double GetSoftBasketDDThresholdUSD();
++string BasketDDStateText();
++string MFEProtectionStateText(int index);
++double EstimateMFEServerDistanceCostMoney(int index);
++string MFEDistanceBlockReasonText();
+ 
+ int OnInit()
+ {
+@@ -618,6 +699,7 @@
+ 
+    g_operationalBusy = true;
+ 
++   InvalidateMoneySnapshots();
+    RefreshDailyState();
+ 
+    if(!UpdateSymbolData(true))
+@@ -628,59 +710,59 @@
+       return;
+    }
+ 
++   ManageUnifiedProfitStopProtection();
++
+    ManageDailyRisk();
+    ManageDailyProfitTarget();
++   ManageBasketDrawdown();
++
+    AtualizarPicoLucroCesta();
+    ManageBasketClosing();
+    ManagePriceBasedBasketClosing();
+-   if(GerenciarProtecaoLucroCestaMFE())
+-   {
+-      DrawBasketLines();
+-      UpdatePanel();
+-      g_operationalBusy = false;
+-      return;
+-   }
+-   ManageUnifiedProfitStopProtection();
+-   ManageBasketDrawdown();
+-   if(!UseAsymmetricBilateralFlowEngine)
++   bool basket_close_in_progress = GerenciarProtecaoLucroCestaMFE();
++
++   if(!basket_close_in_progress)
+    {
+-      g_adaptivePendingSuspensionLogged = false;
+-      CancelInvalidPendingOrders();
+-      ManageDynamicPendingOrders();
++      if(!UseAsymmetricBilateralFlowEngine)
++      {
++         g_adaptivePendingSuspensionLogged = false;
++         CancelInvalidPendingOrders();
++         ManageDynamicPendingOrders();
+ 
+-      int open_positions = CountOpenPositions();
++         int open_positions = CountOpenPositions();
+ 
+-      if(open_positions == 0)
+-      {
+-         if(CanOpenNewPair())
+-            OpenBuySellPair(false);
++         if(open_positions == 0)
++         {
++            if(CanOpenNewPair())
++               OpenBuySellPair(false);
++         }
++         else
++         {
++            if(CanOpenAdditionalPair())
++               OpenBuySellPair(true);
++         }
+       }
+       else
+       {
+-         if(CanOpenAdditionalPair())
+-            OpenBuySellPair(true);
+-      }
+-   }
+-   else
+-   {
+-      bool adaptive_pendings_cleared = CancelLegacyPendingOrdersForAdaptiveMode();
+-      int adaptive_open_positions = CountOpenPositions();
+-      PrepareAdaptiveFlowForBasket(adaptive_open_positions);
++         bool adaptive_pendings_cleared = CancelLegacyPendingOrdersForAdaptiveMode();
++         int adaptive_open_positions = CountOpenPositions();
++         PrepareAdaptiveFlowForBasket(adaptive_open_positions);
+ 
+-      if(adaptive_open_positions > 0)
+-      {
+-         UpdateTacticalFlowOnClosedBar();
+-         UpdateStructuralFlowOnClosedBar();
+-         CheckTacticalOrderPendingTimeout();
+-         LogTacticalFlowTrace("AFTER_UPDATE");
+-      }
++         if(adaptive_open_positions > 0)
++         {
++            UpdateTacticalFlowOnClosedBar();
++            UpdateStructuralFlowOnClosedBar();
++            CheckTacticalOrderPendingTimeout();
++            LogTacticalFlowTrace("AFTER_UPDATE");
++         }
+ 
+-      g_adaptiveEntryAttemptedThisTick = false;
+-      LogTacticalFlowTrace("BEFORE_MANAGE");
+-      if(adaptive_pendings_cleared)
+-         ManageAsymmetricAdaptiveEntries();
+-      else
+-         SetAdaptiveBlockReason("TETO TOTAL", "pendentes legadas ainda ativas");
++         g_adaptiveEntryAttemptedThisTick = false;
++         LogTacticalFlowTrace("BEFORE_MANAGE");
++         if(adaptive_pendings_cleared)
++            ManageAsymmetricAdaptiveEntries();
++         else
++            SetAdaptiveBlockReason("TETO TOTAL", "pendentes legadas ainda ativas");
++      }
+    }
+ 
+    DrawBasketLines();
+@@ -697,6 +779,20 @@
+    RefreshDailyState();
+    UpdateMarketDiagnostics();
+    CheckTacticalOrderPendingTimeout();
++
++   datetime persist_now = TimeCurrent();
++   if(persist_now > 0 &&
++      (g_lastMfePeriodicPersist <= 0 ||
++       persist_now - g_lastMfePeriodicPersist >= MFE_PERIODIC_PERSIST_SECONDS))
++   {
++      g_lastMfePeriodicPersist = persist_now;
++      for(int i = 0; i < MFE_MAX_TRACKED_POSITIONS; i++)
++      {
++         if(g_mfePositions[i].used)
++            PersistMFEPositionState(i, false);
++      }
++   }
++
+    if(UsePanel)
+       UpdatePanel();
+    g_timerBusy = false;
+@@ -704,6 +800,14 @@
+ 
+ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result)
+ {
++   if(trans.type == TRADE_TRANSACTION_DEAL_ADD && trans.deal > 0)
++   {
++      InvalidateMoneySnapshots();
++      g_todayClosedProfitDirty = true;
++      if(HistoryDealSelect(trans.deal))
++         InvalidateCommissionCache((long)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID));
++   }
++
+    HandleMFETradeTransaction(trans, request, result);
+ 
+    if(g_tacticalState != TACTICAL_STATE_ORDER_PENDING)
+@@ -2509,12 +2613,28 @@
+       return false;
+    }
+ 
+-   if(g_basketDDBlocked)
++   if(g_basketDDState == BASKET_DD_HARD || g_basketDDBlocked)
+    {
+-      SetAdaptiveBlockReason("DD");
++      SetAdaptiveBlockReason("HARD_DD_MANAGEMENT_ONLY");
+       return false;
+    }
+ 
++   if(g_basketDDState == BASKET_DD_SOFT)
++   {
++      int soft_flow_direction = StructuralFlowDirection();
++      int soft_entry_direction = (order_type == ORDER_TYPE_BUY ? 1 : -1);
++      if(soft_flow_direction == 0)
++      {
++         SetAdaptiveBlockReason("SOFT_DD", "sem lado estrutural dominante");
++         return false;
++      }
++      if(soft_entry_direction != soft_flow_direction)
++      {
++         SetAdaptiveBlockReason("SOFT_DD", "entrada fora do lado estrutural dominante");
++         return false;
++      }
++   }
++
+    return true;
+ }
+ 
+@@ -2668,6 +2788,7 @@
+    g_lastPairOpenTime = TimeCurrent();
+    g_lastPairCandleTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+    g_lastPairMidPrice = MidPrice();
++   InvalidateMoneySnapshots();
+    return true;
+ }
+ 
+@@ -2906,6 +3027,13 @@
+    if(!BaseEntryFiltersOK())
+       return false;
+ 
++   if(g_basketDDState != BASKET_DD_NORMAL)
++   {
++      SetStatus(g_basketDDState == BASKET_DD_HARD ? "HARD_DD_MANAGEMENT_ONLY" : "DD SOFT",
++                "novo par bloqueado por drawdown da cesta");
++      return false;
++   }
++
+    if(CountOpenPositions() >= LimitOpenPositions())
+    {
+       SetStatus("MAXIMO DE 8 OPERACOES", "bloqueio por MaxOpenPositions");
+@@ -3045,6 +3173,7 @@
+    g_lastPairOpenTime = TimeCurrent();
+    g_lastPairCandleTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+    g_lastPairMidPrice = MidPrice();
++   InvalidateMoneySnapshots();
+ 
+    if(additional_pair)
+       LogMessage("abertura de par adicional BUY/SELL.");
+@@ -3426,6 +3555,9 @@
+ 
+ double GetBasketProfit()
+ {
++   if(g_basketProfitCacheCycle == g_moneySnapshotCycle)
++      return g_basketProfitCache;
++
+    double profit = 0.0;
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+@@ -3434,11 +3566,17 @@
+ 
+       profit += GetSelectedPositionProfitWithCosts();
+    }
++
++   g_basketProfitCache = profit;
++   g_basketProfitCacheCycle = g_moneySnapshotCycle;
+    return profit;
+ }
+ 
+ double GetBuyBasketProfit()
+ {
++   if(g_buyBasketProfitCacheCycle == g_moneySnapshotCycle)
++      return g_buyBasketProfitCache;
++
+    double profit = 0.0;
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+@@ -3448,11 +3586,17 @@
+       if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+          profit += GetSelectedPositionProfitWithCosts();
+    }
++
++   g_buyBasketProfitCache = profit;
++   g_buyBasketProfitCacheCycle = g_moneySnapshotCycle;
+    return profit;
+ }
+ 
+ double GetSellBasketProfit()
+ {
++   if(g_sellBasketProfitCacheCycle == g_moneySnapshotCycle)
++      return g_sellBasketProfitCache;
++
+    double profit = 0.0;
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+@@ -3462,6 +3606,9 @@
+       if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+          profit += GetSelectedPositionProfitWithCosts();
+    }
++
++   g_sellBasketProfitCache = profit;
++   g_sellBasketProfitCacheCycle = g_moneySnapshotCycle;
+    return profit;
+ }
+ 
+@@ -3595,8 +3742,10 @@
+       CancelAllPendingOrders();
+       g_lastBasketCloseTime = TimeCurrent();
+       g_basketDDBlocked = false;
++      g_basketDDState = BASKET_DD_NORMAL;
+    }
+ 
++   InvalidateMoneySnapshots();
+    return all_ok;
+ }
+ 
+@@ -3629,8 +3778,10 @@
+       CancelAllPendingOrders();
+       g_lastBasketCloseTime = TimeCurrent();
+       g_basketDDBlocked = false;
++      g_basketDDState = BASKET_DD_NORMAL;
+    }
+ 
++   InvalidateMoneySnapshots();
+    return all_ok;
+ }
+ 
+@@ -3663,8 +3814,10 @@
+       CancelAllPendingOrders();
+       g_lastBasketCloseTime = TimeCurrent();
+       g_basketDDBlocked = false;
++      g_basketDDState = BASKET_DD_NORMAL;
+    }
+ 
++   InvalidateMoneySnapshots();
+    return all_ok;
+ }
+ 
+@@ -3866,6 +4019,11 @@
+ {
+    if(CountOpenPositions() <= 0)
+    {
++      if(g_basketDDState == BASKET_DD_HARD)
++         LogMessage("[HARD_DD_RELEASE] motivo=CESTA_ZERADA");
++      else if(g_basketDDState == BASKET_DD_SOFT)
++         LogMessage("[SOFT_DD_RELEASE] motivo=CESTA_ZERADA");
++      g_basketDDState = BASKET_DD_NORMAL;
+       g_basketDDBlocked = false;
+       return;
+    }
+@@ -3876,10 +4034,58 @@
+    if(close_loss <= 0.0)
+       close_loss = block_loss;
+ 
++   double soft_loss = GetSoftBasketDDThresholdUSD();
++   double hard_release_ratio = MathMax(0.0, MathMin(1.0, HardDDReleaseRatio));
++
+    if(block_loss > 0.0 && profit <= -block_loss)
+    {
++      if(g_basketDDState != BASKET_DD_HARD)
++      {
++         g_basketDDState = BASKET_DD_HARD;
++         LogMessage("[HARD_DD_ENTER] basket=" + DoubleToString(profit, 2) +
++                    " limite=" + DoubleToString(-block_loss, 2) +
++                    " modo=HARD_DD_MANAGEMENT_ONLY fechar_cesta=" + BoolToSimNao(Close_loss_by_drawdown));
++      }
+       g_basketDDBlocked = true;
+-      SetStatus("DD BLOQUEADO", "bloqueio por DD");
++      SetStatus("HARD_DD_MANAGEMENT_ONLY");
++   }
++   else if(g_basketDDState == BASKET_DD_HARD)
++   {
++      bool hard_recovered = (block_loss > 0.0 && profit >= -block_loss * hard_release_ratio);
++      if(hard_recovered && !g_dailyLossBlocked)
++      {
++         g_basketDDState = BASKET_DD_NORMAL;
++         g_basketDDBlocked = false;
++         LogMessage("[HARD_DD_RELEASE] basket=" + DoubleToString(profit, 2) +
++                    " gatilho=" + DoubleToString(-block_loss * hard_release_ratio, 2) +
++                    " histerese=" + DoubleToString(hard_release_ratio, 2));
++      }
++      else
++      {
++         g_basketDDBlocked = true;
++         SetStatus("HARD_DD_MANAGEMENT_ONLY");
++      }
++   }
++
++   if(g_basketDDState != BASKET_DD_HARD)
++   {
++      if(soft_loss > 0.0 && profit <= -soft_loss)
++      {
++         if(g_basketDDState != BASKET_DD_SOFT)
++         {
++            g_basketDDState = BASKET_DD_SOFT;
++            LogMessage("[SOFT_DD_ENTER] basket=" + DoubleToString(profit, 2) +
++                       " limite=" + DoubleToString(-soft_loss, 2) +
++                       " regra=REFORCO_ESTRUTURAL_UNITARIO_APENAS");
++         }
++      }
++      else if(g_basketDDState == BASKET_DD_SOFT &&
++              (soft_loss <= 0.0 || profit >= -soft_loss * SOFT_BASKET_DD_RELEASE_RATIO))
++      {
++         g_basketDDState = BASKET_DD_NORMAL;
++         LogMessage("[SOFT_DD_RELEASE] basket=" + DoubleToString(profit, 2) +
++                    " gatilho=" + DoubleToString(-soft_loss * SOFT_BASKET_DD_RELEASE_RATIO, 2));
++      }
+    }
+ 
+    if(Close_loss_by_drawdown && close_loss > 0.0 && profit <= -close_loss)
+@@ -4050,6 +4256,11 @@
+ 
+ void DrawBasketLines()
+ {
++   uint lines_now_ms = GetTickCount();
++   if(g_lastBasketLinesRefreshMs != 0 && lines_now_ms - g_lastBasketLinesRefreshMs < 900)
++      return;
++   g_lastBasketLinesRefreshMs = lines_now_ms;
++
+    if(!DrawBasketPriceLines || CountOpenPositions() <= 0)
+    {
+       DeleteBasketLines();
+@@ -4093,6 +4304,11 @@
+       return;
+    }
+ 
++   uint panel_now_ms = GetTickCount();
++   if(g_lastPanelRefreshMs != 0 && panel_now_ms - g_lastPanelRefreshMs < 900)
++      return;
++   g_lastPanelRefreshMs = panel_now_ms;
++
+    int pa = DetectPriceActionBias();
+    int flow = DetectNativeVolumeFlow();
+    double basket_profit = GetBasketProfit();
+@@ -4117,6 +4333,103 @@
+    int current_sell_limit = (UseAsymmetricBilateralFlowEngine ? GetDynamicSellLimit() : LimitSellPositions());
+    string adaptive_reason = (g_adaptiveBlockReason == "" ? "SEM BLOQUEIO" : g_adaptiveBlockReason);
+ 
++   int mfe_tracked = 0;
++   int mfe_armed_count = 0;
++   int mfe_full_count = 0;
++   int mfe_partial_count = 0;
++   int mfe_waiting_distance_count = 0;
++   int mfe_failure_count = 0;
++   string mfe_positions_block = "";
++   double mfe_activation = MathMax(MFEActivationNetMoney, 0.01);
++   for(int mfe_index = 0; mfe_index < MFE_MAX_TRACKED_POSITIONS; mfe_index++)
++   {
++      if(!g_mfePositions[mfe_index].used)
++         continue;
++
++      mfe_tracked++;
++      mfe_failure_count += g_mfePositions[mfe_index].failure_count;
++      if(g_mfePositions[mfe_index].net_mfe >= mfe_activation)
++         mfe_armed_count++;
++
++      string mfe_state_text = MFEProtectionStateText(mfe_index);
++      if(mfe_state_text == "PROTECTED_FULL")
++         mfe_full_count++;
++      else if(mfe_state_text == "PROTECTED_PARTIAL")
++         mfe_partial_count++;
++      else if(mfe_state_text == "ARMED_WAITING_SERVER_DISTANCE")
++         mfe_waiting_distance_count++;
++
++      string mfe_retcode_text = (g_mfePositions[mfe_index].last_modify_retcode == 0 ? "N/D" :
++                                 MFERetcodeReason(g_mfePositions[mfe_index].last_modify_retcode));
++      mfe_positions_block += "#" + IntegerToString((long)g_mfePositions[mfe_index].ticket) +
++                             (g_mfePositions[mfe_index].type == POSITION_TYPE_BUY ? " BUY" : " SELL") +
++                             " liq=" + DoubleToString(g_mfePositions[mfe_index].current_net_profit, 2) +
++                             " mfe=" + DoubleToString(g_mfePositions[mfe_index].net_mfe, 2) +
++                             " lock=" + DoubleToString(g_mfePositions[mfe_index].desired_net_lock, 2) +
++                             "/" + DoubleToString(g_mfePositions[mfe_index].effective_net_lock, 2) +
++                             " sl=" + DoubleToString(g_mfePositions[mfe_index].last_confirmed_sl, _Digits) +
++                             " " + mfe_state_text +
++                             " src=" + MFESLSourceToText(g_mfePositions[mfe_index].last_confirmed_source) +
++                             " rc=" + mfe_retcode_text + "\n";
++
++      if(mfe_state_text == "ARMED_WAITING_SERVER_DISTANCE" || mfe_state_text == "ARMED_WAITING_PRICE")
++      {
++         double server_distance_cost = EstimateMFEServerDistanceCostMoney(mfe_index);
++         if(server_distance_cost >= 0.0)
++         {
++            double viable_activation = MathMax(mfe_activation,
++                                               MathMax(0.0, MFEInitialProtectedNetMoney) +
++                                               server_distance_cost +
++                                               MathMax(0.0, MFEExecutionBufferMoney));
++            mfe_positions_block += "   ativ cfg=" + DoubleToString(mfe_activation, 2) +
++                                   " viavel=" + DoubleToString(viable_activation, 2) +
++                                   " motivo=" + MFEDistanceBlockReasonText() + "\n";
++         }
++      }
++   }
++
++   string mfe_lock_mode_text = (MFELockMode == MFE_LOCK_STEPPED_2_TO_1 ? "STEPPED 2->1" : "ADAPTATIVO HIBRIDO");
++   string mfe_authority_text = (ProfitStopAuthority == PROFIT_STOP_MFE_ONLY ? "MFE ONLY" :
++                                ProfitStopAuthority == PROFIT_STOP_MFE_WITH_BE_FLOOR ? "MFE + BE FLOOR" :
++                                "LEGADO UNIFICADO");
++   string mfe_panel_block =
++      "=== MFE MONETARIO ===\n" +
++      "Modo: " + mfe_lock_mode_text + " | Autoridade: " + mfe_authority_text + "\n" +
++      "Monitoradas: " + IntegerToString(mfe_tracked) +
++      " | Armadas: " + IntegerToString(mfe_armed_count) +
++      " | Integral: " + IntegerToString(mfe_full_count) +
++      " | Parcial: " + IntegerToString(mfe_partial_count) + "\n" +
++      "Aguardando distancia: " + IntegerToString(mfe_waiting_distance_count) +
++      " | Falhas: " + IntegerToString(mfe_failure_count) + "\n" +
++      mfe_positions_block;
++
++   int exposure_buy = CountPotentialBuyExposure();
++   int exposure_sell = CountPotentialSellExposure();
++   int free_buy_slots = MathMax(0, current_buy_limit - exposure_buy);
++   int free_sell_slots = MathMax(0, current_sell_limit - exposure_sell);
++   string structural_entry_text = "SIM";
++   if(g_basketDDState == BASKET_DD_HARD)
++      structural_entry_text = "NAO (HARD_DD_MANAGEMENT_ONLY)";
++   else if(g_dailyLossBlocked)
++      structural_entry_text = "NAO (DAILY_BLOCK)";
++   else if(g_dailyProfitBlocked)
++      structural_entry_text = "NAO (META_DIARIA)";
++   else if(g_basketDDState == BASKET_DD_SOFT)
++      structural_entry_text = "PARCIAL (SOFT_DD: somente lado estrutural dominante)";
++   else if(adaptive_reason != "SEM BLOQUEIO")
++      structural_entry_text = "NAO (" + adaptive_reason + ")";
++
++   string risk_panel_block =
++      "=== AUTORIDADE DE RISCO ===\n" +
++      "Basket DD: " + BasketDDStateText() +
++      " | Soft: " + DoubleToString(GetSoftBasketDDThresholdUSD(), 2) +
++      " | Hard: " + DoubleToString(MathAbs(Maximum_allowed_loss), 2) + "\n" +
++      "Daily Block: " + (g_dailyLossBlocked ? "ATIVO" : "INATIVO") +
++      " | Meta diaria: " + (g_dailyProfitBlocked ? "ATIVA" : "INATIVA") + "\n" +
++      "Exposicao atual: BUY " + IntegerToString(exposure_buy) + " / SELL " + IntegerToString(exposure_sell) + "\n" +
++      "Slots livres (tetos simultaneos): BUY " + IntegerToString(free_buy_slots) + " / SELL " + IntegerToString(free_sell_slots) + "\n" +
++      "Entrada estrutural autorizada: " + structural_entry_text + "\n";
++
+    string panel =
+       EA_NAME + "\n" +
+       "Simbolo: " + _Symbol + "\n" +
+@@ -4136,7 +4449,7 @@
+       "Microfluxo: " + TacticalFlowToText() + "\n" +
+       "Episodio tatico: " + tactical_episode + "\n" +
+       "Entradas taticas confirmadas: " + tactical_execution + "\n" +
+-      "Limites BUY/SELL: " + IntegerToString(current_buy_limit) + " / " + IntegerToString(current_sell_limit) + "\n" +
++      "TETOS ATUAIS BUY/SELL (simultaneos): " + IntegerToString(current_buy_limit) + " / " + IntegerToString(current_sell_limit) + "\n" +
+       "Pares abertos: " + IntegerToString(CountPairs()) + "\n" +
+       "BUYs abertas: " + IntegerToString(CountBuyPositions()) + "\n" +
+       "SELLs abertas: " + IntegerToString(CountSellPositions()) + "\n" +
+@@ -4163,6 +4476,8 @@
+       "Preco alvo de fechamento: " + DoubleToString(GetDynamicBasketClosePrice(), _Digits) + "\n" +
+       "Distancia ate proximo par: " + DoubleToString(remaining_distance, 1) + " pontos\n" +
+       "Tempo desde ultimo par: " + IntegerToString(seconds_since_pair) + "s\n" +
++      mfe_panel_block +
++      risk_panel_block +
+       "Ultima acao: " + g_adaptiveLastAction + "\n" +
+       "Motivo do bloqueio adaptativo: " + adaptive_reason + "\n" +
+       "Motivo operacional atual: " + status + "\n" +
+@@ -4363,6 +4678,10 @@
+    g_dailyLossBlocked = true;
+    PersistDailyLossBlock();
+ 
++   if(!was_blocked)
++      LogMessage("[DAILY_BLOCK_ENTER] limite=" + DoubleToString(MathAbs(MaxDailyLossUSD), 2) +
++                 " resultado=" + DoubleToString(g_dailyResult, 2));
++
+    if(!was_blocked && log_reason != "")
+       SetStatus("LOSS DIARIO", log_reason);
+    else
+@@ -4455,9 +4774,10 @@
+          g_dailyLossBlocked = false;
+          g_dailyProfitBlocked = false;
+          g_dailyResult = 0.0;
++         g_todayClosedProfitDirty = true;
+          ClearDailyLossBlock();
+          if(was_loss_blocked)
+-            LogMessage("bloqueio diario removido por mudanca de dia do servidor.");
++            LogMessage("[DAILY_BLOCK_RELEASE] motivo=NOVO_DIA_SERVIDOR");
+          LogMessage("novo dia operacional iniciado.");
+       }
+ 
+@@ -4484,6 +4804,9 @@
+    if(g_currentDayStart <= 0)
+       return result;
+ 
++   if(!g_todayClosedProfitDirty && g_todayClosedProfitDay == g_currentDayStart)
++      return g_todayClosedProfitCache;
++
+    datetime to = GetOperationalServerTime();
+    if(to <= 0)
+       return result;
+@@ -4508,6 +4831,9 @@
+       result += HistoryDealGetDouble(deal, DEAL_COMMISSION);
+    }
+ 
++   g_todayClosedProfitCache = result;
++   g_todayClosedProfitDay = g_currentDayStart;
++   g_todayClosedProfitDirty = false;
+    return result;
+ }
+ 
+@@ -4525,6 +4851,13 @@
+    if(position_id <= 0)
+       return 0.0;
+ 
++   for(int cache_index = 0; cache_index < COMMISSION_CACHE_SIZE; cache_index++)
++   {
++      if(g_commissionCache[cache_index].valid &&
++         g_commissionCache[cache_index].identifier == position_id)
++         return g_commissionCache[cache_index].commission;
++   }
++
+    double commission = 0.0;
+    datetime from = 0;
+    datetime to = TimeCurrent();
+@@ -4549,6 +4882,11 @@
+       commission += HistoryDealGetDouble(deal, DEAL_COMMISSION);
+    }
+ 
++   g_commissionCache[g_commissionCacheCursor].identifier = position_id;
++   g_commissionCache[g_commissionCacheCursor].commission = commission;
++   g_commissionCache[g_commissionCacheCursor].valid = true;
++   g_commissionCacheCursor = (g_commissionCacheCursor + 1) % COMMISSION_CACHE_SIZE;
++
+    return commission;
+ }
+ 
+@@ -4887,9 +5225,10 @@
+       return false;
+    }
+ 
+-   if(g_basketDDBlocked)
++   if(g_basketDDBlocked || g_basketDDState != BASKET_DD_NORMAL)
+    {
+-      SetStatus("DD BLOQUEADO", "bloqueio por DD");
++      SetStatus(g_basketDDState == BASKET_DD_SOFT ? "DD SOFT" : "HARD_DD_MANAGEMENT_ONLY",
++                "bloqueio de pendentes por drawdown da cesta");
+       return false;
+    }
+ 
+@@ -4915,6 +5254,126 @@
+    return (sl_price > g_tick.ask + min_distance);
+ }
+ 
++void InvalidateMoneySnapshots()
++{
++   g_moneySnapshotCycle++;
++   if(g_moneySnapshotCycle == 0)
++      g_moneySnapshotCycle = 1;
++}
++
++void InvalidateCommissionCache(long position_id)
++{
++   for(int cache_index = 0; cache_index < COMMISSION_CACHE_SIZE; cache_index++)
++   {
++      if(!g_commissionCache[cache_index].valid)
++         continue;
++      if(position_id <= 0 || g_commissionCache[cache_index].identifier == position_id)
++         g_commissionCache[cache_index].valid = false;
++   }
++}
++
++double GetSoftBasketDDThresholdUSD()
++{
++   if(SoftBasketDDUSD > 0.0)
++      return MathAbs(SoftBasketDDUSD);
++
++   double hard_loss = MathAbs(Maximum_allowed_loss);
++   if(hard_loss <= 0.0)
++      return 0.0;
++
++   return hard_loss * SOFT_BASKET_DD_AUTO_FRACTION;
++}
++
++string BasketDDStateText()
++{
++   if(g_basketDDState == BASKET_DD_HARD)
++      return "HARD";
++   if(g_basketDDState == BASKET_DD_SOFT)
++      return "SOFT";
++   return "NORMAL";
++}
++
++string MFEProtectionStateText(int index)
++{
++   if(index < 0 || index >= MFE_MAX_TRACKED_POSITIONS || !g_mfePositions[index].used)
++      return "UNTRACKED";
++
++   double activation = MathMax(MFEActivationNetMoney, 0.01);
++   double tolerance = MathMax(MFEMoneyConversionTolerance, 0.01);
++   datetime state_now = TimeCurrent();
++
++   if(g_mfePositions[index].state == MFE_CLOSED)
++      return "CLOSED";
++   if(g_mfePositions[index].pending || g_mfePositions[index].state == MFE_MODIFY_PENDING)
++      return "MODIFY_PENDING";
++
++   if(g_mfePositions[index].state == MFE_PROTECTED && g_mfePositions[index].last_confirmed_sl > 0.0)
++   {
++      if(!EnableAdaptiveMoneyMFE ||
++         g_mfePositions[index].desired_net_lock <= 0.0 ||
++         g_mfePositions[index].effective_net_lock + tolerance >= g_mfePositions[index].desired_net_lock)
++         return "PROTECTED_FULL";
++      return "PROTECTED_PARTIAL";
++   }
++
++   if(!EnableAdaptiveMoneyMFE || g_mfePositions[index].net_mfe < activation)
++      return "DISARMED";
++
++   if(g_mfePositions[index].last_modify_retcode != 0 &&
++      g_mfePositions[index].last_modify_retcode != TRADE_RETCODE_DONE &&
++      g_mfePositions[index].backoff_until > 0 && state_now < g_mfePositions[index].backoff_until)
++      return "MODIFY_REJECTED";
++
++   if(g_mfePositions[index].wait_reason == MFE_WAIT_SERVER_DISTANCE)
++      return "ARMED_WAITING_SERVER_DISTANCE";
++   if(g_mfePositions[index].wait_reason == MFE_WAIT_BACKOFF &&
++      g_mfePositions[index].conversion_backoff_until > 0 &&
++      state_now < g_mfePositions[index].conversion_backoff_until)
++      return "CONVERSION_BACKOFF";
++
++   return "ARMED_WAITING_PRICE";
++}
++
++double EstimateMFEServerDistanceCostMoney(int index)
++{
++   if(index < 0 || index >= MFE_MAX_TRACKED_POSITIONS || !g_mfePositions[index].used)
++      return -1.0;
++
++   double market_price = (g_mfePositions[index].type == POSITION_TYPE_BUY ? g_tick.bid : g_tick.ask);
++   if(market_price <= 0.0)
++      return -1.0;
++
++   double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
++   if(tick_size <= 0.0)
++      tick_size = _Point;
++
++   double minimum_distance = MinTradeDistancePrice();
++   double closest_sl = (g_mfePositions[index].type == POSITION_TYPE_BUY ?
++                        NormalizeMFEPriceToTick(market_price - minimum_distance - tick_size, false) :
++                        NormalizeMFEPriceToTick(market_price + minimum_distance + tick_size, true));
++   if(closest_sl <= 0.0)
++      return -1.0;
++
++   double market_net = 0.0;
++   double closest_net = 0.0;
++   if(!CalculateMFEPositionNetProfit(index, true, market_price, market_net) ||
++      !CalculateMFEPositionNetProfit(index, true, closest_sl, closest_net))
++      return -1.0;
++
++   return MathMax(0.0, market_net - closest_net);
++}
++
++string MFEDistanceBlockReasonText()
++{
++   int stops_level = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
++   int freeze_level = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
++   if(stops_level >= freeze_level && stops_level > 0)
++      return "STOPS_LEVEL";
++   if(freeze_level > 0)
++      return "FREEZE_LEVEL";
++   return "SPREAD_TICK";
++}
++
+ string MFEStateToText(ENUM_MFE_POSITION_STATE state)
+ {
+    switch(state)
+@@ -5090,6 +5549,12 @@
+    GlobalVariableSet(MFEGlobalName(identifier, "SG"), (double)g_mfePositions[index].stage);
+    GlobalVariableSet(MFEGlobalName(identifier, "LS"), (double)g_mfePositions[index].last_step);
+    GlobalVariableSet(MFEGlobalName(identifier, "HQ"), (double)g_mfePositions[index].last_logged_high_quantum);
++
++   double persist_quantum = MathMax(MFEProtectionQuantumNetMoney, 0.01);
++   g_mfePositions[index].last_persisted_mfe_quantum =
++      (int)MathFloor(MathMax(0.0, g_mfePositions[index].net_mfe) / persist_quantum);
++   g_mfePositions[index].last_persisted_lock = g_mfePositions[index].desired_net_lock;
++
+    if(!full_state)
+       return;
+ 
+@@ -5323,7 +5788,10 @@
+    }
+ 
+    if(identity_changed)
++   {
++      g_mfePositions[index].conversion_backoff_until = 0;
+       PersistMFEPositionState(index, true);
++   }
+    return true;
+ }
+ 
+@@ -5527,11 +5995,17 @@
+                       (double)completed_steps * MathMax(0.0, MFEProtectStepNetMoney);
+    double retention_ratio = 0.0;
+    int stage = GetMFERetentionStage(g_mfePositions[index].net_mfe, retention_ratio);
+-   double ratio_lock = g_mfePositions[index].net_mfe * retention_ratio;
+-   double candidate_lock = MathMax(base_lock, ratio_lock);
+-   double maximum_lock = g_mfePositions[index].net_mfe - MathMax(0.0, MFEMinimumGivebackNetMoney);
+-   candidate_lock = MathMin(candidate_lock, maximum_lock);
+-   candidate_lock = QuantizeMFENetLock(MathMax(0.0, candidate_lock));
++   double candidate_lock = 0.0;
++   if(MFELockMode == MFE_LOCK_STEPPED_2_TO_1)
++      candidate_lock = QuantizeMFENetLock(MathMax(0.0, base_lock));
++   else
++   {
++      double ratio_lock = g_mfePositions[index].net_mfe * retention_ratio;
++      candidate_lock = MathMax(base_lock, ratio_lock);
++      double maximum_lock = g_mfePositions[index].net_mfe - MathMax(0.0, MFEMinimumGivebackNetMoney);
++      candidate_lock = MathMin(candidate_lock, maximum_lock);
++      candidate_lock = QuantizeMFENetLock(MathMax(0.0, candidate_lock));
++   }
+ 
+    bool stage_changed = false;
+    int previous_stage = g_mfePositions[index].stage;
+@@ -5574,11 +6048,13 @@
+                               double desired_net_lock,
+                               double &sl_price,
+                               double &effective_net_lock,
+-                              bool &distance_clamped)
++                              bool &distance_clamped,
++                              int &fail_reason)
+ {
+    sl_price = 0.0;
+    effective_net_lock = 0.0;
+    distance_clamped = false;
++   fail_reason = MFE_CONVERT_FAIL_CALC;
+    if(index < 0 || index >= MFE_MAX_TRACKED_POSITIONS || !g_mfePositions[index].used)
+       return false;
+    if(desired_net_lock <= 0.0 || !ReconcileMFEPositionIdentity(index))
+@@ -5588,13 +6064,20 @@
+    if(market_price <= 0.0 || g_mfePositions[index].open_price <= 0.0)
+       return false;
+ 
++   double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
++   if(tick_size <= 0.0)
++      tick_size = _Point;
++
+    double open_net = 0.0;
+    double market_net = 0.0;
+    if(!CalculateMFEPositionNetProfit(index, true, g_mfePositions[index].open_price, open_net) ||
+       !CalculateMFEPositionNetProfit(index, true, market_price, market_net))
+       return false;
+    if(market_net + MFEMoneyConversionTolerance < desired_net_lock)
++   {
++      fail_reason = MFE_CONVERT_FAIL_PRICE;
+       return false;
++   }
+ 
+    double low = MathMin(g_mfePositions[index].open_price, market_price);
+    double high = MathMax(g_mfePositions[index].open_price, market_price);
+@@ -5608,10 +6091,16 @@
+    double maximum_net = MathMax(low_net, high_net);
+    if(desired_net_lock < minimum_net - MFEMoneyConversionTolerance ||
+       desired_net_lock > maximum_net + MFEMoneyConversionTolerance)
++   {
++      fail_reason = MFE_CONVERT_FAIL_PRICE;
+       return false;
++   }
+ 
+    for(int iteration = 0; iteration < MFE_PRICE_SEARCH_ITERATIONS; iteration++)
+    {
++      if(high - low <= tick_size * 0.5)
++         break;
++
+       double middle = (low + high) * 0.5;
+       double middle_net = 0.0;
+       if(!CalculateMFEPositionNetProfit(index, true, middle, middle_net))
+@@ -5658,9 +6147,6 @@
+    if(MathAbs(effective_net_lock - desired_net_lock) > MathMax(MFEMoneyConversionTolerance, 0.01))
+       return false;
+ 
+-   double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+-   if(tick_size <= 0.0)
+-      tick_size = _Point;
+    double minimum_distance = MinTradeDistancePrice();
+    if(g_mfePositions[index].type == POSITION_TYPE_BUY)
+    {
+@@ -5671,7 +6157,10 @@
+          distance_clamped = true;
+       }
+       if(sl_price <= g_mfePositions[index].open_price)
++      {
++         fail_reason = MFE_CONVERT_FAIL_DISTANCE;
+          return false;
++      }
+    }
+    else
+    {
+@@ -5682,18 +6171,33 @@
+          distance_clamped = true;
+       }
+       if(sl_price >= g_mfePositions[index].open_price)
++      {
++         fail_reason = MFE_CONVERT_FAIL_DISTANCE;
+          return false;
++      }
+    }
+ 
+    if(!IsSLValid(g_mfePositions[index].type, sl_price) ||
+       !CalculateMFEPositionNetProfit(index, true, sl_price, effective_net_lock))
++   {
++      fail_reason = MFE_CONVERT_FAIL_DISTANCE;
+       return false;
++   }
+ 
+    double minimum_positive_lock = MathMin(MathMax(MFEProtectionQuantumNetMoney, 0.01),
+                                           desired_net_lock);
++   minimum_positive_lock = MathMax(minimum_positive_lock, MathMax(0.0, MFEMinimumNetLockMoney));
++   if(distance_clamped)
++      minimum_positive_lock = MathMax(minimum_positive_lock,
++                                      MathMax(0.0, MFEMinimumNetLockMoney) +
++                                      MathMax(0.0, MFEExecutionBufferMoney));
+    if(effective_net_lock + MathMax(MFEMoneyConversionTolerance, 0.01) < minimum_positive_lock)
++   {
++      fail_reason = MFE_CONVERT_FAIL_DISTANCE;
+       return false;
++   }
+ 
++   fail_reason = MFE_CONVERT_FAIL_NONE;
+    return true;
+ }
+ 
+@@ -5942,6 +6446,7 @@
+    ResetLastError();
+    bool sent = OrderSend(trade_request, trade_result);
+    int terminal_error = GetLastError();
++   g_mfePositions[index].last_modify_retcode = trade_result.retcode;
+    LogMFEStateEvent("MFE_SL_REQUEST", index,
+                     "source=" + MFESLSourceToText(source) +
+                     " previous_sl=" + DoubleToString(current_sl, _Digits) +
+@@ -6185,6 +6690,11 @@
+                   " failures=" + IntegerToString(g_mfePositions[index].failure_count) +
+                   " last_source=" + MFESLSourceToText(g_mfePositions[index].last_confirmed_source);
+    LogMFEStateEvent("MFE_CLOSED", index, extra);
++   LogMessage("[STRUCTURAL_SLOT_RELEASED] side=" +
++              (g_mfePositions[index].type == POSITION_TYPE_BUY ? "BUY" : "SELL") +
++              " identifier=" + IntegerToString(identifier) +
++              " exit_class=" + exit_class +
++              " reason=" + close_reason);
+ 
+    ClearMFEPersistedState(identifier);
+    ResetMFEPositionState(index);
+@@ -6213,6 +6723,8 @@
+    if(index < 0)
+       return;
+ 
++   g_mfePositions[index].conversion_backoff_until = 0;
++
+    ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+    if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_OUT_BY)
+       return;
+@@ -6322,7 +6834,9 @@
+             g_mfePositions[index].last_logged_high_quantum = high_quantum;
+             LogMFEStateEvent("MFE_NEW_HIGH", index, "");
+          }
+-         PersistMFEPositionState(index, false);
++         if(high_quantum > g_mfePositions[index].last_persisted_mfe_quantum ||
++            MathAbs(g_mfePositions[index].desired_net_lock - g_mfePositions[index].last_persisted_lock) >= 0.005)
++            PersistMFEPositionState(index, false);
+       }
+ 
+       if(EnableAdaptiveMoneyMFE &&
+@@ -6340,11 +6854,19 @@
+       double final_sl = 0.0;
+       double final_effective_lock = 0.0;
+       ENUM_MFE_SL_SOURCE final_source = MFE_SL_SOURCE_NONE;
+-      double legacy_profit = g_mfePositions[index].current_net_profit - g_mfePositions[index].estimated_exit_commission;
++      double unified_net_profit = g_mfePositions[index].current_net_profit;
+       double candidate_sl = 0.0;
+-
+-      if(BuildBreakEvenSLCandidate(g_mfePositions[index].type,
+-                                  legacy_profit,
++      bool mfe_engine_armed = (EnableAdaptiveMoneyMFE &&
++                               g_mfePositions[index].net_mfe >= MathMax(MFEActivationNetMoney, 0.01));
++      bool allow_legacy_trailing = (!EnableAdaptiveMoneyMFE ||
++                                    ProfitStopAuthority == PROFIT_STOP_LEGACY_UNIFIED);
++      bool allow_break_even = (!EnableAdaptiveMoneyMFE ||
++                               ProfitStopAuthority == PROFIT_STOP_LEGACY_UNIFIED ||
++                               (ProfitStopAuthority == PROFIT_STOP_MFE_WITH_BE_FLOOR && !mfe_engine_armed));
++
++      if(allow_break_even &&
++         BuildBreakEvenSLCandidate(g_mfePositions[index].type,
++                                  unified_net_profit,
+                                   g_mfePositions[index].open_price,
+                                   g_mfePositions[index].volume,
+                                   current_sl,
+@@ -6352,14 +6874,29 @@
+          IsSLValid(g_mfePositions[index].type, candidate_sl) &&
+          IsMFEStopMoreProtective(g_mfePositions[index].type, candidate_sl, current_sl))
+       {
+-         final_sl = candidate_sl;
+-         final_source = MFE_SL_SOURCE_BREAK_EVEN;
+-         CalculateMFEPositionNetProfit(index, true, final_sl, final_effective_lock);
++         double break_even_net_lock = 0.0;
++         bool break_even_lock_known = CalculateMFEPositionNetProfit(index, true, candidate_sl, break_even_net_lock);
++         bool break_even_covers_costs = (!EnableAdaptiveMoneyMFE ||
++                                         ProfitStopAuthority == PROFIT_STOP_LEGACY_UNIFIED ||
++                                         (break_even_lock_known &&
++                                          break_even_net_lock >= MathMax(0.0, MFEMinimumNetLockMoney) +
++                                                                 MathMax(0.0, MFEExecutionBufferMoney)));
++         if(break_even_covers_costs)
++         {
++            final_sl = candidate_sl;
++            final_source = MFE_SL_SOURCE_BREAK_EVEN;
++            final_effective_lock = (break_even_lock_known ? break_even_net_lock : 0.0);
++         }
++         else
++            LogMFEStateEvent("MFE_BE_COST_FLOOR_BLOCK", index,
++                             "candidate_sl=" + DoubleToString(candidate_sl, _Digits) +
++                             " net_lock=" + DoubleToString(break_even_net_lock, 1));
+       }
+ 
+       candidate_sl = 0.0;
+-      if(BuildSmartTrailingSLCandidate(g_mfePositions[index].type,
+-                                      legacy_profit,
++      if(allow_legacy_trailing &&
++         BuildSmartTrailingSLCandidate(g_mfePositions[index].type,
++                                      unified_net_profit,
+                                       g_mfePositions[index].open_price,
+                                       g_mfePositions[index].volume,
+                                       current_sl,
+@@ -6388,53 +6925,105 @@
+                   g_mfePositions[index].confirmed_net_lock =
+                      MathMax(g_mfePositions[index].confirmed_net_lock, current_sl_lock);
+                   g_mfePositions[index].effective_net_lock = current_sl_lock;
++                  g_mfePositions[index].wait_reason = MFE_WAIT_NONE;
+                   conversion_required = false;
+                }
+             }
+ 
+             if(conversion_required)
+             {
+-            double mfe_sl = 0.0;
+-            double mfe_effective_lock = 0.0;
+-            bool distance_clamped = false;
+-            if(ConvertMFENetLockToPrice(index,
+-                                        desired_lock,
+-                                        mfe_sl,
+-                                        mfe_effective_lock,
+-                                        distance_clamped))
+-            {
+-               if(distance_clamped &&
+-                  MathAbs(g_mfePositions[index].last_conversion_failure_lock + desired_lock) > 0.0000001)
+-               {
+-                  g_mfePositions[index].last_conversion_failure_lock = -desired_lock;
+-                  LogMFEStateEvent("MFE_SERVER_DISTANCE_CLAMP", index,
+-                                   "requested_lock=" + DoubleToString(desired_lock, 2) +
+-                                   " effective_lock=" + DoubleToString(mfe_effective_lock, 2) +
+-                                   " clamped_sl=" + DoubleToString(mfe_sl, _Digits));
+-               }
+-               else if(!distance_clamped)
+-                  g_mfePositions[index].last_conversion_failure_lock = 0.0;
++               datetime conversion_now = TimeCurrent();
++               if(conversion_now <= 0)
++                  conversion_now = GetOperationalServerTime();
++               double conversion_market_price = (g_mfePositions[index].type == POSITION_TYPE_BUY ?
++                                                 g_tick.bid : g_tick.ask);
++               double conversion_tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
++               if(conversion_tick_size <= 0.0)
++                  conversion_tick_size = _Point;
++               bool conversion_backoff_active = (g_mfePositions[index].conversion_backoff_until > 0 &&
++                                                 conversion_now < g_mfePositions[index].conversion_backoff_until);
++               bool conversion_lock_changed = (MathAbs(desired_lock - g_mfePositions[index].last_conversion_attempt_lock) >= 0.005);
++               bool conversion_price_moved = (g_mfePositions[index].last_conversion_price <= 0.0 ||
++                                              MathAbs(conversion_market_price - g_mfePositions[index].last_conversion_price) >=
++                                              conversion_tick_size * 0.999);
+ 
+-               g_mfePositions[index].effective_net_lock = mfe_effective_lock;
+-               if(IsMFEStopMoreProtective(g_mfePositions[index].type, mfe_sl, current_sl) &&
+-                  IsMFEStopMoreProtective(g_mfePositions[index].type, mfe_sl, final_sl))
++               if(!conversion_backoff_active || conversion_lock_changed || conversion_price_moved)
+                {
+-                  final_sl = mfe_sl;
+-                  final_effective_lock = mfe_effective_lock;
+-                  final_source = MFE_SL_SOURCE_ADAPTIVE_MFE;
+-               }
+-            }
+-            else
+-            {
+-               if(MathAbs(g_mfePositions[index].last_conversion_failure_lock - desired_lock) > 0.0000001)
+-               {
+-                  g_mfePositions[index].last_conversion_failure_lock = desired_lock;
+-                  LogMFEStateEvent("MFE_PRICE_CONVERSION_FAILED", index,
+-                                   "requested_lock=" + DoubleToString(desired_lock, 2));
++                  g_mfePositions[index].last_conversion_attempt_lock = desired_lock;
++                  g_mfePositions[index].last_conversion_price = conversion_market_price;
++
++                  double mfe_sl = 0.0;
++                  double mfe_effective_lock = 0.0;
++                  bool distance_clamped = false;
++                  int conversion_fail_reason = MFE_CONVERT_FAIL_NONE;
++                  if(ConvertMFENetLockToPrice(index,
++                                              desired_lock,
++                                              mfe_sl,
++                                              mfe_effective_lock,
++                                              distance_clamped,
++                                              conversion_fail_reason))
++                  {
++                     g_mfePositions[index].conversion_backoff_until = 0;
++                     if(distance_clamped)
++                     {
++                        g_mfePositions[index].wait_reason = MFE_WAIT_SERVER_DISTANCE;
++                        if(MathAbs(g_mfePositions[index].last_conversion_failure_lock + desired_lock) > 0.0000001)
++                        {
++                           g_mfePositions[index].last_conversion_failure_lock = -desired_lock;
++                           LogMFEStateEvent("MFE_PARTIAL_LOCK", index,
++                                            "requested_lock=" + DoubleToString(desired_lock, 2) +
++                                            " effective_lock=" + DoubleToString(mfe_effective_lock, 2) +
++                                            " clamped_sl=" + DoubleToString(mfe_sl, _Digits) +
++                                            " reason=SERVER_DISTANCE");
++                        }
++                     }
++                     else
++                     {
++                        g_mfePositions[index].wait_reason = MFE_WAIT_NONE;
++                        g_mfePositions[index].last_conversion_failure_lock = 0.0;
++                     }
++
++                     g_mfePositions[index].effective_net_lock = mfe_effective_lock;
++                     if(IsMFEStopMoreProtective(g_mfePositions[index].type, mfe_sl, current_sl) &&
++                        IsMFEStopMoreProtective(g_mfePositions[index].type, mfe_sl, final_sl))
++                     {
++                        final_sl = mfe_sl;
++                        final_effective_lock = mfe_effective_lock;
++                        final_source = MFE_SL_SOURCE_ADAPTIVE_MFE;
++                     }
++                  }
++                  else
++                  {
++                     int previous_wait_reason = g_mfePositions[index].wait_reason;
++                     int new_wait_reason = MFE_WAIT_BACKOFF;
++                     if(conversion_fail_reason == MFE_CONVERT_FAIL_PRICE)
++                        new_wait_reason = MFE_WAIT_PRICE;
++                     else if(conversion_fail_reason == MFE_CONVERT_FAIL_DISTANCE)
++                        new_wait_reason = MFE_WAIT_SERVER_DISTANCE;
++                     g_mfePositions[index].wait_reason = new_wait_reason;
++                     g_mfePositions[index].conversion_backoff_until =
++                        conversion_now + MathMax(1, MFEConversionBackoffSeconds);
++
++                     if(new_wait_reason != previous_wait_reason ||
++                        MathAbs(g_mfePositions[index].last_conversion_failure_lock - desired_lock) > 0.0000001)
++                     {
++                        g_mfePositions[index].last_conversion_failure_lock = desired_lock;
++                        if(new_wait_reason == MFE_WAIT_SERVER_DISTANCE)
++                           LogMFEStateEvent("MFE_SERVER_DISTANCE_BLOCK", index,
++                                            "requested_lock=" + DoubleToString(desired_lock, 2) +
++                                            " stops_level=" + IntegerToString((int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL)) +
++                                            " freeze_level=" + IntegerToString((int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL)) +
++                                            " backoff=" + IntegerToString(MathMax(1, MFEConversionBackoffSeconds)) + "s");
++                        else
++                           LogMFEStateEvent("MFE_PRICE_CONVERSION_FAILED", index,
++                                            "requested_lock=" + DoubleToString(desired_lock, 2) +
++                                            " reason=" + (new_wait_reason == MFE_WAIT_PRICE ? "PRICE_BELOW_LOCK" : "CONVERSION_ERROR") +
++                                            " backoff=" + IntegerToString(MathMax(1, MFEConversionBackoffSeconds)) + "s");
++                     }
++                     if(g_mfePositions[index].last_confirmed_sl <= 0.0)
++                        g_mfePositions[index].state = MFE_ARMED;
++                  }
+                }
+-               if(g_mfePositions[index].last_confirmed_sl <= 0.0)
+-                  g_mfePositions[index].state = MFE_ARMED;
+-            }
+             }
+          }
+       }
+@@ -6507,6 +7096,7 @@
+    if(!ok)
+       LogMessage("erro ao fechar ordem unilateral de seguranca: " + trade.ResultRetcodeDescription());
+ 
++   InvalidateMoneySnapshots();
+    return ok;
+ }
+ 
+@@ -6546,8 +7136,10 @@
+       return "LOSS DIARIO";
+    if(g_dailyProfitBlocked)
+       return "META BATIDA";
+-   if(g_basketDDBlocked)
+-      return "DD BLOQUEADO";
++   if(g_basketDDBlocked || g_basketDDState == BASKET_DD_HARD)
++      return "HARD_DD_MANAGEMENT_ONLY";
++   if(g_basketDDState == BASKET_DD_SOFT)
++      return "DD SOFT";
+    if(g_symbolSessionState == "MERCADO FECHADO")
+       return "MERCADO FECHADO";
+    if(g_symbolSessionState == "AGUARDANDO PRIMEIRO TICK")

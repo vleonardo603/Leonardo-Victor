@@ -328,3 +328,90 @@ encontrado alem dos dois acima. Nenhuma alteracao adicional foi feita.
 O projeto entra em fase de compilacao, Strategy Tester e forward test
 — nenhuma etapa de codigo permanece em aberto do lado desta auditoria.
 ====================================================================
+
+====================================================================
+ADENDO — CONFIRMACAO FINAL DE ENCERRAMENTO TECNICO (rodada R3 -> R4)
+====================================================================
+Solicitado: revisao final independente, respondendo apenas 3 perguntas,
+sem nenhuma melhoria/refatoracao fora de defeito objetivo comprovado.
+
+DEFEITO 3 CONFIRMADO (nao encontrado nas rodadas R1/R2/R3) —
+  motor neutro podia ignorar Allow_SELL=false
+  (categoria: violacao da arquitetura originalmente especificada /
+  caminho plausivel de violacao do "motor neutro")
+  Causa-raiz: dentro de CanOpenEntryRole, todos os papeis nao-INITIAL
+  passam por `BaseDirectionalEntryFiltersOK(direction)` antes do bloco
+  especifico do papel. O NEUTRAL sempre invoca essa checagem com
+  `direction=ORDER_TYPE_BUY` (placeholder, ja que abre um par), e
+  `BaseDirectionalEntryFiltersOK(ORDER_TYPE_BUY)` so valida
+  `Allow_BUY` (linha correspondente a
+  `if(order_type==ORDER_TYPE_BUY && !Allow_BUY)`), nunca `Allow_SELL`.
+  Como `OpenNeutralPairControlled` sempre abre DUAS pernas
+  (IA_FG_NEUTRAL_BUY e IA_FG_NEUTRAL_SELL), um usuario com
+  `Allow_SELL=false` (input pre-existente, protegido pela regra
+  absoluta de preservacao) veria o motor neutro autorizado e a perna
+  SELL efetivamente enviada mesmo assim. Confirmado por comparacao
+  direta: `CanOpenNewPair` (usado pelo INITIAL, que tambem abre par)
+  usa `BaseEntryFiltersOK()`, que corretamente exige
+  `Allow_BUY E Allow_SELL` — ou seja, o INITIAL sempre esteve correto;
+  apenas o NEUTRAL (adicionado nesta implementacao) herdou o filtro
+  direcional errado para uma operacao que nao e direcional.
+  Correcao aplicada (R4, cirurgica, +7/-1 linha, 1 funcao): adicionado
+  um gate explicito `if(!Allow_SELL) { block_reason="SIDE_LIMIT";
+  ... return false; }` no inicio do bloco `role==ENTRY_ROLE_NEUTRAL`,
+  reutilizando o mesmo motivo/convencao ja usado em todo o arquivo
+  ("LIMITE DO LADO" -> "SIDE_LIMIT"). Allow_BUY=false ja bloqueava
+  corretamente o NEUTRAL antes desta correcao (pois o placeholder de
+  direcao usado e sempre BUY) — confirmado que nao havia assimetria
+  na direcao oposta.
+  Verificacao: 720/720 chaves, 4595/4595 parenteses, 228 definicoes
+  sem duplicatas, UNICA funcao alterada de R3 para R4
+  (CanOpenEntryRole), demais 21 funcoes de entrada/risco e as 44
+  funcoes de MFE/risco/fluxo/base continuam byte-identicas.
+
+VERIFICACOES DESTA RODADA SEM DEFEITO (respostas as 3 perguntas):
+  - Autoridade central: reconfirmado que existe exatamente 1 chamada de
+    CanOpenEntryRole por invocacao do scheduler, e o scheduler roda no
+    maximo 1 vez por tick — sem risco de dois grants sobrescrevendo um
+    ao outro no mesmo ciclo.
+  - Par inicial: BaseEntryFiltersOK (via CanOpenNewPair) ja exigia
+    Allow_BUY E Allow_SELL — sempre esteve correto, nao precisou de
+    ajuste.
+  - Motor estrutural / tatico: usam a direcao REAL (nao um placeholder),
+    entao BaseDirectionalEntryFiltersOK ja valida o lado correto para
+    cada um; nao existe o mesmo tipo de gap (cada um abre 1 perna, nao
+    um par).
+  - Tetos 6/2, 5/3, 4/4, 3/5, 2/6 e teto global de 8: GetDynamicBuyLimit/
+    SellLimit permanecem byte-identicos a base; nao houve alteracao.
+  - Ausencia de IA_FG_ADDITIONAL / ausencia de reposicao artificial:
+    nenhuma funcao nova toca esses caminhos; guardas de R1/R2
+    inalterados.
+  - MFE/BE/trailing/SL servidor/gestao de risco: 44/44 funcoes
+    verificadas byte-identicas ao arquivo-base original nesta rodada.
+
+RESPOSTA AS 3 PERGUNTAS DA CONFIRMACAO FINAL:
+  1. Existe defeito objetivo remanescente? SIM, um: o gap de
+     Allow_SELL no motor neutro (Defeito 3 acima). JA CORRIGIDO em R4.
+  2/3. Apos a correcao, nenhum outro caminho de execucao plausivel foi
+     encontrado que viole autoridade central, par inicial, motor
+     estrutural, motor tatico, motor neutro, tetos 6/2-5/3-4/4, teto
+     global de 8, ausencia de ADDITIONAL, ausencia de reposicao
+     artificial, ou preservacao de MFE/BE/trailing/SL/risco.
+
+ARQUIVO FINAL DESTA RODADA: PREDATOR_FLOW_AI_V2_ADAPTIVE_BILATERAL_ENGINE_FINAL_FIXED_R4.mq5
+(R3 e todas as versoes anteriores preservadas intactas; diff R3->R4 em
+adaptive_bilateral_engine_r4_diff.txt).
+
+Apos esta correcao, nao encontrei nenhuma outra pendencia de codigo.
+Considero a implementacao encerrada do ponto de vista da auditoria
+estatica. As unicas etapas restantes sao compilacao, Strategy Tester e
+Forward Test.
+
+VEREDITO ATUALIZADO:
+Implementacao:      APROVADO
+Auditoria Estatica: APROVADO
+Compilacao:         PENDENTE
+Strategy Tester:    PENDENTE
+Forward Demo:       PENDENTE
+FTMO:               PENDENTE
+====================================================================

@@ -1,0 +1,15 @@
+--- PREDATOR_FLOW_AI_V2_ADAPTIVE_BILATERAL_ENGINE_FINAL_FIXED_R3.mq5	2026-07-20 12:29:19.777932992 +0000
++++ PREDATOR_FLOW_AI_V2_ADAPTIVE_BILATERAL_ENGINE_FINAL_FIXED_R4.mq5	2026-07-20 15:10:50.264503740 +0000
+@@ -3291,6 +3291,12 @@
+ 
+    if(role == ENTRY_ROLE_NEUTRAL)
+    {
++      if(!Allow_SELL)
++      {
++         block_reason = "SIDE_LIMIT";
++         LogEntryDecision(false, role, direction, block_reason);
++         return false;
++      }
+       if(NeutralEntryPolicy == NEUTRAL_INITIAL_PAIR_ONLY)
+       {
+          block_reason = "NEUTRAL_DISABLED_BY_POLICY";

@@ -65,3 +65,14 @@ OpenInitialPairAdaptive, OpenNeutralPairControlled,
 ReconcileEntryEngineFromAccount), 0 linhas de MFE/risco tocadas.
 Ver adaptive_bilateral_engine_final_validation.txt para a Fase 1-5
 completa desta rodada de validacao.
+
+================================================================
+ADENDO - VERSAO R4 (confirmacao final de encerramento tecnico)
+================================================================
+arquivo alvo: PREDATOR_FLOW_AI_V2_ADAPTIVE_BILATERAL_ENGINE_FINAL_FIXED_R4.mq5
+COMPILACAO REAL: NAO COMPROVADA (mesma limitacao de ambiente).
+Verificacao estatica R4: chaves 720/720, parenteses 4595/4595,
+colchetes 558/558, 228 definicoes sem duplicatas, unica funcao alterada
+(CanOpenEntryRole), 44/44 funcoes MFE/risco/fluxo/base byte-identicas
+ao arquivo-base original. Ver adaptive_bilateral_engine_final_validation.txt,
+adendo final, para o defeito encontrado e corrigido nesta rodada.

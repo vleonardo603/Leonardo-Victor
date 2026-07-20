@@ -192,3 +192,10 @@ COMPARACAO OBRIGATORIA COM O HTML (mesmo periodo 2026.07.01-03):
   exposicao potencial max <= 8; sem reposicao pos-fechamento.
   O lucro NAO e criterio de aprovacao.
 ====================================================================
+
+ADENDO R2: apos a auditoria adversarial, validar tambem no tester:
+T41 rejeicao persistente de envio estrutural -> exatamente 1 tentativa
+    por candle (log STRUCTURAL_ENTRY_BLOCKED reason=SEND_FAILED), sem
+    spam por tick. T42 rejeicao do par neutro -> proxima tentativa
+    somente apos NeutralCooldownSeconds. T43 rejeicao dupla do par
+    inicial -> proxima tentativa somente apos cooldown de tentativa.

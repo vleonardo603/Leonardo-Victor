@@ -324,3 +324,92 @@ APROVADO ESTATICAMENTE
 Strategy Tester -> so entao APROVADO COM RESSALVAS PARA FORWARD TEST
 EM DEMO. Proibido uso em conta real neste estagio.)
 ====================================================================
+
+====================================================================
+ADENDO R2 - AUDITORIA ESTATICA FINAL ADVERSARIAL (pre-compilacao)
+====================================================================
+Releitura adversarial independente do codigo (nao do relatorio).
+RESULTADO: 1 (um) defeito objetivo encontrado e corrigido; nenhum
+outro defeito comprovado. Nova versao cirurgica:
+PREDATOR_FLOW_AI_V2_ADAPTIVE_BILATERAL_ENGINE_FINAL_FIXED_R2.mq5
+(R1 preservado; diff R1->R2 = +15/-1 linhas, 4 blocos).
+
+DEFEITO CONFIRMADO (unico): retentativa por tick apos falha de envio.
+  Evidencia (R1): ramo estrutural do scheduler retornava sem consumir
+  candle/cooldown apos OpenAdaptiveUnitPosition falhar (linhas ~4288-
+  4301); OpenNeutralPairControlled nao carimbava g_lastNeutralAuthTime
+  nos 2 caminhos de falha (~3878-3893); autoridade INITIAL sem gate de
+  cooldown apos AMBAS_REJEITADAS (~3240-3262). Com rejeicao persistente
+  do broker (ex.: sem margem), o EA reenviaria a cada tick (spam de
+  requisicoes; nenhuma posicao duplicada, pois cada envio falha).
+  O caminho TATICO ja era imune (g_tacticalEntryAuthorizedClosedBar
+  setado antes do envio + guard SAME_BAR_DUPLICATE_REQUEST).
+CORRECAO R2 (linhas novas):
+  R2-1 CanOpenEntryRole/INITIAL: gate de cooldown de tentativa
+       (max(5, ReopenDelaySecondsAfterClose)) sobre
+       g_initialLastAttemptTime -> 1 tentativa por janela.
+  R2-2 scheduler estrutural: falha de envio carimba
+       g_lastStructuralEntryBar + g_lastStructuralEntryTime e loga
+       [STRUCTURAL_ENTRY_BLOCKED] reason=SEND_FAILED -> 1 tentativa
+       por candle estrutural.
+  R2-3 OpenNeutralPairControlled: ambos os caminhos de falha carimbam
+       g_lastNeutralAuthTime -> 1 tentativa por cooldown neutro (600s).
+Pos-verificacao R2: chaves 719/719, parenteses 4593/4593, 228
+definicoes sem duplicatas, MFE/risco/fluxo intactos, CRLF preservado.
+
+RESPOSTAS BINARIAS CRITICAS (auditoria por codigo, com linhas em R2):
+ 1. Reposicao artificial de perna em cesta ativa? NAO — flags
+    confirmadas sao pegajosas; missing_leg exige "nunca confirmada E
+    nao aberta" (TryCompleteInitialPair); fechamento por MFE/SL/BE
+    mantem confirmed=true -> partial impossivel; restart sem
+    persistencia valida zera requested -> sem retentativa.
+ 2. Mais de uma tatica no mesmo episodio? NAO — consumo em
+    MarkTacticalEntryConfirmed (so por confirmacao transacional),
+    TACTICAL_MAX_PROGRESSIVE_ENTRIES=1, CONSUMED persiste apos
+    fechamento, rebuild trata episodio nao comprovado como CONSUMED.
+ 3. Mais de uma solicitacao no mesmo tick? NAO — g_adaptiveEntry-
+    AttemptedThisTick checado no scheduler e em OpenAdaptiveUnit-
+    Position; pares INITIAL/NEUTRAL sao 1 transacao logica unica;
+    prioridade: inicial -> perna ausente -> tatica -> estrutural ->
+    neutra; falha de envio nao libera segunda role (returns).
+ 4. Caminho que contorna a autoridade central? NAO no modo
+    assimetrico — 15 pontos de envio auditados com linha: grant de uso
+    unico obrigatorio (L2970/3707/3841), TryCompleteInitialPair e
+    sub-fluxo mandatorio da prioridade 2 com gates proprios; caminhos
+    legados (OpenBuySellPair/pendentes) bloqueados por guards no modo
+    assimetrico; OnTimer e OnTradeTransaction sem nenhuma chamada de
+    abertura (verificacao automatizada de corpo).
+ 5. Estrutural depende de OpenAdditionalPairs*? NAO — gates proprios
+    (candle/cooldown 240s/0.35 ATR/extensao 3.0 ATR/reservas).
+ 6. Tatica depende desses inputs? NAO — CanOpenEntryRole/TACTICAL.
+ 7. Ainda e possivel gerar IA_FG_ADDITIONAL? NAO no modo assimetrico
+    — 3 guardas: OpenBuySellPair (recusa total no asym),
+    CanOpenAdditionalPair (gate), Place*Pending (gate); scheduler novo
+    nunca usa esses caminhos. Posicoes ADDITIONAL herdadas apenas sao
+    administradas.
+ 8. Possivel exceder 8 exposicoes? NAO por design — total = abertas +
+    pendentes + transito revalidado DENTRO da autoridade imediatamente
+    antes do envio; 1 solicitacao/tick elimina corrida intra-tick;
+    confirmacao runtime pendente (Strategy Tester).
+ 9. Extensao apaga o fluxo estrutural? NAO — bloqueio e so motivo
+    (EXTENSION); painel exibe fluxo real da mesma variavel usada pela
+    autoridade.
+10. Consumo tatico antes da confirmacao real? NAO — ORDER_PENDING
+    reserva sem incrementar; contador so em MarkTacticalEntryConfirmed
+    (deal/posicao real); rejeicao volta a ACTIVE sem consumo.
+
+RISCOS DE COMPILACAO REMANESCENTES (nao confirmaveis sem MetaEditor):
+  conversoes long->int em IntegerToString (warnings possiveis, nao
+  erros); ternarios aninhados em concatenacao (precedente no proprio
+  arquivo); nenhum uso de PositionSelectByIndex; nenhuma funcao
+  chamada sem definicao (whitelist CTrade/builtins conferida).
+COMPILACAO REAL: NAO COMPROVADA.
+
+MATRIZ (cobertura complementar do adendo): cenarios exigidos mapeados
+  -> falha de retentativa inicial (T30+R2-1), fechamento de perna sem
+  reposicao (T28 + resposta binaria 1), confirmacao atrasada (T15/T39),
+  spam pos-rejeicao (novo comportamento R2: 1 tentativa por candle/
+  cooldown — validar no tester observando STRUCTURAL_ENTRY_BLOCKED).
+VEREDITO DO ADENDO: APROVADO COM RESSALVAS PARA COMPILACAO
+  (auditoria estatica concluida; compilacao real, Strategy Tester,
+  forward demo e FTMO permanecem NAO COMPROVADOS).

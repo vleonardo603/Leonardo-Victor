@@ -1,0 +1,148 @@
+--- PREDATOR_FLOW_AI_V2_ADAPTIVE_BILATERAL_ENGINE_FINAL_FIXED_R4.mq5	2026-07-20 15:10:50.264503740 +0000
++++ PREDATOR_FLOW_AI_V2_ENTRY_ENGINE_ROOT_CAUSE_FIXED.mq5	2026-07-20 22:13:50.940269674 +0000
+@@ -494,9 +494,9 @@
+ int g_lastSeenStructuralFlow = 0;
+ double g_structuralFlowAnchorPrice = 0.0;
+ bool g_structuralFirstSlotConsumed = false;
+-datetime g_lastStructuralEntryTime = 0;
+-double g_lastStructuralEntryPrice = 0.0;
+-datetime g_lastStructuralEntryBar = 0;
++datetime g_lastStructuralEntryTime[2] = {0, 0};   // [0]=BUY [1]=SELL, cadencia por lado
++double g_lastStructuralEntryPrice[2] = {0.0, 0.0}; // [0]=BUY [1]=SELL, distancia por lado
++datetime g_lastStructuralEntryBar[2] = {0, 0};     // [0]=BUY [1]=SELL, candle por lado
+ bool g_structuralResumeConfirmed = true;
+ datetime g_structuralResumeWaitSinceBar = 0;
+ long g_tacticalEpisodeSeq = 0;
+@@ -2316,9 +2316,12 @@
+    g_structuralFirstSlotConsumed = false;
+    g_structuralResumeConfirmed = true;
+    g_structuralResumeWaitSinceBar = 0;
+-   g_lastStructuralEntryTime = 0;
+-   g_lastStructuralEntryPrice = 0.0;
+-   g_lastStructuralEntryBar = 0;
++   g_lastStructuralEntryTime[0] = 0;
++   g_lastStructuralEntryTime[1] = 0;
++   g_lastStructuralEntryPrice[0] = 0.0;
++   g_lastStructuralEntryPrice[1] = 0.0;
++   g_lastStructuralEntryBar[0] = 0;
++   g_lastStructuralEntryBar[1] = 0;
+    g_lastSeenStructuralFlow = 0;
+    g_inFlightBuy = 0;
+    g_inFlightSell = 0;
+@@ -3469,8 +3472,9 @@
+          return false;
+       }
+ 
++      int structural_side_index = (direction == ORDER_TYPE_BUY ? 0 : 1);
+       datetime structural_closed_bar = iTime(_Symbol, StructuralFlowTimeframe, 1);
+-      if(structural_closed_bar <= 0 || g_lastStructuralEntryBar == structural_closed_bar)
++      if(structural_closed_bar <= 0 || g_lastStructuralEntryBar[structural_side_index] == structural_closed_bar)
+       {
+          block_reason = "WAITING_CLOSED_BAR";
+          LogEntryDecision(false, role, direction, block_reason);
+@@ -3478,8 +3482,8 @@
+       }
+ 
+       datetime structural_now = TimeCurrent();
+-      if(g_lastStructuralEntryTime > 0 && StructuralCooldownSeconds > 0 &&
+-         (int)(structural_now - g_lastStructuralEntryTime) < StructuralCooldownSeconds)
++      if(g_lastStructuralEntryTime[structural_side_index] > 0 && StructuralCooldownSeconds > 0 &&
++         (int)(structural_now - g_lastStructuralEntryTime[structural_side_index]) < StructuralCooldownSeconds)
+       {
+          block_reason = "COOLDOWN";
+          LogEntryDecision(false, role, direction, block_reason);
+@@ -3488,9 +3492,9 @@
+ 
+       double structural_atr_points = GetEntryAtrPoints();
+       double entry_price = (direction == ORDER_TYPE_BUY ? g_tick.ask : g_tick.bid);
+-      if(StructuralMinDistanceATR > 0.0 && structural_atr_points > 0.0 && g_lastStructuralEntryPrice > 0.0)
++      if(StructuralMinDistanceATR > 0.0 && structural_atr_points > 0.0 && g_lastStructuralEntryPrice[structural_side_index] > 0.0)
+       {
+-         double structural_distance_points = MathAbs(entry_price - g_lastStructuralEntryPrice) / _Point;
++         double structural_distance_points = MathAbs(entry_price - g_lastStructuralEntryPrice[structural_side_index]) / _Point;
+          if(structural_distance_points < StructuralMinDistanceATR * structural_atr_points)
+          {
+             block_reason = "DISTANCE";
+@@ -3663,9 +3667,12 @@
+             g_structuralFirstSlotConsumed = false;
+             g_structuralResumeConfirmed = true;
+             g_structuralResumeWaitSinceBar = 0;
+-            g_lastStructuralEntryPrice = 0.0;
+-            g_lastStructuralEntryTime = 0;
+-            g_lastStructuralEntryBar = 0;
++            g_lastStructuralEntryPrice[0] = 0.0;
++            g_lastStructuralEntryPrice[1] = 0.0;
++            g_lastStructuralEntryTime[0] = 0;
++            g_lastStructuralEntryTime[1] = 0;
++            g_lastStructuralEntryBar[0] = 0;
++            g_lastStructuralEntryBar[1] = 0;
+             LogMessage("[STRUCTURAL_FLOW_CONFIRMED] flow=" + StructuralFlowToText() +
+                        " anchor=" + DoubleToString(g_structuralFlowAnchorPrice, _Digits));
+          }
+@@ -4144,9 +4151,12 @@
+    GlobalVariableSet(TacticalStateGlobalName("EESW"), (double)g_structuralResumeWaitSinceBar);
+    GlobalVariableSet(TacticalStateGlobalName("EESF"), (g_structuralFirstSlotConsumed ? 1.0 : 0.0));
+    GlobalVariableSet(TacticalStateGlobalName("EESA"), g_structuralFlowAnchorPrice);
+-   GlobalVariableSet(TacticalStateGlobalName("EELP"), g_lastStructuralEntryPrice);
+-   GlobalVariableSet(TacticalStateGlobalName("EELT"), (double)g_lastStructuralEntryTime);
+-   GlobalVariableSet(TacticalStateGlobalName("EELB"), (double)g_lastStructuralEntryBar);
++   GlobalVariableSet(TacticalStateGlobalName("EELPB"), g_lastStructuralEntryPrice[0]);
++   GlobalVariableSet(TacticalStateGlobalName("EELPS"), g_lastStructuralEntryPrice[1]);
++   GlobalVariableSet(TacticalStateGlobalName("EELTB"), (double)g_lastStructuralEntryTime[0]);
++   GlobalVariableSet(TacticalStateGlobalName("EELTS"), (double)g_lastStructuralEntryTime[1]);
++   GlobalVariableSet(TacticalStateGlobalName("EELBB"), (double)g_lastStructuralEntryBar[0]);
++   GlobalVariableSet(TacticalStateGlobalName("EELBS"), (double)g_lastStructuralEntryBar[1]);
+    GlobalVariableSet(TacticalStateGlobalName("EESQ"), (double)g_tacticalEpisodeSeq);
+ }
+ 
+@@ -4181,12 +4191,18 @@
+       g_structuralFirstSlotConsumed = (GlobalVariableGet(TacticalStateGlobalName("EESF")) > 0.5);
+    if(GlobalVariableCheck(TacticalStateGlobalName("EESA")))
+       g_structuralFlowAnchorPrice = GlobalVariableGet(TacticalStateGlobalName("EESA"));
+-   if(GlobalVariableCheck(TacticalStateGlobalName("EELP")))
+-      g_lastStructuralEntryPrice = GlobalVariableGet(TacticalStateGlobalName("EELP"));
+-   if(GlobalVariableCheck(TacticalStateGlobalName("EELT")))
+-      g_lastStructuralEntryTime = (datetime)GlobalVariableGet(TacticalStateGlobalName("EELT"));
+-   if(GlobalVariableCheck(TacticalStateGlobalName("EELB")))
+-      g_lastStructuralEntryBar = (datetime)GlobalVariableGet(TacticalStateGlobalName("EELB"));
++   if(GlobalVariableCheck(TacticalStateGlobalName("EELPB")))
++      g_lastStructuralEntryPrice[0] = GlobalVariableGet(TacticalStateGlobalName("EELPB"));
++   if(GlobalVariableCheck(TacticalStateGlobalName("EELPS")))
++      g_lastStructuralEntryPrice[1] = GlobalVariableGet(TacticalStateGlobalName("EELPS"));
++   if(GlobalVariableCheck(TacticalStateGlobalName("EELTB")))
++      g_lastStructuralEntryTime[0] = (datetime)GlobalVariableGet(TacticalStateGlobalName("EELTB"));
++   if(GlobalVariableCheck(TacticalStateGlobalName("EELTS")))
++      g_lastStructuralEntryTime[1] = (datetime)GlobalVariableGet(TacticalStateGlobalName("EELTS"));
++   if(GlobalVariableCheck(TacticalStateGlobalName("EELBB")))
++      g_lastStructuralEntryBar[0] = (datetime)GlobalVariableGet(TacticalStateGlobalName("EELBB"));
++   if(GlobalVariableCheck(TacticalStateGlobalName("EELBS")))
++      g_lastStructuralEntryBar[1] = (datetime)GlobalVariableGet(TacticalStateGlobalName("EELBS"));
+    if(GlobalVariableCheck(TacticalStateGlobalName("EESQ")))
+       g_tacticalEpisodeSeq = (long)GlobalVariableGet(TacticalStateGlobalName("EESQ"));
+ }
+@@ -4298,9 +4314,10 @@
+                     " flow=" + StructuralFlowToText());
+          if(OpenAdaptiveUnitPosition(structural_order, structural_comment))
+          {
+-            g_lastStructuralEntryTime = TimeCurrent();
+-            g_lastStructuralEntryPrice = (structural_order == ORDER_TYPE_BUY ? g_tick.ask : g_tick.bid);
+-            g_lastStructuralEntryBar = iTime(_Symbol, StructuralFlowTimeframe, 1);
++            int structural_success_index = (structural_order == ORDER_TYPE_BUY ? 0 : 1);
++            g_lastStructuralEntryTime[structural_success_index] = TimeCurrent();
++            g_lastStructuralEntryPrice[structural_success_index] = (structural_order == ORDER_TYPE_BUY ? g_tick.ask : g_tick.bid);
++            g_lastStructuralEntryBar[structural_success_index] = iTime(_Symbol, StructuralFlowTimeframe, 1);
+             g_structuralFirstSlotConsumed = true;
+             g_roleBlockReasonStructural = "";
+             g_adaptiveLastAction = "REFORCO " + structural_side;
+@@ -4310,8 +4327,9 @@
+             return true;
+          }
+ 
+-         g_lastStructuralEntryBar = iTime(_Symbol, StructuralFlowTimeframe, 1);
+-         g_lastStructuralEntryTime = TimeCurrent();
++         int structural_fail_index = (structural_order == ORDER_TYPE_BUY ? 0 : 1);
++         g_lastStructuralEntryBar[structural_fail_index] = iTime(_Symbol, StructuralFlowTimeframe, 1);
++         g_lastStructuralEntryTime[structural_fail_index] = TimeCurrent();
+          g_roleBlockReasonStructural = "SEND_FAILED";
+          LogMessage("[STRUCTURAL_ENTRY_BLOCKED] reason=SEND_FAILED retry=PROXIMO_CANDLE");
+          return false;

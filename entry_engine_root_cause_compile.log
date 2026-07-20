@@ -1,0 +1,60 @@
+================================================================
+COMPILE LOG - PREDATOR_FLOW_AI_V2_ENTRY_ENGINE_ROOT_CAUSE_FIXED.mq5
+================================================================
+data: 2026-07-20
+arquivo alvo: PREDATOR_FLOW_AI_V2_ENTRY_ENGINE_ROOT_CAUSE_FIXED.mq5
+arquivo-base: PREDATOR_FLOW_AI_V2_ADAPTIVE_BILATERAL_ENGINE_FINAL_FIXED_R4.mq5
+              (sha256 1cc2de2f15fa7eef9bf0c42385611b90700f7f1da2794ec2560f82366747b9b2,
+               idêntico ao upload aed8b454-...R4.mq5 — original preservado, não sobrescrito)
+
+erros:      NAO VERIFICADO - COMPILACAO NAO EXECUTADA
+warnings:   NAO VERIFICADO - COMPILACAO NAO EXECUTADA
+compilador: INDISPONIVEL NESTE AMBIENTE (Linux, sem MetaEditor/MetaTrader/Wine)
+
+STATUS: COMPILAÇÃO BLOQUEADA
+
+Nenhum resultado de compilação foi inventado. "0 erros / 0 warnings" NÃO
+é declarado.
+
+VERIFICAÇÃO ESTÁTICA EXECUTADA EM SUBSTITUIÇÃO (não equivalente a um
+compilador real):
+  - chaves 723/723, parênteses 4623/4623, colchetes 595/595 — balanceados
+  - 228 definições de função, 0 duplicadas
+  - exatamente 6 funções alteradas (CanOpenEntryRole, ManageAsymmetric-
+    AdaptiveEntries, SyncEntryEngineWithFlow, ResetAdaptiveFlowCycle,
+    PersistEntryEngineState, LoadEntryEngineState) — confirmadas por
+    comparação função a função com a base
+  - 57 funções fora do escopo (todo o MFE, risco, leitura de fluxo,
+    filtros base, e as demais funções do motor de entradas) confirmadas
+    BYTE-IDÊNTICAS à base R4
+  - nenhum uso escalar remanescente das 3 variáveis convertidas em
+    array (grep exaustivo, 0 ocorrências fora de [0]/[1])
+  - contagem de inputs inalterada: 147 = 147 (nenhum input criado,
+    removido ou com valor padrão alterado)
+  - CRLF preservado (padrão MetaEditor)
+
+RISCOS POTENCIAIS DE COMPILAÇÃO IDENTIFICADOS POR LEITURA (nenhum
+confirmado como erro real — isso exige o compilador MQL5):
+  1. Inicializadores de array globais `datetime g_lastStructuralEntryTime[2]
+     = {0, 0};` e `double g_lastStructuralEntryPrice[2] = {0.0, 0.0};` —
+     sintaxe válida em MQL5 para arrays de tamanho fixo declarados em
+     escopo global; padrão já usado em outras partes do arquivo-base
+     para arrays de tamanho fixo (ex.: `bool seen[MFE_MAX_TRACKED_POSITIONS]`
+     é inicializado via ArrayInitialize, não por chaves — mas a sintaxe
+     `{0,0}` em declaração é suportada pela linguagem para arrays
+     estáticos). Risco baixo.
+  2. Variáveis locais `structural_side_index`, `structural_success_index`,
+     `structural_fail_index` — nomes novos, sem colisão com identificadores
+     existentes (grep confirmou ausência de duplicidade).
+  3. Conversão `(datetime)GlobalVariableGet(...)` — padrão idêntico ao já
+     usado em todas as demais 20+ chamadas de carregamento de estado no
+     arquivo-base; sem alteração de padrão.
+
+INSTRUÇÕES EXATAS PARA COMPILAÇÃO REAL (ambiente do usuário):
+  1. Copiar PREDATOR_FLOW_AI_V2_ENTRY_ENGINE_ROOT_CAUSE_FIXED.mq5 para
+     MQL5\Experts\ do terminal MetaTrader 5.
+  2. Abrir no MetaEditor e pressionar F7, ou via linha de comando:
+     metaeditor64.exe /compile:"MQL5\Experts\PREDATOR_FLOW_AI_V2_ENTRY_ENGINE_ROOT_CAUSE_FIXED.mq5" /log
+  3. Exigir 0 erros e 0 warnings antes de qualquer teste.
+  4. Salvar o log gerado pelo MetaEditor como evidência.
+================================================================

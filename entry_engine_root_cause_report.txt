@@ -1,0 +1,308 @@
+====================================================================
+RELATORIO TECNICO - AUDITORIA CIRURGICA DE CAUSA-RAIZ
+PREDATOR_FLOW_AI_V2_ENTRY_ENGINE_ROOT_CAUSE_FIXED.mq5
+Data: 2026-07-20
+Base autorizada: PREDATOR_FLOW_AI_V2_ADAPTIVE_BILATERAL_ENGINE_FINAL_FIXED_R4.mq5
+(sha256 1cc2de2f15fa7eef9bf0c42385611b90700f7f1da2794ec2560f82366747b9b2,
+upload aed8b454-... — idêntico byte a byte ao commit d806bb6 já existente
+no repositório; original preservado, não sobrescrito)
+====================================================================
+
+A. RESUMO EXECUTIVO
+--------------------------------------------------------------------
+Causa-raiz: as variáveis de cadência estrutural
+(`g_lastStructuralEntryPrice`, `g_lastStructuralEntryTime`,
+`g_lastStructuralEntryBar`) eram ESCALARES ÚNICAS, compartilhadas
+entre BUY e SELL. Uma nova entrada STRUCTURAL de qualquer lado media
+sua distância mínima (StructuralMinDistanceATR), cooldown
+(StructuralCooldownSeconds) e unicidade por candle contra a última
+entrada estrutural de QUALQUER direção — inclusive uma entrada do
+lado OPOSTO — em vez de medir contra a última entrada do MESMO lado.
+Impacto: o mecanismo de "distância mínima entre reforços" (cuja
+finalidade documentada é impedir perseguir o preço com reforços
+consecutivos do MESMO lado) fica contaminado sempre que o fluxo
+estrutural alterna de direção: uma SELL passa a medir sua distância
+contra o preço da BUY anterior (não relacionado), o que pode permitir
+uma SELL que estaria bloqueada se medida corretamente contra a última
+SELL real, ou bloquear uma SELL que deveria ser permitida.
+Demonstrado nos dados reais do teste anexado (ver seção B): o ticket
+104 (SELL @3962.87, 10:35) mediu sua distância contra o ticket 103
+(BUY @3970.53, 10:20) em vez do ticket 101 (SELL @3965.00, 09:15), a
+última SELL genuína, 80 minutos antes.
+Correção aplicada: as 3 variáveis foram convertidas em arrays de 2
+posições (`[0]=BUY`, `[1]=SELL`); todos os 8 pontos de leitura/escrita
+foram indexados pela direção da entrada. Nenhuma outra lógica foi
+alterada.
+Status de compilação: BLOQUEADA (sem MetaEditor neste ambiente; ver
+entry_engine_root_cause_compile.log).
+Status dos testes: BLOQUEADOS (sem Strategy Tester neste ambiente).
+Veredito: APROVADO COM RESSALVAS — auditoria estática completa e
+correção cirúrgica aplicada; compilação e execução real permanecem
+pendentes do lado do usuário.
+
+ADVERTENCIA OBRIGATORIA SOBRE DIVERGENCIA DE EVIDENCIAS (hierarquia
+da secao 1 do bloco final): a lista de "Inputs" do relatorio HTML
+anexado (ADAPTIVE_FIXED4.html) NAO contem NENHUM dos 10 parametros do
+grupo "=== MOTOR DE ENTRADAS ASSIMETRICO V3 ===" (NeutralEntryPolicy,
+NeutralConfirmationBars, NeutralMinDistanceATR, NeutralCooldownSeconds,
+StructuralMinDistanceATR, StructuralCooldownSeconds,
+StructuralMaxExtensionATR, TacticalMaxEntryAgeBars, TacticalMaxEpisodeBars,
+TacticalInvalidationATRBuffer) — parametros que existem em TODAS as
+versoes do motor de entradas que produzi (da primeira, sem sufixo, ate
+R4). Ao mesmo tempo, os COMENTARIOS reais das ordens (evidencia mais
+objetiva, escrita pelo proprio EA a cada negociacao) mostram
+IA_FG_NEUTRAL_BUY/SELL (44 cada) e ZERO IA_FG_ADDITIONAL — um padrao
+que so existe quando o motor de entradas do escopo desta tarefa esta
+ativo. As duas evidencias sao contraditorias entre si. Prioritizei a
+evidencia operacional mais direta (comentarios das ordens) para
+prosseguir com a reconstrucao das 5 posicoes e o diagnostico, mas
+declaro explicitamente que NAO POSSO GARANTIR que o binario (.ex5)
+executado neste teste especifico corresponde byte a byte a nenhuma das
+versoes do arquivo que entreguei (aa71a8f sem sufixo, R1, R2, R3 ou
+R4). Isso NAO bloqueou a tarefa (a base de codigo autorizada — R4 — foi
+auditada e corrigida de qualquer forma, por instrucao explicita do
+usuario), mas limita a certeza de que os VALORES NUMERICOS exatos dos
+parametros (ex.: StructuralMinDistanceATR=0.35, StructuralCooldownSeconds=240)
+estavam realmente em vigor neste teste especifico — por isso a secao I
+usa linguagem de "mecanismo demonstrado", nao de "causa numerica
+comprovada com certeza absoluta".
+
+B. INTERPRETACAO DAS CINCO POSICOES
+--------------------------------------------------------------------
+Reconstruído a partir da tabela de Deals do relatório HTML (evidência
+direta — ticket, horário, tipo, preço e COMENTÁRIO gravado pelo EA em
+cada abertura; nenhum dado inventado).
+
+| Horário (2026.07.01) | Direção | Preço   | Ticket | Comentário (papel) | Regime/fluxo no momento | Motivo da autorização | Conclusão |
+|-----------------------|---------|---------|--------|---------------------|--------------------------|------------------------|-----------|
+| 03:41:42 | BUY  | 3997.16 | 58  | IA_FG_INITIAL_BUY    | Cesta zerada (fechamento total às 03:41:27, tickets 54-57) | Par inicial — autoridade INITIAL | INITIAL confirmado por comentário; cesta genuinamente flat antes (4 fechamentos simultâneos imediatamente antes) |
+| 04:30:00 | BUY  | 3986.01 | 76  | IA_FG_STRUCTURAL_BUY | Fluxo lido como BUY neste candle (preço subiu de 3980.89 há 10 min para 3986.01) | Reforço estrutural — autoridade STRUCTURAL | STRUCTURAL confirmado por comentário; NÃO COMPROVÁVEL COM OS ARTEFATOS DISPONÍVEIS se StructuralMaxExtensionATR bloqueou corretamente (sem log/journal no artefato) |
+| 10:35:00 | SELL | 3962.87 | 104 | IA_FG_STRUCTURAL_SELL | Fluxo lido como SELL neste candle; entrada estrutural anterior (103) foi BUY 15 min antes | Reforço estrutural — autoridade STRUCTURAL | STRUCTURAL confirmado por comentário. DEFEITO OBJETIVO CONFIRMADO (seção C, item 1): a checagem de distância mínima mediu contra o ticket 103 (BUY, direção oposta), não contra a última SELL real (ticket 101, 3965.00, 09:15) |
+| 10:50:00 | SELL | 3970.56 | 105 | IA_FG_STRUCTURAL_SELL | Fluxo ainda lido como SELL; preço SUBIU de 3962.87 (104) para 3970.56 nos 15 min anteriores | Reforço estrutural — autoridade STRUCTURAL | STRUCTURAL confirmado por comentário. Neste caso específico a referência (ticket 104, também SELL) coincidia por acaso com o lado correto — o mesmo defeito do item anterior não necessariamente afetou esta entrada isoladamente, mas a MESMA falha de arquitetura estava presente |
+| 11:20:00 | BUY  | 3982.97 | 107 | IA_FG_STRUCTURAL_BUY | Fluxo lido como BUY; preço subiu de 3970.56 (30 min antes) para 3982.97 | Reforço estrutural — autoridade STRUCTURAL | STRUCTURAL confirmado por comentário; sinal fresco (candle novo, distância de preço grande — 12.4 pontos desde a última entrada estrutural de qualquer lado) |
+
+Todas as 5 posições possuem comentário identificador explícito — não
+houve necessidade de heurística visual ou suposição de preço/direção.
+Nenhuma das 5 é INITIAL_SELL, NEUTRAL, TACTICAL ou LEGACY/ADDITIONAL.
+
+Esclarecimento sobre "Entradas táticas confirmadas: 0" observado pelo
+usuário no painel: o contador `g_tacticalEntryCount` é POR EPISÓDIO
+(reinicia a cada novo episódio de microcorreção), não é um total
+acumulado da sessão. O relatório completo mostra 8 deals
+IA_FG_TACTICAL_BUY (4 posições táticas reais, cada uma com deal de
+entrada e saída) ao longo do período — a leitura "0" no painel no
+momento do print reflete apenas que, NAQUELE instante, o episódio
+tático corrente (se algum) ainda não havia confirmado uma entrada, não
+que o motor tático nunca funcionou. Nenhuma IA_FG_TACTICAL_SELL foi
+observada nos dados — isso é um dado factual (NÃO COMPROVÁVEL, sem o
+Journal, se por ausência genuína de microcorreção compradora válida em
+fluxo SELL, ou por algum bloqueio; não investigado nesta rodada por
+estar fora do escopo do defeito comprovado e por não ter sido apontado
+como sintoma pelo usuário para esta tarefa específica).
+
+C. DEFEITOS OBJETIVOS
+--------------------------------------------------------------------
+| ID | Função | Linha (R4) | Defeito | Evidência | Correção |
+|----|--------|------------|---------|-----------|----------|
+| D1 | `CanOpenEntryRole` (ramo STRUCTURAL) | 3473, 3481-3482, 3491-3493 | Distância mínima, cooldown e unicidade-por-candle de reforço estrutural medidos contra a última entrada estrutural de QUALQUER direção, não da MESMA direção da nova entrada | Declaração escalar única em `g_lastStructuralEntryPrice/Time/Bar` (linhas 497-499); lidas sem distinção de lado nas linhas citadas | Convertidas em arrays `[2]` (`[0]=BUY`,`[1]=SELL`); leitura indexada por `direction` |
+| D2 | `ManageAsymmetricAdaptiveEntries` | 4301-4303 (sucesso), 4313-4314 (falha de envio) | Escrita das mesmas variáveis também sem distinção de lado, perpetuando a contaminação cruzada a cada novo reforço | Mesmas linhas | Escrita indexada por `structural_order` (a direção da entrada que efetivamente foi tentada) |
+| D3 | `SyncEntryEngineWithFlow` | 3666-3668 | Reset das variáveis (ao confirmar reversão genuína de fluxo) também escalar | Mesmas linhas | Reset de ambos os índices `[0]` e `[1]` |
+| D4 | `ResetAdaptiveFlowCycle` | 2319-2321 | Reset completo (cesta zerada / novo ciclo) também escalar | Mesmas linhas | Reset de ambos os índices |
+| D5 | `PersistEntryEngineState` / `LoadEntryEngineState` | 4147-4149 / 4184-4189 | Persistência/reconstrução após restart também escalar — perderia a distinção por lado mesmo após reinício do terminal | Mesmas linhas | 3 chaves → 6 chaves (`EELPB`/`EELPS`, `EELTB`/`EELTS`, `EELBB`/`EELBS`), uma por lado |
+
+Nenhum outro defeito objetivo foi comprovado nesta rodada. Itens
+investigados e CLASSIFICADOS SEM DEFEITO (ver seção D e J):
+- Uso de Bid/Ask no cálculo de distância estrutural (linha 3490):
+  `entry_price = (direction==ORDER_TYPE_BUY ? g_tick.ask : g_tick.bid)`
+  — correto, sem inversão.
+- Ordem do scheduler (prioridade risco→MFE→par inicial→tática→
+  estrutural→neutra): idêntica à especificada, função
+  `ManageAsymmetricAdaptiveEntries` com estrutura de retornos
+  mutuamente exclusivos — RISCO ARQUITETURAL não encontrado.
+- `OnTimer`/`OnTradeTransaction`: confirmadas byte-idênticas à base,
+  sem qualquer chamada de abertura de posição.
+- Reset da âncora de extensão (`g_structuralFlowAnchorPrice`) apenas em
+  reversão genuína de sinal (cruzamento de zero), preservado durante
+  troca de intensidade dentro do mesmo lado — COMPORTAMENTO ESPERADO,
+  não alterado.
+
+D. COMPORTAMENTOS ESPERADOS
+--------------------------------------------------------------------
+Por que S/L = 0.00 em posição negativa pode ser normal: o Trailing MFE
+Monetário Adaptativo só arma proteção quando o lucro líquido da
+posição atinge `MFEActivationNetMoney` (5.0 USD neste teste, conforme
+inputs do relatório). Uma posição que nunca esteve favorável o
+suficiente permanece sem SL do MFE — isso é o comportamento
+DOCUMENTADO e ESPERADO da arquitetura (ver
+adaptive_bilateral_engine_report.txt, seção D, e o patch original de
+MFE_TRAILING_INTEGRATION_FIXED). As 5 posições do print estão todas
+negativas (entre -US$4.80 e -US$36.30); nenhuma delas jamais atingiu
++US$5.00 de lucro líquido, logo NENHUMA deveria ter SL do MFE — e de
+fato nenhuma tem. Isso NÃO é evidência de defeito.
+Por que o MFE não deve ser alterado por essa evidência: a tarefa
+pediu explicitamente para não confundir risco pré-MFE com proteção
+pós-MFE, e para só alterar o MFE se um defeito objetivo e
+INDEPENDENTE fosse encontrado nele. O defeito encontrado (D1-D5) está
+inteiramente dentro do motor de ENTRADAS (cadência de reforços
+estruturais) — não há qualquer relação de causa com o cálculo
+monetário, a conversão dinheiro→preço, a modificação de SL no
+servidor ou a monotonicidade do MFE. As 44 funções de MFE/BE/Lock/
+risco auditadas nesta e nas rodadas anteriores permanecem byte-
+idênticas ao arquivo-base. Nenhuma alteração foi feita no MFE.
+
+E. PATCH APLICADO
+--------------------------------------------------------------------
+Funções alteradas (6, confirmadas por comparação função a função —
+nenhuma outra função do arquivo foi tocada):
+
+1. Declaração global (linhas 497-499): 3 variáveis escalares →
+   3 arrays de tamanho 2.
+2. `ResetAdaptiveFlowCycle`: reset de 3 linhas → 6 linhas (ambos os
+   índices).
+3. `SyncEntryEngineWithFlow`: reset de 3 linhas → 6 linhas (ambos os
+   índices), no bloco que já existia para reversão genuína de fluxo.
+4. `CanOpenEntryRole` (ramo `ENTRY_ROLE_STRUCTURAL`): leitura das 3
+   variáveis agora indexada por `structural_side_index = (direction ==
+   ORDER_TYPE_BUY ? 0 : 1)`.
+5. `ManageAsymmetricAdaptiveEntries`: escrita das 3 variáveis (sucesso
+   e falha de envio) agora indexada por `structural_order`.
+6. `PersistEntryEngineState`/`LoadEntryEngineState`: 3 chaves de
+   GlobalVariable → 6 chaves (uma por lado, por campo).
+
+Lógica anterior (resumo): 1 variável por campo, compartilhada entre
+BUY e SELL; qualquer entrada estrutural (de qualquer lado) atualizava
+a mesma referência, usada por qualquer verificação subsequente
+(também de qualquer lado).
+
+Lógica corrigida (resumo): 1 array de 2 posições por campo; cada
+entrada estrutural só lê e só escreve a posição correspondente ao seu
+próprio lado. A distância, o cooldown e a unicidade-por-candle de uma
+SELL agora dependem exclusivamente do histórico de SELLs; o mesmo para
+BUY.
+
+Invariantes preservadas (confirmadas por diff/comparação automática):
+lote (`FixedLot`, `NormalizeVolume`), risco (`ManageDailyRisk`,
+`ManageBasketDrawdown`, todos os blocos Soft/Hard DD), máximo global
+(`total_cap = MathMin(8, LimitOpenPositions())`, inalterado), tetos
+adaptativos (`GetDynamicBuyLimit`/`GetDynamicSellLimit`, inalteradas),
+MFE/BE/Lock/trailing/SL servidor (44 funções, byte-idênticas), par
+inicial, motor neutro, motor tático, autoridade central
+(`CanOpenEntryRole` só teve o ramo STRUCTURAL tocado; ramos INITIAL,
+NEUTRAL e TACTICAL permanecem idênticos), comentários das ordens,
+Magic Number, filtros de símbolo, hedging, Allow_BUY/Allow_SELL
+(incluindo o gate de Allow_SELL no motor neutro corrigido na rodada
+anterior — não tocado nesta rodada), 147 inputs (nenhum criado,
+removido ou com valor padrão alterado).
+
+F. DIFF
+--------------------------------------------------------------------
+Resumo: +47 linhas / -29 linhas, 8 blocos de substituição, todos
+dentro das 6 funções listadas na seção E. Arquivo completo em
+entry_engine_root_cause_diff.txt.
+Confirmação de ausência de alterações fora do escopo: verificação
+automatizada comparou TODAS as 228 definições de função entre o
+arquivo-base (R4) e o corrigido; exatamente 6 diferem (as pretendidas)
+e as 57 funções relacionadas a MFE/risco/fluxo/base/demais partes do
+motor de entradas testadas explicitamente são byte-idênticas. Nenhum
+`input` foi adicionado, removido ou alterado (147 = 147).
+
+G. COMPILAÇÃO
+--------------------------------------------------------------------
+Comando/processo: MetaEditor F7 ou
+`metaeditor64.exe /compile:"...\PREDATOR_FLOW_AI_V2_ENTRY_ENGINE_ROOT_CAUSE_FIXED.mq5" /log`
+Versão do compilador: não aplicável — não executado.
+Erros: NÃO VERIFICADO.
+Warnings: NÃO VERIFICADO.
+Caminho do log: entry_engine_root_cause_compile.log (log honesto de
+bloqueio, com riscos potenciais listados por leitura, não por
+compilação real).
+STATUS: COMPILAÇÃO BLOQUEADA — ambiente Linux sem MetaEditor/
+MetaTrader/Wine.
+
+H. TESTES
+--------------------------------------------------------------------
+Ver matriz completa em entry_engine_root_cause_test_matrix.txt.
+Resumo: todos os cenários de execução real estão BLOCKED (sem
+Strategy Tester neste ambiente). Verificações estáticas equivalentes
+(balanceamento, funções alteradas, preservação, ausência de uso
+escalar residual) = PASS. Nenhum resultado de teste foi inventado.
+
+I. COMPARAÇÃO A/B
+--------------------------------------------------------------------
+REPRODUÇÃO EXATA NÃO OBTIDA — não há Strategy Tester neste ambiente
+para rodar A (R4) e B (corrigido) sob as mesmas condições. Comparação
+lógica/estática apresentada em vez disso:
+
+Decisão para o ticket 104 (SELL @3962.87, 10:35:00):
+  VERSÃO BASE (R4): distância mínima calculada como
+    |3962.87 (preço de entrada) − 3970.53 (g_lastStructuralEntryPrice,
+    herdado da BUY do ticket 103, 20 min antes)| = 7.66 pontos.
+    Referência de cooldown/candle: também herdada do ticket 103 (BUY).
+  VERSÃO CORRIGIDA: distância mínima seria calculada como
+    |3962.87 − 3965.00 (g_lastStructuralEntryPrice[1]=SELL, herdado do
+    ticket 101, 80 min antes)| = 2.13 pontos — uma referência
+    significativamente diferente (mais antiga, mais próxima em preço).
+  Motivo exato da diferença: a referência de "última entrada
+  estrutural" deixa de ser contaminada por uma entrada do lado oposto.
+  NÃO COMPROVÁVEL COM OS ARTEFATOS DISPONÍVEIS se este ticket
+  especificamente teria sido bloqueado (dependeria do valor exato de
+  ATR M5 naquele instante e do valor exato de StructuralMinDistanceATR
+  ativo, nenhum dos dois disponível sem o Journal/log do teste — ver a
+  advertência de divergência de evidências na seção A). O que ESTÁ
+  comprovado por código é que a REFERÊNCIA usada para a decisão muda
+  de forma material entre as duas versões, e que a versão corrigida é
+  a única consistente com a finalidade documentada do parâmetro
+  ("distância mínima entre reforços do MESMO lado").
+
+Não foi usado lucro isolado como critério de aprovação — a correção
+não visa e não deve ser julgada por tornar o período mais lucrativo.
+
+J. RISCOS REMANESCENTES
+--------------------------------------------------------------------
+1. Compilação real não executada — risco residual de erro sintático
+   pontual, mitigado pela verificação estática exaustiva.
+2. Divergência de evidências não resolvida (seção A): não há certeza
+   absoluta de que o binário testado corresponde byte a byte a R4;
+   os valores exatos de StructuralMinDistanceATR/StructuralCooldown-
+   Seconds/StructuralMaxExtensionATR efetivamente ativos no teste
+   anexado não puderam ser confirmados com certeza total.
+3. Upgrade de estado persistido: ao atualizar de R4 para esta versão
+   em uma conta com estado já persistido (GlobalVariables antigas
+   "EELP"/"EELT"/"EELB"), essas 3 chaves antigas ficam órfãs
+   (ignoradas, não lidas) e as novas 6 chaves começam vazias — ou
+   seja, na PRIMEIRA execução após o upgrade, a cadência estrutural
+   por lado reinicia do zero (efeito transitório, único, não
+   recorrente; não afeta par inicial, motor neutro, motor tático ou
+   MFE, que têm suas próprias chaves de persistência, intocadas).
+4. `IA_FG_TACTICAL_SELL` não observado nos dados do teste anexado —
+   não investigado nesta rodada por estar fora do escopo do defeito
+   comprovado; permanece como item para investigação futura caso o
+   usuário aponte isso como sintoma específico.
+5. Todos os 40 cenários de execução real (par inicial, tetos, teto
+   global, MFE, restart, etc.) continuam BLOCKED — nenhum foi
+   executado.
+
+K. ARQUIVOS ENTREGUES
+--------------------------------------------------------------------
+| Nome | Tamanho | SHA-256 | Finalidade |
+|------|---------|---------|------------|
+| PREDATOR_FLOW_AI_V2_ADAPTIVE_BILATERAL_ENGINE_FINAL_FIXED_R4.mq5 | 310439 bytes / 8603 linhas | 1cc2de2f15fa7eef9bf0c42385611b90700f7f1da2794ec2560f82366747b9b2 | Base autorizada, preservada intacta (não sobrescrita) |
+| PREDATOR_FLOW_AI_V2_ENTRY_ENGINE_ROOT_CAUSE_FIXED.mq5 | 312134 bytes / 8621 linhas | 07ec3de24d3e6219390cc31da7359c8e6db554607564294333ff6bdeb30292ab | Arquivo corrigido — patch cirúrgico do defeito D1-D5 |
+| .ex5 | — | — | NÃO GERADO — compilação bloqueada, ver seção G |
+| entry_engine_root_cause_diff.txt | — | — | Diff unificado R4 → corrigido (+47/-29 linhas) |
+| entry_engine_root_cause_report.txt | este arquivo | — | Relatório técnico completo |
+| entry_engine_root_cause_test_matrix.txt | — | — | Matriz de testes de aceitação (20 testes) |
+| entry_engine_root_cause_compile.log | — | — | Log honesto de compilação bloqueada |
+
+L. VEREDITO FINAL
+--------------------------------------------------------------------
+APROVADO COM RESSALVAS
+
+Ressalvas explícitas: (1) compilação real com 0 erros/0 warnings ainda
+não executada; (2) Strategy Tester A/B ainda não executado; (3)
+divergência de evidências entre a lista de Inputs do HTML e os
+comentários das ordens não foi resolvida com certeza absoluta (seção
+A); (4) o mecanismo de causa-raiz (D1-D5) está comprovado por código
+e por reconstrução dos dados reais, mas o efeito NUMÉRICO exato sobre
+o ticket 104 especificamente não é comprovável sem o Journal do teste.
+====================================================================

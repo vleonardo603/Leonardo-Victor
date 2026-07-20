@@ -1,0 +1,131 @@
+====================================================================
+MATRIZ DE TESTES DE ACEITACAO (20) - ENTRY_ENGINE_ROOT_CAUSE_FIXED.mq5
+Ambiente exigido: MT5 Strategy Tester, XAUUSD M5, hedge, real ticks.
+Este ambiente (Linux) NAO executa MT5: todos os testes de runtime
+estao BLOCKED, com evidencia estatica/logica associada. Nada inventado.
+====================================================================
+
+TESTE 1 — PAR INICIAL
+  Cesta realmente zerada -> exatamente 1 BUY + 1 SELL, comentarios
+  IA_FG_INITIAL_*, sem 2a tentativa no mesmo ciclo.
+  STATUS: BLOCKED (nao tocado por este patch; CanOpenEntryRole/INITIAL
+  e OpenInitialPairAdaptive confirmados byte-identicos a R4).
+
+TESTE 2 — PAR INCOMPLETO
+  Falha de 1 perna -> bloqueia demais entradas, tenta so a ausente.
+  STATUS: BLOCKED (nao tocado; TryCompleteInitialPair byte-identica).
+
+TESTE 3 — SELL ESTRUTURAL VALIDA
+  Fluxo SELL confirmado, preco nao estendido -> autoriza 1 SELL
+  unitaria, respeita distancia/cooldown/teto/maximo.
+  STATUS: BLOCKED. Evidencia logica: com o patch, a distancia/cooldown
+  agora e medida contra a ultima SELL real (g_lastStructuralEntryPrice[1]),
+  nao contra qualquer entrada anterior.
+
+TESTE 4 — SELL ESTRUTURAL ESTENDIDA
+  Fluxo SELL, queda ja estendida -> mantem fluxo SELL, bloqueia nova
+  SELL (EXTENSION), nao vira NEUTRAL, ancora nao reinicia artificialmente.
+  STATUS: BLOCKED. Confirmado por leitura: StructuralMaxExtensionATR
+  usa g_structuralFlowAnchorPrice (nao tocado por este patch) e so
+  reseta em reversao GENUINA de sinal (cruzamento de zero) —
+  comportamento preservado.
+
+TESTE 5 — BUY ESTRUTURAL ESPELHADA
+  Espelho do Teste 3 para BUY. STATUS: BLOCKED. Mesma logica indexada
+  por g_lastStructuralEntryPrice[0].
+
+TESTE 6 — MICROCORRECAO BUY EM FLUXO SELL
+  Suspende reforco SELL, permite 1 BUY tatica, nao inverte estrutural,
+  contador so sobe apos sucesso. STATUS: BLOCKED. ManageTacticalEpisodeEntry
+  e toda a maquina tatica confirmadas byte-identicas — nao afetadas.
+
+TESTE 7 — MICROCORRECAO SELL EM FLUXO BUY
+  Espelho do Teste 6. STATUS: BLOCKED.
+
+TESTE 8 — AUSENCIA DE SINAL TATICO
+  Sem microcorrecao valida -> nenhuma tatica abre, log indica ausencia.
+  STATUS: BLOCKED (nao tocado).
+
+TESTE 9 — SINAL TATICO BLOQUEADO
+  Sinal existe mas bloqueado -> motivo exato registrado, sem falsa
+  confirmacao. STATUS: BLOCKED (nao tocado).
+
+TESTE 10 — SINAL EXPIRADO
+  Sinal estrutural ou tatico antigo nao abre posicao.
+  STATUS: BLOCKED. Para o lado estrutural, a idade agora e verificada
+  via g_lastStructuralEntryBar[side] (candle da MESMA direcao), o que
+  torna a checagem de "candle ja usado" mais precisa por lado (antes,
+  uma BUY no candle X impedia uma SELL tambem no candle X mesmo que a
+  SELL fosse logicamente independente — agora cada lado tem seu proprio
+  registro de candle).
+
+TESTE 11 — NEUTRO REAL
+  Neutro so com neutralidade confirmada, respeita distancia/cooldown,
+  nao tenta completar 4/4, nao abre durante direcao valida.
+  STATUS: BLOCKED (ramo NEUTRAL de CanOpenEntryRole nao tocado por
+  este patch — apenas o ramo STRUCTURAL foi alterado).
+
+TESTE 12 — LIMITE GLOBAL
+  8 exposicoes comprometidas -> nenhuma nova entrada.
+  STATUS: BLOCKED. total_cap = MathMin(8, LimitOpenPositions()) e a
+  checagem TOTAL_LIMIT no ramo STRUCTURAL nao foram alteradas (apenas
+  as checagens WAITING_CLOSED_BAR/COOLDOWN/DISTANCE, que vem DEPOIS do
+  TOTAL_LIMIT no codigo).
+
+TESTE 13 — TETO LATERAL
+  6/2, 5/3, 4/4, 3/5, 2/6 respeitados como limites, nao metas.
+  STATUS: BLOCKED. GetDynamicBuyLimit/GetDynamicSellLimit confirmadas
+  byte-identicas a base original; side_cap/side_total nao tocados.
+
+TESTE 14 — UMA ACAO POR CICLO
+  Nenhum ciclo abre tatica+estrutural, estrutural+neutra, neutra+legada
+  simultaneamente. STATUS: BLOCKED. g_adaptiveEntryAttemptedThisTick e
+  a estrutura de retornos mutuamente exclusivos do scheduler nao foram
+  tocados.
+
+TESTE 15 — ALLOW_BUY/ALLOW_SELL
+  Allow_BUY=false bloqueia BUY; Allow_SELL=false bloqueia SELL; par
+  bilateral exige ambas. STATUS: BLOCKED. BaseDirectionalEntryFiltersOK
+  (ramo BUY/SELL) e o gate explicito de Allow_SELL no motor neutro
+  (corrigido na rodada anterior, R4) permanecem intocados nesta rodada.
+
+TESTE 16 — MFE NAO ATIVADO
+  Posicao sem lucro minimo pode ficar com S/L=0.00; nao e defeito;
+  patch de entrada nao cria SL artificial. STATUS: BLOCKED. Confirmado
+  por design: este patch nao adiciona nenhum SL inicial nem toca em
+  nenhuma funcao MFE (44/44 preservadas).
+
+TESTE 17 — MFE ATIVADO
+  Posicao com gatilho atingido recebe protecao real, monotonica.
+  STATUS: BLOCKED. ManageUnifiedProfitStopProtection,
+  ConvertMFENetLockToPrice, SubmitUnifiedPositionStop e demais funcoes
+  MFE confirmadas byte-identicas a base — comportamento inalterado.
+
+TESTE 18 — REBUILD
+  Reinicio nao duplica, nao repete sinal consumido, nao reabre par
+  inicial com cesta ativa, mantem contagens/papeis coerentes.
+  STATUS: BLOCKED. ReconcileEntryEngineFromAccount nao foi tocada
+  (deriva do estado real da conta, nao das variaveis de cadencia
+  estrutural). LoadEntryEngineState foi estendida (3->6 chaves) mas
+  preserva a mesma logica de fallback seguro: se as chaves novas nao
+  existirem (upgrade de estado antigo), os arrays permanecem no valor
+  padrao {0,0} — equivalente a "sem cadencia estrutural registrada
+  ainda", nunca um estado invalido ou travado (fail-closed: ausencia de
+  referencia apenas faz as checagens de distancia/cooldown nao
+  bloquearem por falta de dado, o que e o MESMO comportamento que a
+  variavel escalar tinha antes de qualquer entrada estrutural ocorrer).
+
+TESTE 19 — PAINEL
+  Painel mostra leitura instantanea, fluxo estavel, regime, bloqueio e
+  episodio tatico separadamente. STATUS: BLOCKED (nao tocado; UpdatePanel
+  nao referencia as variaveis alteradas, confirmado por grep).
+
+TESTE 20 — REGRESSAO
+  Hash/diff confirmam que lote, risco, MFE, BE, Lock, saidas e demais
+  areas protegidas nao mudaram sem necessidade.
+  STATUS: PASS ESTATICO. sha256 da base registrado e inalterado
+  (1cc2de2f...); diff mostra exatamente 6 funcoes alteradas, todas
+  dentro do motor de entradas (ramo estrutural); 57 funcoes fora do
+  escopo verificadas byte-identicas; 147 inputs inalterados.
+  BLOCKED apenas quanto a confirmacao por execucao real.
+====================================================================

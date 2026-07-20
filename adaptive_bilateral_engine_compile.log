@@ -52,3 +52,16 @@ INSTRUCOES EXATAS PARA COMPILAR E TESTAR (ambiente do usuario):
   5. Validar no journal os eventos ENTRY_AUTH/ENTRY_BLOCK e a
      ausencia de novas IA_FG_ADDITIONAL_*.
 ================================================================
+
+================================================================
+ADENDO - VERSAO R3 (auditoria adversarial final, pos-R2)
+================================================================
+arquivo alvo: PREDATOR_FLOW_AI_V2_ADAPTIVE_BILATERAL_ENGINE_FINAL_FIXED_R3.mq5
+COMPILACAO REAL: NAO COMPROVADA (mesma limitacao de ambiente).
+Verificacao estatica R3: chaves 719/719, parenteses 4593/4593,
+colchetes 558/558, 228 definicoes sem duplicatas, 5 funcoes alteradas
+(exatamente as pretendidas: ConsumeEntryGrant, OpenAdaptiveUnitPosition,
+OpenInitialPairAdaptive, OpenNeutralPairControlled,
+ReconcileEntryEngineFromAccount), 0 linhas de MFE/risco tocadas.
+Ver adaptive_bilateral_engine_final_validation.txt para a Fase 1-5
+completa desta rodada de validacao.

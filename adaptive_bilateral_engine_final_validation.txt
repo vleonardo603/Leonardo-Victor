@@ -1,0 +1,330 @@
+====================================================================
+VALIDACAO FINAL - PREDATOR_FLOW_AI_V2_ADAPTIVE_BILATERAL_ENGINE_FINAL_FIXED_R3.mq5
+Data: 2026-07-20
+Base desta validacao: R2 (aprovado com ressalvas anteriormente) + esta
+auditoria adversarial final, que produziu R3 (unica alteracao desde R2).
+Nenhuma reescrita, nenhum novo motor, nenhuma refatoracao. Apenas os
+dois defeitos abaixo foram corrigidos; todo o resto foi apenas lido.
+====================================================================
+
+FASE 1 — REVISAO FINAL DO CODIGO
+--------------------------------------------------------------------
+Metodologia: releitura linha a linha do R2 (nao do relatorio), com
+grep dirigido as 10 categorias pedidas + leitura de corpo completo das
+funcoes de risco (grant lifecycle, reconciliacao pos-restart, scheduler,
+episodio tatico, reset de ciclo).
+
+DEFEITO 1 CONFIRMADO — checagem de role posterior ao consumo do grant
+  (categoria: bypass da autoridade central / inconsistencia logica)
+  Causa-raiz: `ConsumeEntryGrant(direction)` (R2, linha 3602) validava
+  apenas ciclo+direcao e marcava `g_entryGrantConsumed=true` ANTES de
+  qualquer verificacao de papel (role). Os tres consumidores tratavam
+  o papel de formas diferentes e inconsistentes:
+    - OpenInitialPairAdaptive (L3714) e OpenNeutralPairControlled
+      (L3848): checavam `g_entryGrantRole` DEPOIS de chamar
+      ConsumeEntryGrant, via `||` — ou seja, um grant emitido para
+      OUTRO papel seria consumido (queimado) antes de a funcao
+      perceber que nao era dela e devolver false.
+    - OpenAdaptiveUnitPosition (L2970), a funcao mais usada (serve
+      STRUCTURAL e TACTICAL), NAO VERIFICAVA ROLE NENHUMA — aceitava
+      qualquer grant valido na direcao pedida, de qualquer papel.
+  Risco demonstrado: nao ha, hoje, nenhum caminho de chamada real que
+  explore isso (o scheduler so chama uma unica funcao Open* por tick,
+  na mesma ramificacao que gerou o grant), portanto NAO havia entrada
+  duplicada nem exposicao invalida em producao. Porem a autoridade
+  central deixava de ser uma garantia estrutural e passava a depender
+  de uma coincidencia do grafo de chamadas atual — qualquer alteracao
+  futura no scheduler poderia reintroduzir um bypass silencioso.
+  Correcao aplicada (R3, cirurgica): `ConsumeEntryGrant` passou a
+  receber `role` e validar direcao+papel ATOMICAMENTE antes de marcar
+  consumido; `OpenAdaptiveUnitPosition` deriva o papel esperado do
+  proprio comentario (`TACTICAL` vs `STRUCTURAL`) e passa a exigir
+  esse papel explicitamente. 5 pontos alterados: 1 prototipo, 1
+  definicao, 3 chamadores. Nenhuma logica de negocio (tetos, cooldown,
+  ATR, risco) foi tocada.
+
+DEFEITO 2 CONFIRMADO — deteccao de INITIAL_PAIR_PARTIAL apos restart
+  dependia de um flag que nao sobrevive a perda de persistencia
+  (categoria: erro de reconstrucao apos restart)
+  Causa-raiz: `ReconcileEntryEngineFromAccount` (R2, linhas 4198-4206)
+  so marcava `g_initialPairPartial=true` SE `g_initialPairRequested`
+  fosse verdadeiro. Esse flag e carregado por `LoadEntryEngineState`,
+  que retorna imediatamente (sem tocar em nenhuma variavel) quando a
+  GlobalVariable de versao nao existe — ou seja, `g_initialPairRequested`
+  fica no valor padrao `false` sempre que a persistencia estiver
+  ausente (primeiro attach do EA num grafico com posicoes herdadas,
+  reset de dados do terminal, GlobalVariables limpas manualmente,
+  etc.). Nesse cenario, mesmo com a conta mostrando exatamente 1 perna
+  INITIAL aberta e a outra ausente — e mesmo com
+  `g_initialBuyConfirmed`/`g_initialSellConfirmed` corretamente
+  derivados da conta duas linhas acima — o codigo forcava
+  `g_initialPairPartial=false`, escondendo uma cesta inicial
+  genuinamente incompleta e permitindo que estrutural/tatica/neutra
+  fossem autorizadas sobre uma base assimetrica.
+  Isso contraria diretamente o principio ja declarado no relatorio
+  anterior ("o estado real da conta e a fonte de verdade") e a
+  exigencia explicita de detectar par inicial incompleto apos reinicio.
+  Correcao aplicada (R3, cirurgica): a condicao passou a depender
+  exclusivamente de `g_initialBuyConfirmed != g_initialSellConfirmed`,
+  que ja e derivado da conta real nas duas linhas imediatamente
+  anteriores — removendo o gate desnecessario. 1 funcao, 4 linhas
+  substituidas por 1. Testado por leitura: cesta vazia -> ambos false
+  -> partial=false (correto); cesta com ambas as pernas -> ambos true
+  -> partial=false (correto); cesta com 1 perna apenas -> partial=true
+  (agora corretamente detectado, antes era mascarado sem persistencia).
+
+VERIFICACOES ADICIONAIS FEITAS NESTA FASE (sem defeito encontrado):
+  - Deadlock teorico entre `total==0` e `g_initialPairPartial` residual:
+    verificado que `PrepareAdaptiveFlowForBasket` (funcao NAO alterada,
+    byte-identica a base) chama `ResetAdaptiveFlowCycle` sempre que a
+    cesta volta a ficar vazia, ANTES do scheduler rodar no mesmo tick,
+    e `ResetAdaptiveFlowCycle` zera `g_initialPairPartial`. Sem risco.
+  - Reconciliacao de perna "confirmada mas depois fechada" (TryComplete-
+    InitialPair): usa `!g_initialBuyConfirmed`/`!g_initialSellConfirmed`
+    como criterio primario (nao apenas exposicao ao vivo), portanto uma
+    perna que fechou pelo MFE/BE/SL apos ser confirmada NUNCA e tratada
+    como "ausente" — confirma a garantia contra reposicao artificial.
+  - Ciclo de vida do estado TACTICAL_STATE_EXPIRED: e um estado de
+    repouso deliberado (bloqueia novas ordens) ate que a logica de
+    candle fechado (independente do sub-estado) encerre o episodio por
+    um dos motivos ja existentes (retomada estrutural, timeout neutro,
+    max barras). Nao e um estado preso/impossivel.
+  - Decremento de `g_inFlightBuy/Sell`: protegido contra valores
+    negativos (`if(...>0) ...--`); nao ha crash nem contagem invalida.
+  - `PrepareAdaptiveFlowForBasket` e outras 25 funcoes de MFE/risco/
+    fluxo/scheduler auxiliares: confirmadas inalteradas entre base/R2/R3.
+
+DECLARACAO EXPLICITA: fora dos dois defeitos acima, NENHUMA
+INCONSISTENCIA ADICIONAL FOI ENCONTRADA nas categorias solicitadas
+(condicoes de corrida, caminhos mortos, duplicidade de entradas,
+regressoes, contadores incorretos, vazamentos de estado).
+
+====================================================================
+FASE 2 — PRE-COMPILACAO (riscos, NAO um resultado de compilador)
+--------------------------------------------------------------------
+COMPILACAO REAL: NAO COMPROVADA. (Sem MetaEditor/MetaTrader neste
+ambiente Linux; nenhum log de compilador foi gerado ou inventado.)
+
+Riscos potenciais identificados por leitura (nenhum confirmado como
+erro real, pois isso exige o compilador MQL5):
+1. `ENUM_ENTRY_ROLE` vs `int` em comparacoes (`g_entryGrantRole` e
+   `int`, comparado com `(int)role`) — padrao ja usado em dezenas de
+   pontos do arquivo original; risco de warning de conversao, nao de
+   erro.
+2. `StringFind(comment, "TACTICAL")` dentro de `OpenAdaptiveUnitPosition`
+   pressupoe que os unicos comentarios passados a essa funcao contenham
+   literalmente "STRUCTURAL" ou "TACTICAL" — verdade para os dois unicos
+   chamadores (`TacticalOrderComment` e o literal "IA_FG_STRUCTURAL_*");
+   nenhum outro chamador existe (confirmado por auditoria de chamadores).
+3. Uso de `IntegerToString((long)...)` em varios pontos — padrao ja
+   presente no arquivo base, sem alteracao de assinatura nesta rodada.
+4. Nenhuma funcao chamada sem definicao ou prototipo (auditoria de
+   identificadores capitalizados cruzada contra definicoes + lista de
+   builtins MQL5/CTrade).
+5. Nenhum enum, struct ou macro duplicado introduzido por R3 (apenas
+   assinatura de `ConsumeEntryGrant` mudou; unico ponto de definicao).
+6. Balanceamento sintatico integral: chaves 719/719, parenteses
+   4593/4593, colchetes 558/558; 228 definicoes de funcao, 0 duplicadas.
+7. `#property strict` esta ativo no cabecalho do arquivo (heranca do
+   original) — isso torna o compilador MQL5 mais rigoroso quanto a
+   conversoes implicitas; qualquer erro de tipo sera sinalizado no F7,
+   nao aqui.
+
+Nenhum destes riscos e uma prova de erro. Only o MetaEditor decide.
+
+====================================================================
+FASE 3 — ROTEIRO DE VALIDACAO NO STRATEGY TESTER (a ser executado pelo
+usuario; nenhum resultado abaixo foi produzido ou inventado)
+--------------------------------------------------------------------
+Configuracao fixa para todos os testes: XAUUSD, M5, conta hedge,
+"Every tick based on real ticks", lote 0.02 (ou o do SET do usuario),
+sem otimizacao. Usar o MESMO periodo do relatorio HTML original
+(2026.07.01-2026.07.03) pelo menos uma vez, para comparacao por role.
+
+1) PAR INICIAL
+   Objetivo: confirmar que uma cesta zerada abre exatamente 1 BUY + 1
+   SELL, nunca mais que isso no mesmo ciclo.
+   Evidencia esperada: journal com BASKET_FLAT_DETECTED ->
+   INITIAL_PAIR_REQUEST -> INITIAL_PAIR_CONFIRMED; exatamente 2 tickets
+   novos; comentarios IA_FG_INITIAL_BUY/SELL.
+   Motivo de reprovacao: qualquer 3o ticket no mesmo ciclo; ausencia de
+   um dos dois comentarios; par duplicado no mesmo tick.
+
+2) ESTRUTURAL BUY
+   Objetivo: confirmar que fluxo BUY (moderado e forte) abre somente
+   IA_FG_STRUCTURAL_BUY, uma por autorizacao.
+   Evidencia esperada: ENTRY_AUTH role=STRUCTURAL side=BUY seguido de
+   STRUCTURAL_ENTRY_CONFIRMED; nenhuma SELL comum simultanea.
+   Motivo de reprovacao: abertura de SELL nao-tatica durante fluxo BUY;
+   mais de uma STRUCTURAL_BUY no mesmo candle fechado.
+
+3) ESTRUTURAL SELL
+   Objetivo: espelho do teste 2 (cenario da causa-raiz original: SELL
+   moderado, teto 3/5, sem nenhuma STRUCTURAL_SELL abrindo).
+   Evidencia esperada: ENTRY_AUTH role=STRUCTURAL side=SELL efetivamente
+   ocorrendo quando fluxo, teto, distancia, cooldown e risco permitirem.
+   Motivo de reprovacao: fluxo SELL confirmado no painel sem NENHUMA
+   STRUCTURAL_SELL autorizada ao longo de varios candles validos
+   (reproduziria o defeito original).
+
+4) TATICA BUY
+   Objetivo: microcorrecao BUY dentro de fluxo SELL abre exatamente 1
+   IA_FG_TACTICAL_BUY; fluxo estrutural permanece SELL.
+   Evidencia esperada: TACTICAL_DETECTED -> STRUCTURAL_PAUSED_BY_
+   CORRECTION -> TACTICAL_ORDER_CONFIRMED -> TACTICAL_CONSUMED.
+   Motivo de reprovacao: segunda TACTICAL_BUY no mesmo episodio; fluxo
+   estrutural mudando para BUY por causa da correcao.
+
+5) TATICA SELL
+   Espelho do teste 4 (microcorrecao SELL dentro de fluxo BUY). A
+   ausencia historica de TACTICAL_SELL no HTML anterior NAO e prova de
+   funcionamento — este cenario deve ser reproduzido deliberadamente.
+   Motivo de reprovacao: igual ao teste 4, espelhado.
+
+6) NEUTRO
+   Objetivo: confirmar bilateralidade controlada sem rajada — para em
+   3 BUY + 3 SELL pela reserva estrutural antes do teto 4/4.
+   Evidencia esperada: NEUTRAL_PAIR_REQUEST/CONFIRMED espacados por
+   >=600s e >=2 candles neutros; bloqueio STRUCTURAL_SLOT_RESERVED no
+   4o par tentado.
+   Motivo de reprovacao: preenchimento imediato de 4/4; par neutro por
+   candle; qualquer comentario ADDITIONAL no periodo neutro.
+
+7) TETO 8 (maximo absoluto)
+   Objetivo: exposicao potencial (abertas+pendentes+transito) nunca
+   ultrapassa 8 em nenhum papel.
+   Evidencia esperada: ENTRY_BLOCK reason=TOTAL_LIMIT ao tentar a 9a.
+   Motivo de reprovacao: qualquer 9a posicao/pendente/transito
+   simultanea, em qualquer combinacao de papeis.
+
+8) LIMITES 6/2, 5/3, 4/4 (e espelhados 3/5, 2/6)
+   Objetivo: tetos funcionam como limites de admissao, nao metas.
+   Evidencia esperada: ENTRY_BLOCK reason=SIDE_LIMIT no lado saturado;
+   posicoes existentes no lado saturado permanecem geridas normalmente
+   (nunca fechadas so para "equilibrar").
+   Motivo de reprovacao: EA abrindo posicoes so para completar a
+   proporcao do teto; fechamento arbitrario por desequilibrio.
+
+9) AUSENCIA TOTAL DE IA_FG_ADDITIONAL
+   Objetivo: nenhuma nova posicao com esse comentario no modo
+   assimetrico, mesmo com o SET de distancias zeradas usado no HTML
+   original.
+   Evidencia esperada: comparacao por role do relatorio gerado com o
+   HTML anterior — contagem ADDITIONAL = 0 (era 156/248 = 63%).
+   Motivo de reprovacao: qualquer novo ticket com comentario
+   IA_FG_ADDITIONAL_BUY/SELL.
+
+10) AUSENCIA DE REPOSICAO ARTIFICIAL
+    Objetivo: fechamento de qualquer posicao (MFE/BE/SL/risco) apenas
+    libera slot; nenhuma abertura automatica no mesmo evento ou tick
+    seguinte sem nova autorizacao completa (cadencia/distancia/teto).
+    Evidencia esperada: STRUCTURAL_SLOT_RELEASED (ou equivalente) sem
+    ENTRY_AUTH imediatamente a seguir no mesmo tick; nova entrada so
+    aparece apos cooldown/candle novo cumprido.
+    Motivo de reprovacao: qualquer abertura no mesmo tick/evento do
+    fechamento; reabertura do MESMO lado/papel sem cadencia cumprida.
+
+11) CONSUMO TATICO CORRETO
+    Objetivo: contador tatico so incrementa apos confirmacao
+    transacional real (OnTradeTransaction), nunca no envio.
+    Evidencia esperada: TACTICAL_ORDER_REQUESTED -> (deal real) ->
+    TACTICAL_ORDER_CONFIRMED -> TACTICAL_CONSUMED; se rejeitado,
+    TACTICAL_ORDER_REJECTED sem incremento e retorno a ACTIVE dentro da
+    janela valida.
+    Motivo de reprovacao: contador tatico=1 sem posicao/deal real
+    correspondente; segunda tatica autorizada apos rejeicao da primeira
+    fora da janela.
+
+12) RETOMADA ESTRUTURAL
+    Objetivo: apos o fim do episodio tatico, estrutural so retoma com
+    um NOVO candle fechado a favor do fluxo original.
+    Evidencia esperada: STRUCTURAL_RESUME_WAIT ate o candle certo ->
+    STRUCTURAL_RESUME_CONFIRMED -> nova STRUCTURAL_* autorizada.
+    Motivo de reprovacao: reforco estrutural no mesmo candle que
+    encerrou o episodio tatico; estrutura presa mesmo com candle
+    favoravel confirmado (bloqueio permanente indevido).
+
+13) MFE (regressao)
+    Objetivo: confirmar que a curva 2->1, ativacao, lock e
+    monotonicidade do patch anterior permanecem intactas (nenhuma
+    funcao MFE foi tocada nesta ou nas duas rodadas anteriores).
+    Evidencia esperada: MFE_ARMED em +2 USD liquido, MFE_SL_CONFIRMED
+    com lock +1 USD, degraus 2/4/6/8 -> lock 1/2/3/4.
+    Motivo de reprovacao: qualquer desvio da tabela 2->1 ja validada.
+
+14) TRAILING / SL SERVIDOR
+    Objetivo: SL nunca retrocede (BUY so sobe, SELL so desce); SL
+    confirmado no servidor corresponde ao solicitado dentro de 1 tick.
+    Evidencia esperada: MFE_SL_REQUEST -> MFE_SL_CONFIRMED com
+    actual_sl == requested_sl (tolerancia de 1 tick); nenhum
+    MFE_SL_NO_IMPROVEMENT seguido de piora.
+    Motivo de reprovacao: SL reduzido, zerado, ou aplicado a ticket
+    errado.
+
+15) REINICIO DO TERMINAL
+    Objetivo: reiniciar o EA com cesta ativa (inclusive com par inicial
+    incompleto de proposito) e confirmar reconstrucao correta — este e
+    o cenario diretamente corrigido pelo Defeito 2 desta rodada.
+    Evidencia esperada: ENTRY_ENGINE_REBUILT no log de OnInit mostrando
+    a contagem real por papel; se so 1 perna INITIAL estiver aberta,
+    painel deve mostrar par inicial PARCIAL e bloquear as demais roles
+    ate completar ou esgotar a retentativa — mesmo sem GlobalVariables
+    previas (apagar as variaveis do simbolo antes do teste para forcar
+    o cenario "persistencia ausente").
+    Motivo de reprovacao: par inicial incompleto NAO detectado apos
+    reinicio sem persistencia (reproduziria o Defeito 2, ja corrigido
+    em R3); tatica ou estrutural duplicada apos reinicio.
+
+====================================================================
+FASE 4 — CHECKLIST FINAL DE APROVACAO
+--------------------------------------------------------------------
+[IMPLEMENTADO]      Autoridade central unica (CanOpenEntryRole + grant
+                     atomico de papel+direcao, corrigido nesta rodada)
+[IMPLEMENTADO]      Bloqueio do motor legado ADDITIONAL no modo asim.
+[IMPLEMENTADO]      Par inicial com estado PARTIAL e retentativa unica
+[IMPLEMENTADO]      Deteccao de par inicial incompleto apos restart
+                     (corrigido nesta rodada — Defeito 2)
+[IMPLEMENTADO]      Estrutural desacoplado dos inputs ADDITIONAL
+[IMPLEMENTADO]      Tatica com expiracao por idade, invalidacao ATR,
+                     consumo somente transacional, 1 por episodio
+[IMPLEMENTADO]      Retomada estrutural exigindo novo candle a favor
+[IMPLEMENTADO]      Neutro gradual controlado com reserva estrutural
+[IMPLEMENTADO]      Tetos 6/2-5/3-4/4-3/5-2/6 como limites, max 8
+[IMPLEMENTADO]      Exposicao potencial = abertas+pendentes+transito
+[IMPLEMENTADO]      Scheduler unico, 1 solicitacao por tick
+[IMPLEMENTADO]      OnTimer/OnTradeTransaction sem abertura de posicao
+[IMPLEMENTADO]      Throttle pos-falha de envio (corrigido na rodada
+                     anterior R1->R2)
+[IMPLEMENTADO]      Telemetria deterministica (ENTRY_AUTH/BLOCK etc.)
+[IMPLEMENTADO]      Preservacao de MFE/BE/SL/risco/lote (verificacao
+                     automatizada byte a byte, 3 rodadas consecutivas)
+[COMPROVADO]        Balanceamento sintatico e ausencia de duplicatas
+                     (verificacao estatica automatizada, R3)
+[COMPROVADO]        Ausencia de bypass de autoridade no grafo de
+                     chamadas ATUAL (auditoria de chamadores, 3
+                     rodadas)
+[PENDENTE DE RUNTIME] Compilacao real com 0 erros
+[PENDENTE DE RUNTIME] Todos os 15 roteiros da Fase 3 no Strategy Tester
+[PENDENTE DE RUNTIME] Comparacao por role com o HTML original
+[PENDENTE DE RUNTIME] Forward test em conta demo
+[PENDENTE DE RUNTIME] Qualquer uso em conta FTMO ou real
+
+====================================================================
+FASE 5 — VEREDITO
+--------------------------------------------------------------------
+Implementacao:      APROVADO
+Auditoria Estatica: APROVADO
+Compilacao:         PENDENTE
+Strategy Tester:    PENDENTE
+Forward Demo:       PENDENTE
+FTMO:               PENDENTE
+
+Arquivo final desta rodada: PREDATOR_FLOW_AI_V2_ADAPTIVE_BILATERAL_ENGINE_FINAL_FIXED_R3.mq5
+(R2 e todas as versoes anteriores preservadas intactas; diff R2->R3 em
+adaptive_bilateral_engine_r3_diff.txt, +9/-11 linhas em 5 pontos).
+
+Conforme a regra final desta tarefa: nenhum outro defeito foi
+encontrado alem dos dois acima. Nenhuma alteracao adicional foi feita.
+O projeto entra em fase de compilacao, Strategy Tester e forward test
+— nenhuma etapa de codigo permanece em aberto do lado desta auditoria.
+====================================================================

@@ -1,0 +1,65 @@
+--- PREDATOR_FLOW_AI_V2_ADAPTIVE_BILATERAL_ENGINE_FINAL_FIXED_R2.mq5	2026-07-20 09:08:13.126322322 +0000
++++ PREDATOR_FLOW_AI_V2_ADAPTIVE_BILATERAL_ENGINE_FINAL_FIXED_R3.mq5	2026-07-20 12:29:19.777932992 +0000
+@@ -749,7 +749,7 @@
+ string MapAdaptiveBlockReasonToEntryReason();
+ void LogEntryDecision(bool authorized, ENUM_ENTRY_ROLE role, ENUM_ORDER_TYPE direction, string reason);
+ bool CanOpenEntryRole(ENUM_ENTRY_ROLE role, ENUM_ORDER_TYPE direction, string &block_reason);
+-bool ConsumeEntryGrant(ENUM_ORDER_TYPE direction);
++bool ConsumeEntryGrant(ENUM_ORDER_TYPE direction, ENUM_ENTRY_ROLE role);
+ void RegisterEntryInFlight(ENUM_ORDER_TYPE direction);
+ void ReconcileInFlightEntries();
+ void SyncEntryEngineWithFlow();
+@@ -2967,7 +2967,8 @@
+    if(order_type != ORDER_TYPE_BUY && order_type != ORDER_TYPE_SELL)
+       return false;
+ 
+-   if(!ConsumeEntryGrant(order_type))
++   ENUM_ENTRY_ROLE expected_role = (StringFind(comment, "TACTICAL") >= 0 ? ENTRY_ROLE_TACTICAL : ENTRY_ROLE_STRUCTURAL);
++   if(!ConsumeEntryGrant(order_type, expected_role))
+    {
+       LogMessage("[ENTRY_WITHOUT_GRANT] comment=" + comment);
+       return false;
+@@ -3599,11 +3600,11 @@
+    return false;
+ }
+ 
+-bool ConsumeEntryGrant(ENUM_ORDER_TYPE direction)
++bool ConsumeEntryGrant(ENUM_ORDER_TYPE direction, ENUM_ENTRY_ROLE role)
+ {
+    if(g_entryGrantConsumed || g_entryGrantCycle != g_moneySnapshotCycle)
+       return false;
+-   if(g_entryGrantDirection != (int)direction)
++   if(g_entryGrantDirection != (int)direction || g_entryGrantRole != (int)role)
+       return false;
+ 
+    g_entryGrantConsumed = true;
+@@ -3711,7 +3712,7 @@
+ 
+ bool OpenInitialPairAdaptive()
+ {
+-   if(!ConsumeEntryGrant(ORDER_TYPE_BUY) || g_entryGrantRole != (int)ENTRY_ROLE_INITIAL)
++   if(!ConsumeEntryGrant(ORDER_TYPE_BUY, ENTRY_ROLE_INITIAL))
+    {
+       LogMessage("[ENTRY_WITHOUT_GRANT] role=INITIAL");
+       return false;
+@@ -3845,7 +3846,7 @@
+ 
+ bool OpenNeutralPairControlled()
+ {
+-   if(!ConsumeEntryGrant(ORDER_TYPE_BUY) || g_entryGrantRole != (int)ENTRY_ROLE_NEUTRAL)
++   if(!ConsumeEntryGrant(ORDER_TYPE_BUY, ENTRY_ROLE_NEUTRAL))
+    {
+       LogMessage("[ENTRY_WITHOUT_GRANT] role=NEUTRAL");
+       return false;
+@@ -4200,10 +4201,7 @@
+    if(has_initial_sell)
+       g_initialSellConfirmed = true;
+ 
+-   if(g_initialPairRequested)
+-      g_initialPairPartial = (g_initialBuyConfirmed != g_initialSellConfirmed);
+-   else
+-      g_initialPairPartial = false;
++   g_initialPairPartial = (g_initialBuyConfirmed != g_initialSellConfirmed);
+ 
+    int neutral_pairs_open = MathMin(g_exposure.open_buy[(int)ROLE_NEUTRAL],
+                                     g_exposure.open_sell[(int)ROLE_NEUTRAL]);

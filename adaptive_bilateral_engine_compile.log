@@ -1,0 +1,54 @@
+================================================================
+COMPILE LOG - PREDATOR_FLOW_AI_V2_ADAPTIVE_BILATERAL_ENGINE_FINAL_FIXED.mq5
+================================================================
+data: 2026-07-19
+arquivo alvo: PREDATOR_FLOW_AI_V2_ADAPTIVE_BILATERAL_ENGINE_FINAL_FIXED.mq5
+
+erros:      NAO VERIFICADO - COMPILACAO NAO EXECUTADA
+warnings:   NAO VERIFICADO - COMPILACAO NAO EXECUTADA
+compilador: INDISPONIVEL NESTE AMBIENTE
+
+STATUS: BLOCKED
+
+DECLARACAO EXATA (exigida pelo prompt):
+"Implementacao concluida e auditada estaticamente, mas ainda nao
+comprovada por compilacao e execucao reais."
+
+MOTIVO: container Linux x86_64 sem MetaEditor/MetaTrader/Wine. O
+compilador MQL5 e exclusivo do ecossistema MetaTrader/Windows.
+Nenhum resultado de compilacao foi inventado.
+
+OBSERVACAO FACTUAL: o arquivo-base desta versao
+(PREDATOR_FLOW_AI_V2_MFE_TRAILING_INTEGRATION_FIXED.mq5, md5
+4c4f0d19ccf399cb8126240cd1dcdacf) foi comprovadamente compilado e
+executado pelo usuario no Strategy Tester (o relatorio HTML anexado
+foi gerado por ele em XAUUSD M5 real ticks). Isso valida a base, NAO
+a nova versao.
+
+VERIFICACAO ESTATICA EXECUTADA (substituta, nao equivalente):
+  chaves 718/718, parenteses 4582/4582, colchetes 558/558
+  aspas: nenhuma linha impar
+  definicoes: 228 unicas (base 205; +23 novas; 0 removidas; 0 duplicadas)
+  MFE/risco/fluxo/handlers: 42/42 funcoes byte-identicas a base
+    (incl. ManageUnifiedProfitStopProtection, ConvertMFENetLockToPrice,
+     SubmitUnifiedPositionStop, ManageBasketDrawdown, ManageDailyRisk,
+     OnTick, OnTimer, GetDynamicBuyLimit/SellLimit, NormalizeVolume)
+  motor de entradas: 19/19 funcoes alteradas conforme o escopo
+  caminhos de ordem: 15 ocorrencias, todas em conteineres esperados
+  identificadores novos: 49/49 declarados e usados
+  invariantes de valor: 12/12 (lote, magic, max 8, MFE 2->1, risco)
+  eventos de telemetria: 31/31 | motivos de bloqueio: 28/28
+  CRLF preservado (padrao MetaEditor)
+
+INSTRUCOES EXATAS PARA COMPILAR E TESTAR (ambiente do usuario):
+  1. Copiar o arquivo para MQL5\Experts\ do terminal.
+  2. MetaEditor -> abrir o arquivo -> F7 (ou linha de comando:
+     metaeditor64.exe /compile:"MQL5\Experts\PREDATOR_FLOW_AI_V2_ADAPTIVE_BILATERAL_ENGINE_FINAL_FIXED.mq5" /log)
+  3. Exigir 0 erros. Em caso de erro, reportar a linha exata.
+  4. Strategy Tester: XAUUSD, M5, conta hedge, "Every tick based on
+     real ticks", lote 0.02 (ou o do SET), sem otimizacao,
+     preferencialmente o MESMO periodo do relatorio anterior
+     (2026.07.01-2026.07.03) para comparacao por role.
+  5. Validar no journal os eventos ENTRY_AUTH/ENTRY_BLOCK e a
+     ausencia de novas IA_FG_ADDITIONAL_*.
+================================================================

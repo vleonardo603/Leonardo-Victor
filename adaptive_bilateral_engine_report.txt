@@ -1,0 +1,326 @@
+====================================================================
+RELATORIO TECNICO - MOTOR BILATERAL ADAPTATIVO ASSIMETRICO
+PREDATOR_FLOW_AI_V2_ADAPTIVE_BILATERAL_ENGINE_FINAL_FIXED.mq5
+Data: 2026-07-19 | Base: PREDATOR_FLOW_AI_V2_MFE_TRAILING_INTEGRATION_FIXED.mq5
+(md5 da base 4c4f0d19ccf399cb8126240cd1dcdacf, identica ao upload; original preservado)
+====================================================================
+
+RESUMO OBJETIVO (exigido pela secao 31)
+--------------------------------------------------------------------
+Arquivo criado: PREDATOR_FLOW_AI_V2_ADAPTIVE_BILATERAL_ENGINE_FINAL_FIXED.mq5
+Original preservado: SIM (byte a byte; md5 conferido)
+Funcoes alteradas: 19 | Funcoes novas: 23 | Removidas: 0
+Caminhos de entrada auditados: 15 ocorrencias de envio (tabela abaixo)
+Compilacao: BLOCKED (sem MetaEditor neste ambiente; nada inventado)
+Testes de execucao: BLOCKED (sem Strategy Tester; nada inventado)
+Itens totalmente implementados (estatico): autoridade central, bloqueio
+  ADDITIONAL, papel por comentario, snapshot de exposicao com pendentes
+  e transito, reservas funcionais, scheduler unico com prioridade,
+  expiracao tatica por idade, invalidacao ATR, retomada estrutural
+  confirmada, par inicial com perna ausente, neutro gradual controlado,
+  persistencia/restauracao, painel/logs deterministicos.
+Itens parciais: nenhum em codigo; comprovacao de runtime pendente.
+Itens nao comprovados: compilacao 0-erros; os 40 cenarios em execucao.
+Riscos residuais: listados na secao M.
+
+A. VEREDITO DA AUDITORIA INICIAL
+--------------------------------------------------------------------
+O relatorio HTML anexado (XAUUSD M5, 2026.07.01-03, 100% real ticks,
+248 entradas, resultado -234.87, DD max 601.73) comprova o defeito
+descrito: o motor legado de pares adicionais dominou a operacao e o
+motor tatico ficou inerte. A leitura estrutural e o MFE monetario
+funcionaram; o problema e de AUTORIDADE DE ENTRADAS.
+
+B. CAUSAS-RAIZ CONFIRMADAS (diagnostico da secao 2/22, com evidencia)
+--------------------------------------------------------------------
+1. ADDITIONAL repetitivo: CONFIRMADO. 78 IA_FG_ADDITIONAL_BUY + 78
+   IA_FG_ADDITIONAL_SELL = 156 de 248 entradas (62,9%). Origem: no
+   scheduler antigo, fluxo neutro chamava CanOpenAdditionalPair() ->
+   OpenBuySellPair(true) a cada janela de 120 s/candle; com o SET do
+   usuario (First_step=0, Minimum_price_distance=0,
+   Distance_between_orders=0) nao havia trava de distancia.
+2. Inputs legados comandando entradas no modo assimetrico: CONFIRMADO.
+   CanOpenAdaptiveUnitEntry exigia OpenAdditionalPairsWhileBasketActive
+   E OpenAdditionalPairsUntilMaxPositions para autorizar QUALQUER
+   reforco estrutural ou tatica (linha ~2650 da base). Desligar os
+   pares (a correcao natural do usuario) matava tambem o estrutural —
+   exatamente o sintoma da secao 22 (SELL moderado confirmado, teto
+   3/5, e nenhuma STRUCTURAL_SELL aberta).
+3. Caminhos alternativos de abertura: MAPEADOS (tabela C). Nenhum em
+   OnTimer; nenhum em OnTradeTransaction; gestao de cesta so fecha.
+4. Roles no HTML: INITIAL 15+15, ADDITIONAL 78+78, STRUCTURAL 24 BUY +
+   37 SELL, TACTICAL 1 BUY + 0 SELL, NEUTRAL/UNKNOWN 0.
+5. Slots ocupados por pares adicionais: CONFIRMADO (62,9% do volume de
+   entradas; media de ~5 pares adicionais por ciclo de cesta).
+6. Motor tatico sem slot/prioridade: CONFIRMADO (1 tatica em 3 dias;
+   autorizacao dependia dos mesmos gates dos pares + cooldown/distancia
+   compartilhados). A ausencia de TACTICAL_SELL no periodo NAO e prova
+   de funcionamento — cenarios deterministicos exigidos na matriz.
+7. Reposicao automatica apos MFE: NAO ocorre reposicao direta por
+   fechamento; porem o ciclo neutro reabria pares por cadencia,
+   produzindo efeito equivalente. Bloqueado pelo novo motor.
+8. Autorizacao tatica mantida por varios candles: CONFIRMADO no codigo
+   antigo (estado ACTIVE persistia ate o fim do episodio sem idade
+   maxima de entrada). Corrigido com TacticalMaxEntryAgeBars=1 +
+   TACTICAL_STATE_EXPIRED.
+9. Estado de microcorrecao vs posicao tatica: o codigo antigo ja
+   separava episodio/posicao (CONSUMED persiste apos fechamento);
+   agora ha tambem flags explicitas (consumido/expirado/retomada) e
+   painel dedicado.
+10. Contadores historicos ocupando exposicao: REFUTADO — contadores
+    usam posicoes vivas; mantido e agora estendido com pendentes +
+    ordens em transito por papel.
+
+C. MAPA COMPLETO DOS CAMINHOS DE ABERTURA (auditoria da secao 31)
+--------------------------------------------------------------------
+| Chamada           | Funcao                      | Papel        | Autoridade central       | Modo assimetrico | Risco residual |
+| trade.Buy/Sell    | OpenInitialPairAdaptive     | INITIAL      | SIM (CanOpenEntryRole+grant) | SIM (unico caminho inicial) | nenhum |
+| trade.Buy/Sell    | TryCompleteInitialPair      | INITIAL(retry perna ausente) | via scheduler (prioridade 2) + gates proprios: risco duro, cooldown, limite 1 tentativa, transito | SIM | soft DD nao bloqueia a retentativa (integridade da cesta; documentado) |
+| trade.Buy/Sell    | OpenNeutralPairControlled   | NEUTRAL      | SIM (grant obrigatorio)  | SIM | rollback fecha perna unica se par parcial |
+| trade.Buy/Sell    | OpenAdaptiveUnitPosition    | STRUCTURAL/TACTICAL | SIM (grant obrigatorio; ENTRY_WITHOUT_GRANT recusa) | SIM | nenhum |
+| trade.Buy/Sell    | OpenBuySellPair             | LEGACY (inicial/adicional legado) | gates legados (CanOpenNewPair/CanOpenAdditionalPair) | NAO - guard recusa com LEGACY_ADDITIONAL_BLOCKED | so modo legado |
+| trade.BuyStop/BuyLimit  | PlaceDynamicBuyPending  | PENDING legado | gates legados | NAO - guard + cancelamento existente | so modo legado |
+| trade.SellStop/SellLimit| PlaceDynamicSellPending | PENDING legado | gates legados | NAO - guard | so modo legado |
+| OrderSend         | SubmitUnifiedPositionStop   | NAO E ENTRADA (TRADE_ACTION_SLTP, modificacao de SL do MFE) | n/a | SIM (gestao) | nenhum |
+Sem OrderSendAsync, sem PositionOpen, sem wrappers ocultos (grep integral).
+No modo assimetrico os UNICOS caminhos capazes de abrir posicao sao os
+quatro primeiros — todos por grant da autoridade ou pelo sub-fluxo
+mandatorio de completar a perna inicial. Pendentes novas: bloqueadas no
+modo assimetrico (classificacao segura de pendentes legadas nao e
+garantida — decisao prevista pela secao 19, documentada).
+
+D. ARQUITETURA IMPLEMENTADA
+--------------------------------------------------------------------
+AUTORIDADE CENTRAL: CanOpenEntryRole(role, direction, &block_reason)
+  reconstroi o snapshot IMEDIATAMENTE antes de decidir (secao 18),
+  valida risco (daily -> hard -> soft com politica dominante),
+  filtros (spread/horario/sessao/hedge), tetos dinamicos 6/2-5/3-4/4
+  (via GetDynamicBuyLimit/SellLimit INTACTOS), maximo global
+  min(8, MaxOpenPositions), exposicao potencial = abertas + pendentes
+  + transito, reservas funcionais, cadencia por papel, duplicidade por
+  candle, transito por lado, estado tatico e par inicial. Em sucesso
+  emite um GRANT de uso unico (papel+direcao+ciclo); as funcoes de
+  abertura consomem o grant ou recusam com ENTRY_WITHOUT_GRANT — nao
+  existe segunda funcao capaz de abrir ignorando a autoridade.
+
+SCHEDULER UNICO (ManageAsymmetricAdaptiveEntries, chamado apenas pelo
+OnTick apos MFE/risco/fechamentos): prioridade
+  1 cesta zerada -> par inicial; 2 completar perna inicial ausente
+  (bloqueia todo o resto); 3 episodio tatico (expira/invalida/envia);
+  4 estrutural; 5 par neutro controlado. Uma unica solicitacao por
+  tick (g_adaptiveEntryAttemptedThisTick). OnTimer: painel/persistencia
+  apenas. OnTradeTransaction: apenas confirma/reconcilia.
+
+PAR INICIAL: BASKET_FLAT real = 0 abertas + 0 pendentes + 0 transito.
+  OpenInitialPairAdaptive envia as duas pernas com comentarios
+  IA_FG_INITIAL_*; confirmacao por OnTradeTransaction + conta; perna
+  unica -> INITIAL_PAIR_PARTIAL: nenhuma outra entrada e liberada,
+  1 retentativa controlada da perna AUSENTE (cooldown, risco, retcode,
+  sem duplicar a perna aberta), sem rollback do lado ja confirmado e
+  sem abrir novo par inteiro. Ciclo identificado por basket_cycle_id.
+
+NEUTRO (politica padrao NEUTRAL_GRADUAL_BILATERAL, conforme a
+  confirmacao final): pares controlados IA_FG_NEUTRAL_* (1 autorizacao
+  = 1 par), somente com regime neutro real + >=NeutralConfirmationBars
+  candles estruturais neutros fechados + cooldown 600 s + distancia
+  >=0.50 ATR + cesta limpa (somente roles INITIAL/NEUTRAL) + sem
+  episodio tatico + teto 4/4 por lado + reserva estrutural (mantem 1
+  slot livre => na pratica para em 3 BUY + 3 SELL antes do teto 4/4,
+  que permanece como limite de admissao, nunca meta). Politica
+  CONTROLLED_TWO_PAIRS disponivel (para em 2+2), INITIAL_PAIR_ONLY
+  disponivel. Nunca dois pares no mesmo ciclo; nunca preenchimento.
+
+ESTRUTURAL: somente o lado do fluxo confirmado; 1 por autorizacao;
+  gates DESACOPLADOS dos inputs OpenAdditionalPairs* (causa-raiz 2):
+  1 por candle estrutural fechado, cooldown StructuralCooldownSeconds
+  (240 s), distancia >=0.35 ATR da ultima estrutural do fluxo,
+  extensao <=3.0 ATR da ancora do fluxo (bloqueia sem apagar o fluxo:
+  o painel segue mostrando o regime e o motivo EXTENSION), reserva
+  tatica (nao consome o ultimo slot enquanto uma tatica for possivel),
+  pausa durante episodio tatico, retomada apos correcao somente com
+  novo candle fechado a favor (WAITING_STRUCTURAL_RESUME ->
+  STRUCTURAL_RESUME_CONFIRMED). Fechamento por MFE libera slot e NAO
+  gera reposicao: nova entrada exige nova autorizacao completa.
+
+TATICA: deteccao/lifecycle preservados (candle fechado, corpo, volume,
+  deslocamento, ATR, ancoras — funcoes de sinal INTACTAS); episodio
+  registra id, precos e ATR de ativacao; entrada unica por episodio
+  (consumo APENAS na confirmacao transacional; ORDER_PENDING reserva o
+  slot sem incrementar contador; rejeicao com janela valida permite 1
+  retentativa no candle seguinte); autorizacao expira com
+  TacticalMaxEntryAgeBars=1 (TACTICAL_STATE_EXPIRED +
+  TACTICAL_EXPIRED_WITHOUT_ENTRY; risco duro expira imediatamente;
+  nada latente); invalidacao por preco alem do extremo de ativacao +
+  0.20 ATR encerra o episodio (TACTICAL_INVALIDATED); episodio dura no
+  maximo TacticalMaxEpisodeBars=3; a posicao tatica pode permanecer
+  aberta sob MFE apos o fim do episodio sem pausar a estrutura;
+  microcorrecao NAO inverte o fluxo (protecao existente em
+  ApplyStructuralFlowSignal INTACTA — inversao real continua exigindo
+  confirmacao forte).
+
+RESERVAS FUNCIONAIS: MustReserveTacticalSlot (fluxo direcional +
+  taticas habilitadas + episodio nao consumido + sem tatica
+  aberta/pendente/transito => nao-taticas param em 7);
+  MustReserveStructuralSlot (neutro antes da primeira estrutural do
+  proximo fluxo => neutro para em total_cap-1). Tatica pode usar o
+  8o slot. Nenhuma reserva permite ultrapassar 8.
+
+EXPOSICAO POTENCIAL: snapshot por papel/lado com abertas + pendentes
+  validas + ordens em transito (registradas no envio, baixadas na
+  confirmacao do deal, timeout 15 s com log). Painel e autoridade usam
+  O MESMO snapshot (BuildEntryExposureSnapshot).
+
+RECONSTRUCAO POS-RESTART: LoadEntryEngineState (GlobalVariables,
+  prefixo existente IAFGAB_) + ReconcileEntryEngineFromAccount (a conta
+  e a fonte de verdade: roles por comentario, par inicial/parcial,
+  pares neutros, transito zerado, log ENTRY_ENGINE_REBUILT). Episodio
+  tatico persistido/rebuild ja existentes, estendidos (v3: id, precos
+  de ativacao, expirado; estado EXPIRED carregavel). Posicoes
+  IA_FG_ADDITIONAL_* herdadas: seguem gerenciadas pelo MFE, contam na
+  exposicao como LEGACY_ADDITIONAL, aparecem no painel, jamais geram
+  novas ADDITIONAL e jamais sao fechadas arbitrariamente.
+
+E. PARAMETROS NOVOS/REUTILIZADOS
+--------------------------------------------------------------------
+Novos (grupo MOTOR DE ENTRADAS ASSIMETRICO V3):
+  NeutralEntryPolicy=NEUTRAL_GRADUAL_BILATERAL; NeutralConfirmationBars=2;
+  NeutralMinDistanceATR=0.50; NeutralCooldownSeconds=600;
+  StructuralMinDistanceATR=0.35; StructuralCooldownSeconds=240 (faixa
+  recomendada 180-300); StructuralMaxExtensionATR=3.0 (0 desativa);
+  TacticalMaxEntryAgeBars=1; TacticalMaxEpisodeBars=3 (substitui a
+  constante 6, agora nao usada); TacticalInvalidationATRBuffer=0.20.
+Reutilizados sem alteracao de valor: FixedLot, MagicNumber,
+  MaxOpenPositions=8, tetos dinamicos, ReopenDelaySecondsAfterClose,
+  TacticalMinimumBodyRatio/VolumeStrength, ATR tatico (14), todos os
+  parametros MFE/risco (lista da secao 3 conferida por diff).
+Inputs legados (OpenAdditionalPairs*, MaxPairs, MinSecondsBetween*):
+  permanecem no codigo e SO comandam o modo legado.
+
+F. COMENTARIOS DE ENTRADA (lista completa)
+--------------------------------------------------------------------
+IA_FG_INITIAL_BUY / IA_FG_INITIAL_SELL          (par inicial)
+IA_FG_NEUTRAL_BUY / IA_FG_NEUTRAL_SELL          (par neutro controlado - NOVOS)
+IA_FG_STRUCTURAL_BUY / IA_FG_STRUCTURAL_SELL    (reforco estrutural)
+IA_FG_TACTICAL_BUY / IA_FG_TACTICAL_SELL        (microcorrecao)
+IA_FG_ADDITIONAL_BUY / IA_FG_ADDITIONAL_SELL    (LEGADO - bloqueado no assimetrico)
+
+G. EXEMPLOS DE LOGS DETERMINISTICOS
+--------------------------------------------------------------------
+[ENTRY_AUTH] role=STRUCTURAL side=SELL flow=SELL MODERADO buy=1 sell=0
+  pending=0 inflight=0 cap_buy=3 cap_sell=5 exposure=1 result=AUTHORIZED
+[ENTRY_BLOCK] role=STRUCTURAL side=SELL flow=SELL MODERADO exposure=7
+  reason=TACTICAL_SLOT_RESERVED
+[TACTICAL_DETECTED] episode_id=4 structural=BUY tactical=SELL
+  activation_price=4012.35 atr_pts=310.0
+[TACTICAL_EXPIRED_WITHOUT_ENTRY] episode_id=4 age_bars=2
+[STRUCTURAL_RESUME_CONFIRMED] bar=2026.07.02 14:35:00
+[BASKET_FLAT_DETECTED] cycle=7
+[INITIAL_PAIR_PARTIAL] confirmada_apenas=BUY
+[LEGACY_ADDITIONAL_BLOCKED] OpenBuySellPair indisponivel no motor assimetrico (par adicional)
+Dedup: ENTRY_BLOCK por chave papel|lado|motivo; eventos apenas em
+transicao de estado/candle/solicitacao (sem spam por tick).
+
+H. TABELA DE CONFORMIDADE (secao 31 — status por requisito)
+--------------------------------------------------------------------
+Legenda: IMPL = IMPLEMENTADO (caminho conectado ao scheduler/eventos,
+sem rota alternativa, espelhado BUY/SELL, painel=autoridade, localizavel
+no diff); NC = NAO COMPROVADO em execucao (todo runtime esta BLOCKED).
+| Sec | Requisito | Status | Funcao/evidencia |
+| 1 | tetos 6/2-5/3-4/4-3/5-2/6 como limites, max 8 | IMPL+NC | CanOpenEntryRole caps via GetDynamicBuy/SellLimit (intactas) |
+| 1 | progressao unitaria (1 por autorizacao) | IMPL+NC | grant unico + g_adaptiveEntryAttemptedThisTick |
+| 2 | cesta zerada = 1 BUY + 1 SELL INITIAL | IMPL+NC | BASKET_NOT_FLAT (pend+transito) + OpenInitialPairAdaptive |
+| 2 | perna unica -> INCOMPLETE, so completa a ausente | IMPL+NC | TryCompleteInitialPair, prioridade 2, 1 retentativa |
+| 3 | bilateralidade sem par repetitivo | IMPL+NC | scheduler por papel; pares so INITIAL/NEUTRAL |
+| 4 | 5 regimes, bloqueio nao apaga fluxo | IMPL | leitura intacta; painel mostra fluxo + motivo separados |
+| 5/6 | fluxo BUY/SELL espelhado, gates completos | IMPL+NC | ramo estrutural unico parametrizado por direcao |
+| 7 | neutro gradual, sem preenchimento 4/4 | IMPL+NC | politica GRADUAL + streak/cooldown/ATR/reserva |
+| 8 | microcorrecao completa (8.1-8.6) | IMPL+NC | ManageTacticalEpisodeEntry + lifecycle preservado |
+| 9 | autoridade central obrigatoria | IMPL | grant + ENTRY_WITHOUT_GRANT; mapa C sem orfaos |
+| 10 | exposicao potencial (abertas+pend+transito) | IMPL+NC | EntryExposureSnapshot + RegisterEntryInFlight |
+| 11 | reservas funcionais | IMPL+NC | MustReserve* consumidas nos caps da autoridade |
+| 12 | scheduler unico, prioridade, OnTimer/OnTradeTransaction sem entradas | IMPL | OnTick unico chamador; handlers so confirmam |
+| 13 | ADDITIONAL bloqueado no assimetrico, sem input generico | IMPL+NC | guards em OpenBuySellPair/CanOpenAdditionalPair/pendentes; roles separados |
+| 14 | cadencia ATR/cooldown/extensao por papel | IMPL+NC | inputs novos com valores recomendados |
+| 15/16 | MFE/BE/SL intactos; roles p/ telemetria | IMPL | 42/42 funcoes byte-identicas; GetPositionRoleByComment |
+| 17 | risco: daily>hard>soft; AlwaysInMarket nao reabre em bloqueio | IMPL+NC | BaseDirectionalEntryFiltersOK + CanOpenNewPair (intactos) |
+| 18 | revalidacao imediata pre-envio | IMPL | snapshot reconstruido dentro de CanOpenEntryRole |
+| 19 | pendentes: novas bloqueadas no assimetrico (documentado) | IMPL | guards Place*Pending + cancelamento legado existente |
+| 20 | restart: conta = fonte de verdade | IMPL+NC | ReconcileEntryEngineFromAccount + persistencia v3 |
+| 21 | telemetria ENTRY_AUTH/BLOCK + painel = autoridade | IMPL | LogEntryDecision + painel usa BuildEntryExposureSnapshot |
+| 22 | SELL moderado => STRUCTURAL_SELL autorizavel | IMPL+NC | desacoplamento dos inputs Additional (causa-raiz 2) |
+| 24 | restricoes absolutas | IMPL | sem martingale/grid/averaging/lote (diff: NormalizeVolume/FixedLot intactos) |
+| 25 | matriz de 40 testes | ENTREGUE | arquivo de matriz; execucao BLOCKED |
+| 26 | auditoria de diff | FEITA | checker automatizado (42 intactas/19 alteradas/23 novas) |
+| 27 | honestidade de compilacao | CUMPRIDA | compile log BLOCKED |
+VALIDACAO FUNCIONAL (secao 31, item a item): todos os 25 pontos da
+lista possuem implementacao conectada e verificada estaticamente
+(status IMPL); NENHUM esta comprovado em execucao (NC) — a comprovacao
+exige compilar e rodar a matriz.
+
+I. INVARIANTES PRESERVADAS (prova objetiva)
+--------------------------------------------------------------------
+Comparacao automatizada função a função com a base: 42/42 intactas,
+incluindo TODO o MFE monetario (calculo liquido, comissao, conversao,
+retcodes, SL servidor, monotonia, persistencia, autoridade
+MFE+BE-floor), risco (daily/soft/hard, fechamentos), leitura
+estrutural/tatica (price action, volume, ATR, ancoras, histerese,
+inversao), tetos dinamicos, OnTick/OnTimer, lote (NormalizeVolume +
+FixedLot=0.01 default; lote real vem do SET). Nenhum parametro da
+lista de preservacao da secao 3 foi alterado (diff confere).
+
+J. LIMITACOES
+--------------------------------------------------------------------
+1. Compilacao e todos os 40 cenarios: BLOCKED neste ambiente.
+2. Roles dependem do comentario da ordem; corretoras que sobrescrevem
+   comentarios degradam a classificacao para UNKNOWN (posicao segue
+   gerenciada pelo MFE; entra na exposicao total; neutro exige cesta
+   limpa e portanto fica conservador).
+3. TryCompleteInitialPair nao e bloqueada por soft DD (integridade da
+   cesta bilateral); daily/meta/hard bloqueiam.
+4. Pendentes novas desativadas no modo assimetrico (secao 19,
+   documentado) — modo legado preservado.
+5. TACTICAL_MAX_EPISODE_BARS (const 6) permanece declarada porem sem
+   uso (substituida pelo input=3, exigencia explicita do prompt).
+6. CanOpenAdaptiveUnitEntry e TacticalEntryBlockReasonFromAdaptive
+   ficaram sem chamadores no modo assimetrico (mantidas por serem
+   pre-existentes; documentadas; sem efeito em runtime).
+
+K. ALTERACOES FORA DO ESCOPO
+--------------------------------------------------------------------
+Nenhuma. Todas as 31+ edicoes pertencem ao motor de entradas, seus
+estados, persistencia e telemetria. MFE, risco, lote, leitura de
+mercado e hedging: intactos (secao I).
+
+L. RISCOS RESIDUAIS
+--------------------------------------------------------------------
+1. Erro de sintaxe residual possivel ate compilar (mitigado pela
+   verificacao estatica; qualquer erro sera pontual).
+2. Comportamento economico muda por design: sem 63% de entradas
+   ADDITIONAL o perfil de resultado sera diferente do HTML anterior —
+   a comparacao por role (teste 25 da matriz anterior/eqv. teste do
+   mesmo periodo) e obrigatoria antes de qualquer conclusao.
+3. Cadencia ATR nova (0.35/0.50) em regime de volatilidade extrema
+   pode espaçar mais as entradas que o usuario espera — parametrizavel
+   por input, sem otimizacao realizada (proibida).
+4. Estados persistidos de versao anterior (episodio tatico v2) sao
+   descartados uma unica vez na primeira carga (rebuild conservador
+   trata episodio desconhecido como CONSUMED — sem dupla tatica).
+
+M. CONCLUSAO HONESTA
+--------------------------------------------------------------------
+Comprovado por codigo (estatico): tudo da secao H com status IMPL.
+Comprovado por compilacao: NADA (BLOCKED — declaracao exata no log).
+Comprovado por Strategy Tester: NADA (BLOCKED).
+Ainda dependente de backtest/demo: os 40 cenarios da matriz, a
+comparacao por role com o HTML e o forward test.
+
+"Implementacao concluida e auditada estaticamente, mas ainda nao
+comprovada por compilacao e execucao reais."
+
+N. VEREDITO FINAL
+--------------------------------------------------------------------
+APROVADO ESTATICAMENTE
+(proximo passo obrigatorio: compilar com 0 erros -> rodar a matriz no
+Strategy Tester -> so entao APROVADO COM RESSALVAS PARA FORWARD TEST
+EM DEMO. Proibido uso em conta real neste estagio.)
+====================================================================

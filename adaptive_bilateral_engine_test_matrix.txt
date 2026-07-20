@@ -1,0 +1,194 @@
+====================================================================
+MATRIZ DE TESTES (40) - PREDATOR_FLOW_AI_V2_ADAPTIVE_BILATERAL_ENGINE_FINAL_FIXED.mq5
+Ambiente exigido: MT5 Strategy Tester, XAUUSD M5, hedge, real ticks,
+lote 0.02, sem otimizacao. Este ambiente (Linux) NAO executa MT5:
+TODOS os testes estao com status BLOCKED (runtime), acompanhados da
+evidencia estatica que conecta o cenario ao codigo. Nada foi inventado.
+Formato: PRE / EVENTO / ESPERADO / COMENTARIO / CONTADOR / LOG / CRITERIO.
+====================================================================
+
+T01 cesta zerada abre exatamente 1 BUY + 1 SELL
+  PRE: 0 abertas, 0 pendentes, 0 transito; risco livre. EVENTO: tick.
+  ESPERADO: 1 par unico no ciclo. COMENTARIO: IA_FG_INITIAL_BUY/SELL.
+  CONTADOR: total=2 (1/1). LOG: BASKET_FLAT_DETECTED -> ENTRY_AUTH
+  role=INITIAL -> INITIAL_PAIR_REQUEST -> INITIAL_PAIR_CONFIRMED.
+  CRITERIO: nenhum 3o ticket no ciclo. STATUS: BLOCKED (estatico OK:
+  BASKET_NOT_FLAT + grant unico).
+
+T02 falha da BUY inicial
+  PRE: rejeicao simulada na perna BUY. EVENTO: envio do par.
+  ESPERADO: SELL mantida, estado parcial. COMENTARIO: so INITIAL_SELL.
+  CONTADOR: total=1. LOG: INITIAL_PAIR_PARTIAL faltante=BUY.
+  CRITERIO: nenhum novo par completo; nenhuma outra role liberada.
+  STATUS: BLOCKED.
+
+T03 falha da SELL inicial
+  Espelho do T02 (faltante=SELL). STATUS: BLOCKED.
+
+T04 par inicial incompleto bloqueia demais entradas
+  PRE: estado parcial ativo. EVENTO: fluxo direcional forte surge.
+  ESPERADO: nenhuma estrutural/tatica/neutra; apenas 1 retentativa da
+  perna ausente apos cooldown. LOG: ENTRY_BLOCK reason=INITIAL_PAIR_PARTIAL.
+  CRITERIO: scheduler prioridade 2 intercepta. STATUS: BLOCKED.
+
+T05/T06 BUY moderado/forte abre 1 BUY estrutural
+  PRE: fluxo BUY confirmado; cadencia ok. EVENTO: candle fechado.
+  ESPERADO: 1 IA_FG_STRUCTURAL_BUY por autorizacao; nunca par.
+  LOG: ENTRY_AUTH role=STRUCTURAL side=BUY -> STRUCTURAL_ENTRY_REQUEST
+  -> STRUCTURAL_ENTRY_CONFIRMED. CRITERIO: 1 posicao por candle/cooldown.
+  STATUS: BLOCKED.
+
+T07/T08 SELL moderado/forte abre 1 SELL estrutural (cenario da secao 22)
+  PRE: SELL moderado; teto 3/5; 1 BUY aberta; distancia/cooldown ok.
+  ESPERADO: EXATAMENTE 1 autorizacao IA_FG_STRUCTURAL_SELL.
+  LOG: ENTRY_AUTH role=STRUCTURAL side=SELL cap_buy=3 cap_sell=5.
+  CRITERIO: independencia dos inputs OpenAdditionalPairs* (podem estar
+  false). STATUS: BLOCKED (estatico OK: gates desacoplados).
+
+T09-T12 tetos 5/3, 6/2, 3/5, 2/6 bloqueiam o excedente
+  PRE: lado no teto. EVENTO: nova autorizacao. ESPERADO: bloqueio.
+  LOG: ENTRY_BLOCK reason=SIDE_LIMIT. CRITERIO: teto e limite, nunca
+  meta; posicoes existentes nao sao fechadas. STATUS: BLOCKED.
+
+T13 maximo global de 8
+  PRE: exposicao potencial 8. ESPERADO: ENTRY_BLOCK reason=TOTAL_LIMIT
+  para qualquer papel. STATUS: BLOCKED.
+
+T14 pendente conta na exposicao
+  PRE: pendente legada viva (modo legado) ou herdada. ESPERADO:
+  snapshot inclui pending_*; caps aplicados. CRITERIO: painel
+  "Exposicao potencial" inclui pend. STATUS: BLOCKED.
+
+T15 ordem em transito conta na exposicao
+  PRE: envio sem confirmacao transacional. ESPERADO: inflight>0
+  bloqueia lado (ORDER_IN_FLIGHT) ate confirmar/timeout 15s.
+  STATUS: BLOCKED.
+
+T16 neutro nao preenche 4/4 instantaneamente
+  PRE: neutro prolongado. ESPERADO: pares IA_FG_NEUTRAL_* espacados
+  (streak>=2, cooldown 600s, ATR>=0.50), parada em 3/3 pela reserva
+  estrutural; 4/4 apenas teto. LOG: NEUTRAL_PAIR_REQUEST/CONFIRMED;
+  bloqueio STRUCTURAL_SLOT_RESERVED no 4o par. STATUS: BLOCKED.
+
+T17/T18 neutro respeita distancia e cooldown
+  ESPERADO: ENTRY_BLOCK reason=DISTANCE / COOLDOWN. STATUS: BLOCKED.
+
+T19 microcorrecao SELL dentro de BUY
+  PRE: fluxo BUY; candle SELL valido. ESPERADO: estrutura permanece
+  BUY; BUY pausadas; exatamente 1 IA_FG_TACTICAL_SELL. LOG:
+  TACTICAL_DETECTED -> STRUCTURAL_PAUSED_BY_CORRECTION ->
+  TACTICAL_ORDER_REQUESTED -> TACTICAL_ORDER_CONFIRMED -> TACTICAL_CONSUMED.
+  STATUS: BLOCKED.
+
+T20 microcorrecao BUY dentro de SELL
+  Espelho do T19 (IA_FG_TACTICAL_BUY). Cenario deterministico
+  obrigatorio: a ausencia historica de TACTICAL_SELL nao e prova.
+  STATUS: BLOCKED.
+
+T21 segunda tatica no episodio bloqueada
+  PRE: tatica confirmada (mesmo que feche em segundos). ESPERADO:
+  nenhuma nova tatica; LOG ENTRY_BLOCK reason=TACTICAL_ALREADY_CONSUMED.
+  CRITERIO: fechamento nao reinicia episodio. STATUS: BLOCKED.
+
+T22 tatica atrasada bloqueada
+  PRE: autorizacao ativa; entrada nao sai no candle de ativacao nem no
+  seguinte (spread/slot). ESPERADO: TACTICAL_STATE_EXPIRED; nenhuma
+  entrada posterior. LOG: TACTICAL_EXPIRED_WITHOUT_ENTRY age_bars=2.
+  STATUS: BLOCKED.
+
+T23 fim da correcao retoma estrutura
+  PRE: episodio termina (STRUCTURAL_RESUMED/NEUTRAL_TIMEOUT/MAX_BARS).
+  ESPERADO: WAITING_STRUCTURAL_RESUME ate novo candle a favor ->
+  STRUCTURAL_RESUME_CONFIRMED -> estrutural volta. STATUS: BLOCKED.
+
+T24 posicao tatica aberta nao mantem bloqueio infinito
+  PRE: tatica aberta sob MFE; episodio TERMINADO. ESPERADO: estruturais
+  autorizadas com a tatica ainda aberta (se houver slot). CRITERIO:
+  pausa depende do episodio, nao da posicao. STATUS: BLOCKED.
+
+T25 reversao estrutural verdadeira
+  PRE: confirmacao forte contraria. ESPERADO: episodio antigo encerrado
+  (STRUCTURAL_REVERSAL), tatica antiga expirada, novo fluxo com
+  cadencia propria; sem tatica atrasada. STATUS: BLOCKED.
+
+T26 extensao bloqueia sem apagar fluxo
+  PRE: preco a >3 ATR da ancora do fluxo. ESPERADO: ENTRY_BLOCK
+  reason=EXTENSION; painel continua exibindo o regime. STATUS: BLOCKED.
+
+T27 ADDITIONAL bloqueado no modo assimetrico
+  PRE: UseAsymmetricBilateralFlowEngine=true. ESPERADO: zero novas
+  IA_FG_ADDITIONAL_*; qualquer chamada residual gera
+  LEGACY_ADDITIONAL_BLOCKED. CRITERIO: comparacao por role com o HTML
+  (antes: 156/248). STATUS: BLOCKED (estatico OK: 3 guards).
+
+T28 nenhuma reposicao artificial
+  PRE: posicao fecha por MFE/BE/SL. ESPERADO: slot liberado; nenhuma
+  abertura no mesmo evento; nova posicao so por nova autorizacao com
+  cadencia. LOG: STRUCTURAL_SLOT_RELEASED sem ENTRY_AUTH imediato.
+  STATUS: BLOCKED.
+
+T29 restart com posicoes abertas
+  PRE: remover/recolocar EA com cesta ativa. ESPERADO: roles
+  reconstruidos por comentario; ENTRY_ENGINE_REBUILT; sem novo par
+  inicial; MFE preservado. STATUS: BLOCKED.
+
+T30 restart com par inicial incompleto
+  ESPERADO: estado parcial detectado (persistencia + conta); demais
+  entradas seguem bloqueadas; maximo 1 retentativa restante.
+  STATUS: BLOCKED.
+
+T31 Soft DD bloqueia entradas
+  ESPERADO: neutra/tatica bloqueadas (SOFT_DD); somente reforco
+  estrutural dominante unitario (politica ja implementada no risco).
+  STATUS: BLOCKED.
+
+T32 Hard DD bloqueia entradas
+  ESPERADO: nenhuma entrada de nenhum papel (HARD_DD); episodio tatico
+  expira imediatamente; MFE segue gerindo. STATUS: BLOCKED.
+
+T33 daily block impede reabertura
+  PRE: cesta zera durante bloqueio diario. ESPERADO: AlwaysInMarket NAO
+  reabre (CanOpenNewPair -> BaseEntryFiltersOK barra); reason
+  INITIAL_FILTERS/DAILY_BLOCK. STATUS: BLOCKED.
+
+T34 MFE continua gerenciando durante bloqueios
+  ESPERADO: ManageUnifiedProfitStopProtection roda antes de qualquer
+  gate de entrada (OnTick intacto). STATUS: BLOCKED (estatico OK).
+
+T35 SL MFE nunca retrocede
+  ESPERADO: regressao do patch anterior inalterada (42/42 funcoes MFE
+  intactas). STATUS: BLOCKED (prova estatica de nao-alteracao OK).
+
+T36 OnTimer nao abre posicao
+  ESPERADO: OnTimer = painel/persistencia/timeout-reconciliacao apenas
+  (funcao byte-identica a base). STATUS: PASS ESTATICO / BLOCKED runtime.
+
+T37 OnTradeTransaction nao duplica entrada
+  ESPERADO: handler apenas confirma/reconcilia (sem trade.Buy/Sell no
+  caminho — auditoria de chamadas). STATUS: PASS ESTATICO / BLOCKED.
+
+T38 painel e autoridade usam o mesmo estado
+  ESPERADO: ambos leem BuildEntryExposureSnapshot/StructuralFlowToText;
+  regime exibido = regime decidido. STATUS: PASS ESTATICO / BLOCKED.
+
+T39 retcode de falha nao consome episodio
+  PRE: rejeicao no envio tatico. ESPERADO: estado volta a ACTIVE;
+  contador continua 0; retentativa apenas dentro da janela; consumo so
+  na confirmacao transacional. LOG: TACTICAL_ORDER_REJECTED.
+  STATUS: BLOCKED (estatico OK: fluxo preservado + idade).
+
+T40 uma unica entrada por ciclo
+  ESPERADO: apos qualquer envio, g_adaptiveEntryAttemptedThisTick
+  impede nova abertura no mesmo tick (pares INITIAL/NEUTRAL = 1
+  transacao logica com rollback/partial proprios). STATUS: BLOCKED.
+
+--------------------------------------------------------------------
+COMPARACAO OBRIGATORIA COM O HTML (mesmo periodo 2026.07.01-03):
+  metricas por role esperadas no modo assimetrico:
+  ADDITIONAL novas = 0 (antes 78+78); INITIAL = 2 por ciclo de cesta;
+  NEUTRAL <= 3 pares por episodio neutro limpo, espacados >=600s;
+  STRUCTURAL somente no lado do fluxo, max 1/candle e >=240s;
+  TACTICAL <= 1 por episodio, nunca com idade > 1 barra;
+  exposicao potencial max <= 8; sem reposicao pos-fechamento.
+  O lucro NAO e criterio de aprovacao.
+====================================================================

@@ -1,0 +1,1916 @@
+--- PREDATOR_FLOW_AI_V2_MFE_TRAILING_INTEGRATION_FIXED.mq5	2026-07-19 13:34:42.614202788 +0000
++++ PREDATOR_FLOW_AI_V2_ADAPTIVE_BILATERAL_ENGINE_FINAL_FIXED.mq5	2026-07-20 00:51:08.916309396 +0000
+@@ -5,6 +5,10 @@
+ // MFE_TRAILING_INTEGRATION_FIX 2026-07-19: patch cirurgico da gestao MFE/BE/trailing, soft/hard DD,
+ // comissao unica, backoff de conversao, persistencia quantizada e telemetria; sem alteracao de
+ // entradas, lote, fluxo estrutural, tetos direcionais ou arquitetura bilateral.
++// ADAPTIVE_BILATERAL_ENGINE_FIX 2026-07-19: motor de entradas com autoridade central por papel
++// (INITIAL/NEUTRAL/STRUCTURAL/TACTICAL), bloqueio do motor legado ADDITIONAL no modo assimetrico,
++// neutro bilateral gradual controlado, reservas funcionais de slots, expiracao tatica por idade,
++// retomada estrutural confirmada e telemetria deterministica; MFE, lote e risco preservados.
+ 
+ #include <Trade/Trade.mqh>
+ 
+@@ -32,9 +36,38 @@
+    TACTICAL_STATE_CANDIDATE = 1,
+    TACTICAL_STATE_ACTIVE = 2,
+    TACTICAL_STATE_ORDER_PENDING = 3,
+-   TACTICAL_STATE_CONSUMED = 4
++   TACTICAL_STATE_CONSUMED = 4,
++   TACTICAL_STATE_EXPIRED = 5
+ };
+ 
++enum ENUM_ENTRY_ROLE
++{
++   ENTRY_ROLE_INITIAL = 0,
++   ENTRY_ROLE_NEUTRAL = 1,
++   ENTRY_ROLE_STRUCTURAL = 2,
++   ENTRY_ROLE_TACTICAL = 3,
++   ENTRY_ROLE_LEGACY_ADDITIONAL = 4
++};
++
++enum ENUM_POSITION_ROLE
++{
++   ROLE_INITIAL = 0,
++   ROLE_NEUTRAL = 1,
++   ROLE_STRUCTURAL = 2,
++   ROLE_TACTICAL = 3,
++   ROLE_LEGACY_ADDITIONAL = 4,
++   ROLE_UNKNOWN = 5
++};
++
++enum ENUM_NEUTRAL_ENTRY_POLICY
++{
++   NEUTRAL_INITIAL_PAIR_ONLY = 0,    // Somente o par inicial no neutro
++   NEUTRAL_CONTROLLED_TWO_PAIRS = 1, // Par inicial + no maximo 1 par neutro (2 BUY + 2 SELL)
++   NEUTRAL_GRADUAL_BILATERAL = 2     // Evolucao gradual controlada em direcao ao teto 4/4
++};
++
++#define POSITION_ROLE_COUNT 6
++
+ enum ENUM_MFE_POSITION_STATE
+ {
+    MFE_UNTRACKED = 0,
+@@ -138,6 +171,23 @@
+    bool valid;
+ };
+ 
++struct EntryExposureSnapshot
++{
++   int open_buy[POSITION_ROLE_COUNT];
++   int open_sell[POSITION_ROLE_COUNT];
++   int pending_buy[POSITION_ROLE_COUNT];
++   int pending_sell[POSITION_ROLE_COUNT];
++   int inflight_buy;
++   int inflight_sell;
++   int total_open_buy;
++   int total_open_sell;
++   int total_pending_buy;
++   int total_pending_sell;
++   int total_buy;
++   int total_sell;
++   int total;
++};
++
+ input group "=== GERAL ==="
+ input double FixedLot = 0.01; // Lote fixo
+ input long MagicNumber = 20260710; // Numero magico
+@@ -287,6 +337,18 @@
+ input double TacticalMinimumBodyRatio = 0.45;
+ input double TacticalMinimumVolumeStrength = 1.00;
+ 
++input group "=== MOTOR DE ENTRADAS ASSIMETRICO V3 ==="
++input ENUM_NEUTRAL_ENTRY_POLICY NeutralEntryPolicy = NEUTRAL_GRADUAL_BILATERAL; // Politica neutra bilateral controlada
++input int NeutralConfirmationBars = 2; // Candles estruturais neutros fechados exigidos
++input double NeutralMinDistanceATR = 0.50; // Distancia ATR minima desde a ultima autorizacao
++input int NeutralCooldownSeconds = 600; // Cooldown entre autorizacoes neutras
++input double StructuralMinDistanceATR = 0.35; // Distancia ATR minima entre reforcos estruturais
++input int StructuralCooldownSeconds = 240; // Cooldown entre reforcos estruturais
++input double StructuralMaxExtensionATR = 3.0; // Extensao ATR maxima desde a ancora do fluxo (0 desativa)
++input int TacticalMaxEntryAgeBars = 1; // Idade maxima em barras da autorizacao tatica
++input int TacticalMaxEpisodeBars = 3; // Duracao maxima do episodio tatico em barras
++input double TacticalInvalidationATRBuffer = 0.20; // Buffer ATR de invalidacao da correcao
++
+ input group "=== FILTRO DE NOTICIAS V2 ==="
+ input bool UseNewsFilter = false; // Reservado para filtro de noticias na V2
+ input bool BlockMediumImpactNews = true; // Bloquear noticias de medio impacto na V2
+@@ -416,6 +478,45 @@
+ uint g_lastBasketLinesRefreshMs = 0;
+ CommissionCacheEntry g_commissionCache[COMMISSION_CACHE_SIZE];
+ int g_commissionCacheCursor = 0;
++EntryExposureSnapshot g_exposure;
++long g_basketCycleId = 0;
++bool g_initialPairRequested = false;
++bool g_initialBuyConfirmed = false;
++bool g_initialSellConfirmed = false;
++bool g_initialPairPartial = false;
++int g_initialRetryCount = 0;
++datetime g_initialLastAttemptTime = 0;
++long g_neutralEpisodeId = 0;
++int g_neutralPairsOpened = 0;
++datetime g_lastNeutralAuthTime = 0;
++int g_neutralClosedBarStreak = 0;
++datetime g_lastNeutralStreakBar = 0;
++int g_lastSeenStructuralFlow = 0;
++double g_structuralFlowAnchorPrice = 0.0;
++bool g_structuralFirstSlotConsumed = false;
++datetime g_lastStructuralEntryTime = 0;
++double g_lastStructuralEntryPrice = 0.0;
++datetime g_lastStructuralEntryBar = 0;
++bool g_structuralResumeConfirmed = true;
++datetime g_structuralResumeWaitSinceBar = 0;
++long g_tacticalEpisodeSeq = 0;
++bool g_tacticalExpiredThisEpisode = false;
++double g_tacticalActivationPrice = 0.0;
++double g_tacticalActivationHigh = 0.0;
++double g_tacticalActivationLow = 0.0;
++double g_tacticalActivationAtrPoints = 0.0;
++int g_inFlightBuy = 0;
++int g_inFlightSell = 0;
++datetime g_inFlightSince = 0;
++int g_entryGrantRole = -1;
++int g_entryGrantDirection = -1;
++ulong g_entryGrantCycle = 0;
++bool g_entryGrantConsumed = true;
++string g_roleBlockReasonTactical = "";
++string g_roleBlockReasonStructural = "";
++string g_roleBlockReasonNeutral = "";
++string g_lastEntryDecisionLogKey = "";
++string g_lastAuthorizedRoleText = "NENHUM";
+ 
+ int OnInit();
+ void OnDeinit(const int reason);
+@@ -637,6 +738,29 @@
+ string MFEProtectionStateText(int index);
+ double EstimateMFEServerDistanceCostMoney(int index);
+ string MFEDistanceBlockReasonText();
++bool IsLegacyAdditionalPairEngineAllowed();
++ENUM_POSITION_ROLE GetPositionRoleByComment(string comment);
++string PositionRoleToText(ENUM_POSITION_ROLE role);
++string EntryRoleToText(ENUM_ENTRY_ROLE role);
++void BuildEntryExposureSnapshot();
++double GetEntryAtrPoints();
++bool MustReserveTacticalSlot();
++bool MustReserveStructuralSlot();
++string MapAdaptiveBlockReasonToEntryReason();
++void LogEntryDecision(bool authorized, ENUM_ENTRY_ROLE role, ENUM_ORDER_TYPE direction, string reason);
++bool CanOpenEntryRole(ENUM_ENTRY_ROLE role, ENUM_ORDER_TYPE direction, string &block_reason);
++bool ConsumeEntryGrant(ENUM_ORDER_TYPE direction);
++void RegisterEntryInFlight(ENUM_ORDER_TYPE direction);
++void ReconcileInFlightEntries();
++void SyncEntryEngineWithFlow();
++bool OpenInitialPairAdaptive();
++void TryCompleteInitialPair();
++bool OpenNeutralPairControlled();
++void ManageTacticalEpisodeEntry();
++void HandleEntryEngineDealConfirmation(ulong deal_ticket);
++void PersistEntryEngineState();
++void LoadEntryEngineState();
++void ReconcileEntryEngineFromAccount();
+ 
+ int OnInit()
+ {
+@@ -649,6 +773,8 @@
+    UpdateMarketDiagnostics();
+    InitializeMFEObservedCommissionRate();
+    RebuildMFEStateFromOpenPositions();
++   LoadEntryEngineState();
++   ReconcileEntryEngineFromAccount();
+ 
+    if(CountOpenPositions() > 0)
+    {
+@@ -684,6 +810,7 @@
+ void OnDeinit(const int reason)
+ {
+    PersistAllMFEPositionStates();
++   PersistEntryEngineState();
+    if(MFEPersistState)
+       GlobalVariablesFlush();
+    EventKillTimer();
+@@ -805,7 +932,13 @@
+       InvalidateMoneySnapshots();
+       g_todayClosedProfitDirty = true;
+       if(HistoryDealSelect(trans.deal))
++      {
+          InvalidateCommissionCache((long)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID));
++         if(HistoryDealGetString(trans.deal, DEAL_SYMBOL) == _Symbol &&
++            (long)HistoryDealGetInteger(trans.deal, DEAL_MAGIC) == MagicNumber &&
++            (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY) == DEAL_ENTRY_IN)
++            HandleEntryEngineDealConfirmation(trans.deal);
++      }
+    }
+ 
+    HandleMFETradeTransaction(trans, request, result);
+@@ -1518,6 +1651,11 @@
+    GlobalVariableDel(TacticalStateGlobalName("BP"));
+    GlobalVariableDel(TacticalStateGlobalName("RQ"));
+    GlobalVariableDel(TacticalStateGlobalName("RB"));
++   GlobalVariableDel(TacticalStateGlobalName("EX"));
++   GlobalVariableDel(TacticalStateGlobalName("AP"));
++   GlobalVariableDel(TacticalStateGlobalName("AH"));
++   GlobalVariableDel(TacticalStateGlobalName("AL"));
++   GlobalVariableDel(TacticalStateGlobalName("AA"));
+ }
+ 
+ void PersistTacticalEpisodeState()
+@@ -1533,7 +1671,7 @@
+    if(g_tacticalEntryCount > TACTICAL_MAX_PROGRESSIVE_ENTRIES)
+       g_tacticalEntryCount = TACTICAL_MAX_PROGRESSIVE_ENTRIES;
+ 
+-   GlobalVariableSet(TacticalStateGlobalName("V"), 2.0);
++   GlobalVariableSet(TacticalStateGlobalName("V"), 3.0);
+    GlobalVariableSet(TacticalStateGlobalName("D"), (double)((int)g_tacticalEpisode));
+    GlobalVariableSet(TacticalStateGlobalName("B"), (double)g_tacticalEpisodeStartBar);
+    GlobalVariableSet(TacticalStateGlobalName("S"), (double)g_tacticalEpisodeStructuralDirection);
+@@ -1548,6 +1686,12 @@
+    GlobalVariableSet(TacticalStateGlobalName("BP"), (double)g_blockOppositeStructuralPromotionBar);
+    GlobalVariableSet(TacticalStateGlobalName("RQ"), (double)g_tacticalOrderRequestTime);
+    GlobalVariableSet(TacticalStateGlobalName("RB"), (double)g_tacticalOrderRequestBar);
++   GlobalVariableSet(TacticalStateGlobalName("SQ"), (double)g_tacticalEpisodeSeq);
++   GlobalVariableSet(TacticalStateGlobalName("EX"), (g_tacticalExpiredThisEpisode ? 1.0 : 0.0));
++   GlobalVariableSet(TacticalStateGlobalName("AP"), g_tacticalActivationPrice);
++   GlobalVariableSet(TacticalStateGlobalName("AH"), g_tacticalActivationHigh);
++   GlobalVariableSet(TacticalStateGlobalName("AL"), g_tacticalActivationLow);
++   GlobalVariableSet(TacticalStateGlobalName("AA"), g_tacticalActivationAtrPoints);
+ }
+ 
+ bool LoadPersistedTacticalEpisodeState(ENUM_TACTICAL_FLOW_STATE episode, datetime start_bar, int structural_direction, int &entry_count)
+@@ -1573,7 +1717,7 @@
+    int persisted_structure = (int)GlobalVariableGet(structure_name);
+    int persisted_count = (int)GlobalVariableGet(count_name);
+ 
+-   if(version != 2 ||
++   if(version != 3 ||
+       persisted_direction != (int)episode ||
+       persisted_start != start_bar ||
+       persisted_structure != structural_direction ||
+@@ -1590,7 +1734,7 @@
+    if(GlobalVariableCheck(TacticalStateGlobalName("E")))
+    {
+       int state = (int)GlobalVariableGet(TacticalStateGlobalName("E"));
+-      if(state >= (int)TACTICAL_STATE_CANDIDATE && state <= (int)TACTICAL_STATE_CONSUMED)
++      if(state >= (int)TACTICAL_STATE_CANDIDATE && state <= (int)TACTICAL_STATE_EXPIRED)
+          g_tacticalState = (ENUM_TACTICAL_EPISODE_STATE)state;
+    }
+ 
+@@ -1612,6 +1756,18 @@
+       g_tacticalOrderRequestTime = (datetime)GlobalVariableGet(TacticalStateGlobalName("RQ"));
+    if(GlobalVariableCheck(TacticalStateGlobalName("RB")))
+       g_tacticalOrderRequestBar = (datetime)GlobalVariableGet(TacticalStateGlobalName("RB"));
++   if(GlobalVariableCheck(TacticalStateGlobalName("SQ")))
++      g_tacticalEpisodeSeq = (long)GlobalVariableGet(TacticalStateGlobalName("SQ"));
++   if(GlobalVariableCheck(TacticalStateGlobalName("EX")))
++      g_tacticalExpiredThisEpisode = (GlobalVariableGet(TacticalStateGlobalName("EX")) > 0.5);
++   if(GlobalVariableCheck(TacticalStateGlobalName("AP")))
++      g_tacticalActivationPrice = GlobalVariableGet(TacticalStateGlobalName("AP"));
++   if(GlobalVariableCheck(TacticalStateGlobalName("AH")))
++      g_tacticalActivationHigh = GlobalVariableGet(TacticalStateGlobalName("AH"));
++   if(GlobalVariableCheck(TacticalStateGlobalName("AL")))
++      g_tacticalActivationLow = GlobalVariableGet(TacticalStateGlobalName("AL"));
++   if(GlobalVariableCheck(TacticalStateGlobalName("AA")))
++      g_tacticalActivationAtrPoints = GlobalVariableGet(TacticalStateGlobalName("AA"));
+ 
+    if(g_tacticalState == TACTICAL_STATE_NONE)
+       g_tacticalState = (g_tacticalEntryCount > 0 ? TACTICAL_STATE_CONSUMED : TACTICAL_STATE_ACTIVE);
+@@ -1763,6 +1919,8 @@
+          return "ORDER_PENDING";
+       case TACTICAL_STATE_CONSUMED:
+          return "CONSUMED";
++      case TACTICAL_STATE_EXPIRED:
++         return "EXPIRED";
+       default:
+          return "NONE";
+    }
+@@ -1780,6 +1938,8 @@
+          return "ORDEM PENDENTE";
+       case TACTICAL_STATE_CONSUMED:
+          return "CONSUMIDO";
++      case TACTICAL_STATE_EXPIRED:
++         return "EXPIRADO";
+       default:
+          return "INATIVO";
+    }
+@@ -2073,6 +2233,18 @@
+       LogMessage("[TACTICAL_END] reason=" + reason +
+                  " side=" + side +
+                  " bar=" + TimeToString(g_lastTacticalClosedBar, TIME_DATE | TIME_SECONDS));
++      LogMessage("[TACTICAL_FINISHED] episode_id=" + IntegerToString(g_tacticalEpisodeSeq) +
++                 " reason=" + reason +
++                 " entries=" + IntegerToString(g_tacticalEntryCount) +
++                 " expired=" + BoolToSimNao(g_tacticalExpiredThisEpisode));
++      g_structuralResumeConfirmed = (reason == "STRUCTURAL_RESUMED" ||
++                                     reason == "STRUCTURAL_NEUTRAL" ||
++                                     reason == "STRUCTURAL_REVERSAL");
++      g_structuralResumeWaitSinceBar = g_lastTacticalClosedBar;
++      if(!g_structuralResumeConfirmed)
++         LogMessage("[STRUCTURAL_RESUME_WAIT] since_bar=" + TimeToString(g_lastTacticalClosedBar, TIME_DATE | TIME_SECONDS));
++      g_tacticalExpiredThisEpisode = false;
++      PersistEntryEngineState();
+       SetTacticalEpisodeState(TACTICAL_STATE_NONE, reason, g_lastTacticalClosedBar);
+    }
+    else
+@@ -2129,6 +2301,34 @@
+    g_adaptiveLastAction = "AGUARDANDO";
+    g_adaptiveBlockReason = "SEM CONFIRMACAO";
+    g_lastAdaptiveBlockLogKey = "";
++
++   g_basketCycleId++;
++   g_initialPairRequested = false;
++   g_initialBuyConfirmed = false;
++   g_initialSellConfirmed = false;
++   g_initialPairPartial = false;
++   g_initialRetryCount = 0;
++   g_initialLastAttemptTime = 0;
++   g_neutralEpisodeId++;
++   g_neutralPairsOpened = 0;
++   g_neutralClosedBarStreak = 0;
++   g_lastNeutralAuthTime = 0;
++   g_structuralFirstSlotConsumed = false;
++   g_structuralResumeConfirmed = true;
++   g_structuralResumeWaitSinceBar = 0;
++   g_lastStructuralEntryTime = 0;
++   g_lastStructuralEntryPrice = 0.0;
++   g_lastStructuralEntryBar = 0;
++   g_lastSeenStructuralFlow = 0;
++   g_inFlightBuy = 0;
++   g_inFlightSell = 0;
++   g_inFlightSince = 0;
++   g_roleBlockReasonTactical = "";
++   g_roleBlockReasonStructural = "";
++   g_roleBlockReasonNeutral = "";
++   g_lastAuthorizedRoleText = "NENHUM";
++   PersistEntryEngineState();
++   LogMessage("[BASKET_FLAT_DETECTED] cycle=" + IntegerToString(g_basketCycleId));
+ }
+ 
+ void PrepareAdaptiveFlowForBasket(int open_positions)
+@@ -2259,7 +2459,19 @@
+          g_blockOppositeStructuralPromotionBar = closed_bar;
+          g_tacticalNeutralClosedBars = 0;
+          g_tacticalEpisodeClosedBars = 1;
++         g_tacticalEpisodeSeq++;
++         g_tacticalExpiredThisEpisode = false;
++         g_tacticalActivationPrice = iClose(_Symbol, TacticalFlowTimeframe, 1);
++         g_tacticalActivationHigh = iHigh(_Symbol, TacticalFlowTimeframe, 1);
++         g_tacticalActivationLow = iLow(_Symbol, TacticalFlowTimeframe, 1);
++         g_tacticalActivationAtrPoints = atr_points;
+          SetTacticalEpisodeState(TACTICAL_STATE_ACTIVE, "TACTICAL_VALID", closed_bar);
++         LogMessage("[TACTICAL_DETECTED] episode_id=" + IntegerToString(g_tacticalEpisodeSeq) +
++                    " structural=" + (structural_direction > 0 ? "BUY" : "SELL") +
++                    " tactical=" + (g_tacticalEpisode == TACTICAL_BUY ? "BUY" : "SELL") +
++                    " activation_price=" + DoubleToString(g_tacticalActivationPrice, _Digits) +
++                    " atr_pts=" + DoubleToString(g_tacticalActivationAtrPoints, 1));
++         LogMessage("[STRUCTURAL_PAUSED_BY_CORRECTION] episode_id=" + IntegerToString(g_tacticalEpisodeSeq));
+          PersistTacticalEpisodeState();
+ 
+          string structural_side = (structural_direction > 0 ? "BUY" : "SELL");
+@@ -2292,7 +2504,7 @@
+       g_tacticalConsecutiveConfirmations++;
+       g_tacticalNeutralClosedBars = 0;
+       g_tacticalEpisodeClosedBars++;
+-      if(g_tacticalEpisodeClosedBars >= TACTICAL_MAX_EPISODE_BARS)
++      if(g_tacticalEpisodeClosedBars >= MathMax(1, TacticalMaxEpisodeBars))
+          EndTacticalEpisodeReason("MAX_EPISODE_BARS", true);
+       else
+          PersistTacticalEpisodeState();
+@@ -2325,7 +2537,7 @@
+       return;
+    }
+ 
+-   if(g_tacticalEpisodeClosedBars >= TACTICAL_MAX_EPISODE_BARS)
++   if(g_tacticalEpisodeClosedBars >= MathMax(1, TacticalMaxEpisodeBars))
+    {
+       EndTacticalEpisodeReason("MAX_EPISODE_BARS", true);
+       return;
+@@ -2755,6 +2967,12 @@
+    if(order_type != ORDER_TYPE_BUY && order_type != ORDER_TYPE_SELL)
+       return false;
+ 
++   if(!ConsumeEntryGrant(order_type))
++   {
++      LogMessage("[ENTRY_WITHOUT_GRANT] comment=" + comment);
++      return false;
++   }
++
+    double lot = NormalizeVolume(FixedLot);
+    if(lot <= 0.0)
+    {
+@@ -2785,6 +3003,7 @@
+       return false;
+    }
+ 
++   RegisterEntryInFlight(order_type);
+    g_lastPairOpenTime = TimeCurrent();
+    g_lastPairCandleTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+    g_lastPairMidPrice = MidPrice();
+@@ -2792,176 +3011,1315 @@
+    return true;
+ }
+ 
+-bool ManageAsymmetricAdaptiveEntries()
++bool IsLegacyAdditionalPairEngineAllowed()
++{
++   return !UseAsymmetricBilateralFlowEngine;
++}
++
++ENUM_POSITION_ROLE GetPositionRoleByComment(string comment)
++{
++   if(StringFind(comment, "IA_FG_TACTICAL_") >= 0)
++      return ROLE_TACTICAL;
++   if(StringFind(comment, "IA_FG_STRUCTURAL_") >= 0)
++      return ROLE_STRUCTURAL;
++   if(StringFind(comment, "IA_FG_NEUTRAL_") >= 0)
++      return ROLE_NEUTRAL;
++   if(StringFind(comment, "IA_FG_INITIAL_") >= 0)
++      return ROLE_INITIAL;
++   if(StringFind(comment, "IA_FG_ADDITIONAL_") >= 0)
++      return ROLE_LEGACY_ADDITIONAL;
++   return ROLE_UNKNOWN;
++}
++
++string PositionRoleToText(ENUM_POSITION_ROLE role)
++{
++   switch(role)
++   {
++      case ROLE_INITIAL:
++         return "INITIAL";
++      case ROLE_NEUTRAL:
++         return "NEUTRAL";
++      case ROLE_STRUCTURAL:
++         return "STRUCTURAL";
++      case ROLE_TACTICAL:
++         return "TACTICAL";
++      case ROLE_LEGACY_ADDITIONAL:
++         return "LEGACY_ADDITIONAL";
++      default:
++         return "UNKNOWN";
++   }
++}
++
++string EntryRoleToText(ENUM_ENTRY_ROLE role)
++{
++   switch(role)
++   {
++      case ENTRY_ROLE_INITIAL:
++         return "INITIAL";
++      case ENTRY_ROLE_NEUTRAL:
++         return "NEUTRAL";
++      case ENTRY_ROLE_STRUCTURAL:
++         return "STRUCTURAL";
++      case ENTRY_ROLE_TACTICAL:
++         return "TACTICAL";
++      default:
++         return "LEGACY_ADDITIONAL";
++   }
++}
++
++void BuildEntryExposureSnapshot()
+ {
++   for(int role_index = 0; role_index < POSITION_ROLE_COUNT; role_index++)
++   {
++      g_exposure.open_buy[role_index] = 0;
++      g_exposure.open_sell[role_index] = 0;
++      g_exposure.pending_buy[role_index] = 0;
++      g_exposure.pending_sell[role_index] = 0;
++   }
++
++   for(int i = PositionsTotal() - 1; i >= 0; i--)
++   {
++      if(!IsOurPositionByIndex(i))
++         continue;
++
++      ENUM_POSITION_ROLE role = GetPositionRoleByComment(PositionGetString(POSITION_COMMENT));
++      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
++         g_exposure.open_buy[(int)role]++;
++      else
++         g_exposure.open_sell[(int)role]++;
++   }
++
++   for(int i = OrdersTotal() - 1; i >= 0; i--)
++   {
++      if(!IsOurOrderByIndex(i))
++         continue;
++
++      ENUM_ORDER_TYPE order_type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
++      if(!IsPendingOrderType(order_type))
++         continue;
++
++      ENUM_POSITION_ROLE role = GetPositionRoleByComment(OrderGetString(ORDER_COMMENT));
++      if(IsBuyPendingType(order_type))
++         g_exposure.pending_buy[(int)role]++;
++      else if(IsSellPendingType(order_type))
++         g_exposure.pending_sell[(int)role]++;
++   }
++
++   g_exposure.inflight_buy = MathMax(0, g_inFlightBuy);
++   g_exposure.inflight_sell = MathMax(0, g_inFlightSell);
++
++   g_exposure.total_open_buy = 0;
++   g_exposure.total_open_sell = 0;
++   g_exposure.total_pending_buy = 0;
++   g_exposure.total_pending_sell = 0;
++   for(int role_index = 0; role_index < POSITION_ROLE_COUNT; role_index++)
++   {
++      g_exposure.total_open_buy += g_exposure.open_buy[role_index];
++      g_exposure.total_open_sell += g_exposure.open_sell[role_index];
++      g_exposure.total_pending_buy += g_exposure.pending_buy[role_index];
++      g_exposure.total_pending_sell += g_exposure.pending_sell[role_index];
++   }
++
++   g_exposure.total_buy = g_exposure.total_open_buy + g_exposure.total_pending_buy + g_exposure.inflight_buy;
++   g_exposure.total_sell = g_exposure.total_open_sell + g_exposure.total_pending_sell + g_exposure.inflight_sell;
++   g_exposure.total = g_exposure.total_buy + g_exposure.total_sell;
++}
++
++double GetEntryAtrPoints()
++{
++   return GetClosedAtrPoints(TacticalFlowTimeframe, 1, TACTICAL_ATR_LOOKBACK_BARS);
++}
++
++bool MustReserveTacticalSlot()
++{
++   if(!UseTacticalCorrectionEntries)
++      return false;
++   if(StructuralFlowDirection() == 0)
++      return false;
++   if(g_tacticalEntryCount > 0 ||
++      g_tacticalState == TACTICAL_STATE_CONSUMED ||
++      g_tacticalState == TACTICAL_STATE_EXPIRED)
++      return false;
++
++   int tactical_exposure = g_exposure.open_buy[(int)ROLE_TACTICAL] +
++                           g_exposure.open_sell[(int)ROLE_TACTICAL] +
++                           g_exposure.pending_buy[(int)ROLE_TACTICAL] +
++                           g_exposure.pending_sell[(int)ROLE_TACTICAL];
++   if(tactical_exposure > 0)
++      return false;
++   if(g_tacticalState == TACTICAL_STATE_ORDER_PENDING)
++      return false;
++
++   return true;
++}
++
++bool MustReserveStructuralSlot()
++{
++   return (StructuralFlowDirection() == 0 && !g_structuralFirstSlotConsumed);
++}
++
++string MapAdaptiveBlockReasonToEntryReason()
++{
++   string reason = g_adaptiveBlockReason;
++   if(reason == "SPREAD")
++      return "SPREAD";
++   if(reason == "HORARIO")
++      return "TIME_FILTER";
++   if(reason == "LOSS DIARIO")
++      return "DAILY_BLOCK";
++   if(reason == "META DIARIA")
++      return "DAILY_TARGET_BLOCK";
++   if(reason == "HARD_DD_MANAGEMENT_ONLY")
++      return "HARD_DD";
++   if(reason == "SOFT_DD")
++      return "SOFT_DD";
++   if(reason == "MERCADO FECHADO")
++      return "MARKET_CLOSED";
++   if(reason == "LIMITE DO LADO")
++      return "SIDE_LIMIT";
++   if(reason == "")
++      return "NO_SIGNAL";
++   return reason;
++}
++
++void LogEntryDecision(bool authorized, ENUM_ENTRY_ROLE role, ENUM_ORDER_TYPE direction, string reason)
++{
++   string side = (direction == ORDER_TYPE_BUY ? "BUY" : "SELL");
++   string key = EntryRoleToText(role) + "|" + side + "|" + (authorized ? "AUTHORIZED" : reason);
++   if(!authorized && key == g_lastEntryDecisionLogKey)
++      return;
++   g_lastEntryDecisionLogKey = key;
++
++   if(authorized)
++      LogMessage("[ENTRY_AUTH] role=" + EntryRoleToText(role) +
++                 " side=" + side +
++                 " flow=" + StructuralFlowToText() +
++                 " buy=" + IntegerToString(g_exposure.total_open_buy) +
++                 " sell=" + IntegerToString(g_exposure.total_open_sell) +
++                 " pending=" + IntegerToString(g_exposure.total_pending_buy + g_exposure.total_pending_sell) +
++                 " inflight=" + IntegerToString(g_exposure.inflight_buy + g_exposure.inflight_sell) +
++                 " cap_buy=" + IntegerToString(GetDynamicBuyLimit()) +
++                 " cap_sell=" + IntegerToString(GetDynamicSellLimit()) +
++                 " exposure=" + IntegerToString(g_exposure.total) +
++                 " result=AUTHORIZED");
++   else
++      LogMessage("[ENTRY_BLOCK] role=" + EntryRoleToText(role) +
++                 " side=" + side +
++                 " flow=" + StructuralFlowToText() +
++                 " exposure=" + IntegerToString(g_exposure.total) +
++                 " reason=" + reason);
++}
++
++bool CanOpenEntryRole(ENUM_ENTRY_ROLE role, ENUM_ORDER_TYPE direction, string &block_reason)
++{
++   block_reason = "";
++   BuildEntryExposureSnapshot();
++
+    if(g_adaptiveEntryAttemptedThisTick)
+    {
+-      if(g_tacticalState == TACTICAL_STATE_ACTIVE)
+-         LogTacticalEntryBlock("ENTRY_ATTEMPTED_THIS_TICK");
++      block_reason = "ENTRY_ALREADY_SENT_THIS_TICK";
+       return false;
+    }
+ 
+-   int open_positions = CountOpenPositions();
++   if(role == ENTRY_ROLE_LEGACY_ADDITIONAL)
++   {
++      if(!IsLegacyAdditionalPairEngineAllowed())
++      {
++         block_reason = "LEGACY_ADDITIONAL_DISABLED";
++         LogEntryDecision(false, role, direction, block_reason);
++         return false;
++      }
++      return true;
++   }
+ 
+-   if(open_positions == 0)
++   int total_cap = MathMin(8, LimitOpenPositions());
++
++   if(role == ENTRY_ROLE_INITIAL)
+    {
+-      g_adaptiveLastAction = "AGUARDANDO";
+-      if(CanOpenNewPair())
++      if(g_exposure.total > 0)
+       {
+-         g_adaptiveEntryAttemptedThisTick = true;
+-         if(OpenBuySellPair(false))
++         block_reason = "BASKET_NOT_FLAT";
++         LogEntryDecision(false, role, direction, block_reason);
++         return false;
++      }
++      if(g_initialPairPartial)
++      {
++         block_reason = "INITIAL_PAIR_PARTIAL";
++         LogEntryDecision(false, role, direction, block_reason);
++         return false;
++      }
++      if(!CanOpenNewPair())
++      {
++         block_reason = "INITIAL_FILTERS";
++         LogEntryDecision(false, role, direction, block_reason);
++         return false;
++      }
++
++      g_entryGrantRole = (int)role;
++      g_entryGrantDirection = (int)ORDER_TYPE_BUY;
++      g_entryGrantCycle = g_moneySnapshotCycle;
++      g_entryGrantConsumed = false;
++      LogEntryDecision(true, role, direction, "");
++      return true;
++   }
++
++   if(!BaseDirectionalEntryFiltersOK(direction))
++   {
++      block_reason = MapAdaptiveBlockReasonToEntryReason();
++      LogEntryDecision(false, role, direction, block_reason);
++      return false;
++   }
++
++   int side_total = (direction == ORDER_TYPE_BUY ? g_exposure.total_buy : g_exposure.total_sell);
++   int side_cap = (direction == ORDER_TYPE_BUY ? GetDynamicBuyLimit() : GetDynamicSellLimit());
++   int side_inflight = (direction == ORDER_TYPE_BUY ? g_exposure.inflight_buy : g_exposure.inflight_sell);
++
++   if(side_inflight > 0)
++   {
++      block_reason = "ORDER_IN_FLIGHT";
++      LogEntryDecision(false, role, direction, block_reason);
++      return false;
++   }
++
++   if(role == ENTRY_ROLE_NEUTRAL)
++   {
++      if(NeutralEntryPolicy == NEUTRAL_INITIAL_PAIR_ONLY)
++      {
++         block_reason = "NEUTRAL_DISABLED_BY_POLICY";
++         LogEntryDecision(false, role, direction, block_reason);
++         return false;
++      }
++      if(StructuralFlowDirection() != 0)
++      {
++         block_reason = "NO_SIGNAL";
++         LogEntryDecision(false, role, direction, block_reason);
++         return false;
++      }
++      if(g_tacticalEpisode != TACTICAL_NONE || g_tacticalState != TACTICAL_STATE_NONE)
++      {
++         block_reason = "TACTICAL_EPISODE_ACTIVE";
++         LogEntryDecision(false, role, direction, block_reason);
++         return false;
++      }
++      if(g_initialPairPartial)
++      {
++         block_reason = "INITIAL_PAIR_PARTIAL";
++         LogEntryDecision(false, role, direction, block_reason);
++         return false;
++      }
++
++      int dirty_exposure = 0;
++      for(int role_index = 0; role_index < POSITION_ROLE_COUNT; role_index++)
++      {
++         if(role_index == (int)ROLE_INITIAL || role_index == (int)ROLE_NEUTRAL)
++            continue;
++         dirty_exposure += g_exposure.open_buy[role_index] + g_exposure.open_sell[role_index] +
++                           g_exposure.pending_buy[role_index] + g_exposure.pending_sell[role_index];
++      }
++      if(dirty_exposure > 0)
++      {
++         block_reason = "NEUTRAL_BASKET_NOT_CLEAN";
++         LogEntryDecision(false, role, direction, block_reason);
++         return false;
++      }
++
++      if(NeutralEntryPolicy == NEUTRAL_CONTROLLED_TWO_PAIRS)
++      {
++         if(g_neutralPairsOpened >= 1)
+          {
+-            g_adaptiveLastAction = "PAR INICIAL";
+-            SetAdaptiveBlockReason("");
++            block_reason = "NEUTRAL_PAIR_ALREADY_CONSUMED";
++            LogEntryDecision(false, role, direction, block_reason);
++            return false;
++         }
++         if(g_exposure.total != 2 ||
++            g_exposure.open_buy[(int)ROLE_INITIAL] != 1 ||
++            g_exposure.open_sell[(int)ROLE_INITIAL] != 1)
++         {
++            block_reason = "NEUTRAL_BASKET_NOT_CLEAN";
++            LogEntryDecision(false, role, direction, block_reason);
++            return false;
+          }
+       }
++
++      if(g_neutralClosedBarStreak < MathMax(1, NeutralConfirmationBars))
++      {
++         block_reason = "WAITING_CLOSED_BAR";
++         LogEntryDecision(false, role, direction, block_reason);
++         return false;
++      }
++
++      datetime neutral_now = TimeCurrent();
++      if(g_lastNeutralAuthTime > 0 && NeutralCooldownSeconds > 0 &&
++         (int)(neutral_now - g_lastNeutralAuthTime) < NeutralCooldownSeconds)
++      {
++         block_reason = "COOLDOWN";
++         LogEntryDecision(false, role, direction, block_reason);
++         return false;
++      }
++
++      double neutral_atr_points = GetEntryAtrPoints();
++      if(NeutralMinDistanceATR > 0.0 && neutral_atr_points > 0.0 && g_lastPairMidPrice > 0.0)
++      {
++         double neutral_distance_points = MathAbs(MidPrice() - g_lastPairMidPrice) / _Point;
++         if(neutral_distance_points < NeutralMinDistanceATR * neutral_atr_points)
++         {
++            block_reason = "DISTANCE";
++            LogEntryDecision(false, role, direction, block_reason);
++            return false;
++         }
++      }
++
++      int neutral_side_cap_buy = MathMin(4, GetDynamicBuyLimit());
++      int neutral_side_cap_sell = MathMin(4, GetDynamicSellLimit());
++      if(g_exposure.total_buy + 1 > neutral_side_cap_buy ||
++         g_exposure.total_sell + 1 > neutral_side_cap_sell)
++      {
++         block_reason = "SIDE_LIMIT";
++         LogEntryDecision(false, role, direction, block_reason);
++         return false;
++      }
++
++      if(g_exposure.total + 2 > total_cap)
++      {
++         block_reason = "TOTAL_LIMIT";
++         LogEntryDecision(false, role, direction, block_reason);
++         return false;
++      }
++
++      if(MustReserveStructuralSlot() && g_exposure.total + 2 > total_cap - 1)
++      {
++         block_reason = "STRUCTURAL_SLOT_RESERVED";
++         LogEntryDecision(false, role, direction, block_reason);
++         return false;
++      }
++
++      g_entryGrantRole = (int)role;
++      g_entryGrantDirection = (int)ORDER_TYPE_BUY;
++      g_entryGrantCycle = g_moneySnapshotCycle;
++      g_entryGrantConsumed = false;
++      LogEntryDecision(true, role, direction, "");
+       return true;
+    }
+ 
+-   if(g_tacticalEpisode != TACTICAL_NONE || g_tacticalState != TACTICAL_STATE_NONE)
++   if(role == ENTRY_ROLE_STRUCTURAL)
+    {
+-      if(g_tacticalEpisode != TACTICAL_BUY && g_tacticalEpisode != TACTICAL_SELL)
++      int flow_direction = StructuralFlowDirection();
++      int entry_direction = (direction == ORDER_TYPE_BUY ? 1 : -1);
++      if(flow_direction == 0 || entry_direction != flow_direction)
++      {
++         block_reason = "STRUCTURAL_FLOW_LOST";
++         LogEntryDecision(false, role, direction, block_reason);
++         return false;
++      }
++      if(g_tacticalEpisode != TACTICAL_NONE || g_tacticalState != TACTICAL_STATE_NONE)
++      {
++         block_reason = "STRUCTURAL_PAUSED_BY_CORRECTION";
++         LogEntryDecision(false, role, direction, block_reason);
++         return false;
++      }
++      if(g_initialPairPartial)
++      {
++         block_reason = "INITIAL_PAIR_PARTIAL";
++         LogEntryDecision(false, role, direction, block_reason);
++         return false;
++      }
++      if(!g_structuralResumeConfirmed)
+       {
+-         SetAdaptiveBlockReason("CORRECAO ATIVA", "direcao tatica invalida");
+-         LogTacticalEntryBlock("INVALID_TACTICAL_DIRECTION");
++         block_reason = "WAITING_STRUCTURAL_RESUME";
++         LogEntryDecision(false, role, direction, block_reason);
+          return false;
+       }
+ 
+-      string side = TacticalDirectionToText();
++      if(side_total > side_cap)
++      {
++         block_reason = "SIDE_OVEREXPOSED";
++         LogEntryDecision(false, role, direction, block_reason);
++         return false;
++      }
++      if(side_total + 1 > side_cap)
++      {
++         block_reason = "SIDE_LIMIT";
++         LogEntryDecision(false, role, direction, block_reason);
++         return false;
++      }
++      if(g_exposure.total + 1 > total_cap)
++      {
++         block_reason = "TOTAL_LIMIT";
++         LogEntryDecision(false, role, direction, block_reason);
++         return false;
++      }
++      if(MustReserveTacticalSlot() && g_exposure.total + 1 > total_cap - 1)
++      {
++         block_reason = "TACTICAL_SLOT_RESERVED";
++         LogEntryDecision(false, role, direction, block_reason);
++         return false;
++      }
+ 
+-      if(g_tacticalAwaitingPostRebuildClosedBar)
++      datetime structural_closed_bar = iTime(_Symbol, StructuralFlowTimeframe, 1);
++      if(structural_closed_bar <= 0 || g_lastStructuralEntryBar == structural_closed_bar)
+       {
+-         SetAdaptiveBlockReason("CORRECAO ATIVA", side + " aguardando candle pos-rebuild");
+-         LogTacticalEntryBlock("POST_REBUILD_GUARD");
++         block_reason = "WAITING_CLOSED_BAR";
++         LogEntryDecision(false, role, direction, block_reason);
+          return false;
+       }
+ 
+-      if(g_tacticalState == TACTICAL_STATE_ORDER_PENDING)
++      datetime structural_now = TimeCurrent();
++      if(g_lastStructuralEntryTime > 0 && StructuralCooldownSeconds > 0 &&
++         (int)(structural_now - g_lastStructuralEntryTime) < StructuralCooldownSeconds)
+       {
+-         CheckTacticalOrderPendingTimeout();
+-         SetAdaptiveBlockReason("CORRECAO ATIVA", side + " ordem tatica pendente");
+-         LogTacticalEntryBlock("ORDER_ALREADY_PENDING");
++         block_reason = "COOLDOWN";
++         LogEntryDecision(false, role, direction, block_reason);
+          return false;
+       }
+ 
+-      if(g_tacticalState == TACTICAL_STATE_CONSUMED || g_tacticalEntryCount >= TACTICAL_MAX_PROGRESSIVE_ENTRIES)
++      double structural_atr_points = GetEntryAtrPoints();
++      double entry_price = (direction == ORDER_TYPE_BUY ? g_tick.ask : g_tick.bid);
++      if(StructuralMinDistanceATR > 0.0 && structural_atr_points > 0.0 && g_lastStructuralEntryPrice > 0.0)
+       {
+-         SetAdaptiveBlockReason("CORRECAO ATIVA", side + " tatica consumida");
+-         LogTacticalEntryBlock("ALREADY_CONSUMED");
+-         if(g_tacticalConsumedBlockLoggedBar != g_lastTacticalClosedBar)
++         double structural_distance_points = MathAbs(entry_price - g_lastStructuralEntryPrice) / _Point;
++         if(structural_distance_points < StructuralMinDistanceATR * structural_atr_points)
+          {
+-            LogMessage("[TACTICAL_BLOCK] reason=ALREADY_CONSUMED");
+-            g_tacticalConsumedBlockLoggedBar = g_lastTacticalClosedBar;
++            block_reason = "DISTANCE";
++            LogEntryDecision(false, role, direction, block_reason);
++            return false;
++         }
++      }
++
++      if(StructuralMaxExtensionATR > 0.0 && structural_atr_points > 0.0 && g_structuralFlowAnchorPrice > 0.0)
++      {
++         double extension_points = MathAbs(entry_price - g_structuralFlowAnchorPrice) / _Point;
++         if(extension_points > StructuralMaxExtensionATR * structural_atr_points)
++         {
++            block_reason = "EXTENSION";
++            LogEntryDecision(false, role, direction, block_reason);
++            return false;
+          }
+-         return false;
+       }
+ 
++      g_entryGrantRole = (int)role;
++      g_entryGrantDirection = (int)direction;
++      g_entryGrantCycle = g_moneySnapshotCycle;
++      g_entryGrantConsumed = false;
++      LogEntryDecision(true, role, direction, "");
++      return true;
++   }
++
++   if(role == ENTRY_ROLE_TACTICAL)
++   {
++      if(!UseTacticalCorrectionEntries)
++      {
++         block_reason = "NO_SIGNAL";
++         LogEntryDecision(false, role, direction, block_reason);
++         return false;
++      }
+       if(g_tacticalState != TACTICAL_STATE_ACTIVE)
+       {
+-         SetAdaptiveBlockReason("CORRECAO ATIVA", side + " aguardando estado ativo");
+-         LogTacticalEntryBlock("INTERNAL_STATE_MISMATCH");
++         block_reason = (g_tacticalState == TACTICAL_STATE_EXPIRED ? "SIGNAL_EXPIRED" :
++                         g_tacticalState == TACTICAL_STATE_CONSUMED ? "TACTICAL_ALREADY_CONSUMED" :
++                         g_tacticalState == TACTICAL_STATE_ORDER_PENDING ? "ORDER_IN_FLIGHT" :
++                         "NO_SIGNAL");
++         LogEntryDecision(false, role, direction, block_reason);
++         return false;
++      }
++      if(g_tacticalEntryCount >= TACTICAL_MAX_PROGRESSIVE_ENTRIES)
++      {
++         block_reason = "TACTICAL_ALREADY_CONSUMED";
++         LogEntryDecision(false, role, direction, block_reason);
+          return false;
+       }
+ 
+-      if(!UseTacticalCorrectionEntries)
++      int episode_direction = (g_tacticalEpisode == TACTICAL_BUY ? 1 : g_tacticalEpisode == TACTICAL_SELL ? -1 : 0);
++      int entry_direction = (direction == ORDER_TYPE_BUY ? 1 : -1);
++      if(episode_direction == 0 ||
++         entry_direction != episode_direction ||
++         g_tacticalEpisodeStructuralDirection == 0 ||
++         entry_direction != -g_tacticalEpisodeStructuralDirection ||
++         StructuralFlowDirection() != g_tacticalEpisodeStructuralDirection)
+       {
+-         SetAdaptiveBlockReason("CORRECAO ATIVA", side + " tatica desativada");
+-         LogTacticalEntryBlock("TRADE_NOT_ALLOWED");
++         block_reason = "NO_SIGNAL";
++         LogEntryDecision(false, role, direction, block_reason);
+          return false;
+       }
+ 
+-      if(g_tacticalEntryAuthorizedClosedBar == g_lastTacticalClosedBar)
++      int tactical_period_seconds = PeriodSeconds(TacticalFlowTimeframe);
++      int signal_age_bars = 0;
++      if(tactical_period_seconds > 0 && g_tacticalActivatedClosedBar > 0 &&
++         g_lastTacticalClosedBar >= g_tacticalActivatedClosedBar)
++         signal_age_bars = (int)((g_lastTacticalClosedBar - g_tacticalActivatedClosedBar) / tactical_period_seconds);
++      if(signal_age_bars > MathMax(0, TacticalMaxEntryAgeBars))
+       {
+-         SetAdaptiveBlockReason("CORRECAO ATIVA", side + " aguardando novo candle");
+-         LogTacticalEntryBlock("SAME_BAR_DUPLICATE_REQUEST");
++         block_reason = "SIGNAL_EXPIRED";
++         LogEntryDecision(false, role, direction, block_reason);
+          return false;
+       }
+ 
+-      ENUM_ORDER_TYPE tactical_order = TacticalOrderTypeForEpisode(g_tacticalEpisode);
+-      string tactical_comment = TacticalOrderComment(g_tacticalEpisode);
+-      double tactical_volume = NormalizeVolume(FixedLot);
++      int tactical_open = g_exposure.open_buy[(int)ROLE_TACTICAL] + g_exposure.open_sell[(int)ROLE_TACTICAL];
++      if(tactical_open > 0)
++      {
++         block_reason = "TACTICAL_POSITION_ALREADY_OPEN";
++         LogEntryDecision(false, role, direction, block_reason);
++         return false;
++      }
+ 
+-      if(CanOpenAdaptiveUnitEntry(tactical_order))
++      if(side_total > side_cap)
+       {
+-         LogTacticalFlowTrace("BEFORE_OPEN", "side=" + side);
+-         g_tacticalEntryAuthorizedClosedBar = g_lastTacticalClosedBar;
+-         g_blockOppositeStructuralPromotionBar = g_lastTacticalClosedBar;
+-         g_tacticalPendingOrderType = tactical_order;
+-         g_tacticalPendingComment = tactical_comment;
+-         g_tacticalPendingVolume = tactical_volume;
+-         g_tacticalOrderRequestTime = TimeCurrent();
+-         g_tacticalOrderRequestBar = g_lastTacticalClosedBar;
+-         SetTacticalEpisodeState(TACTICAL_STATE_ORDER_PENDING, "ORDER_REQUESTED", g_lastTacticalClosedBar);
+-         PersistTacticalEpisodeState();
++         block_reason = "SIDE_OVEREXPOSED";
++         LogEntryDecision(false, role, direction, block_reason);
++         return false;
++      }
++      if(side_total + 1 > side_cap)
++      {
++         block_reason = "SIDE_LIMIT";
++         LogEntryDecision(false, role, direction, block_reason);
++         return false;
++      }
++      if(g_exposure.total + 1 > total_cap)
++      {
++         block_reason = "TOTAL_LIMIT";
++         LogEntryDecision(false, role, direction, block_reason);
++         return false;
++      }
++
++      g_entryGrantRole = (int)role;
++      g_entryGrantDirection = (int)direction;
++      g_entryGrantCycle = g_moneySnapshotCycle;
++      g_entryGrantConsumed = false;
++      LogEntryDecision(true, role, direction, "");
++      return true;
++   }
++
++   block_reason = "NO_SIGNAL";
++   return false;
++}
++
++bool ConsumeEntryGrant(ENUM_ORDER_TYPE direction)
++{
++   if(g_entryGrantConsumed || g_entryGrantCycle != g_moneySnapshotCycle)
++      return false;
++   if(g_entryGrantDirection != (int)direction)
++      return false;
++
++   g_entryGrantConsumed = true;
++   return true;
++}
++
++void RegisterEntryInFlight(ENUM_ORDER_TYPE direction)
++{
++   if(direction == ORDER_TYPE_BUY)
++      g_inFlightBuy++;
++   else
++      g_inFlightSell++;
++   g_inFlightSince = TimeCurrent();
++}
+ 
+-         LogMessage("[TACTICAL_ORDER_REQUESTED] side=" + side +
+-                    " bar=" + TimeToString(g_lastTacticalClosedBar, TIME_DATE | TIME_SECONDS) +
+-                    " request=" + tactical_comment);
+-
+-         bool requested = OpenAdaptiveUnitPosition(tactical_order, tactical_comment);
+-         uint retcode = (uint)trade.ResultRetcode();
+-         g_tacticalPendingOrder = trade.ResultOrder();
+-         g_tacticalPendingDeal = trade.ResultDeal();
+-         LogTacticalFlowTrace("AFTER_OPEN", "result=" + (requested ? "1" : "0") + " retcode=" + IntegerToString((int)retcode));
++void ReconcileInFlightEntries()
++{
++   if(g_inFlightBuy <= 0 && g_inFlightSell <= 0)
++   {
++      g_inFlightBuy = 0;
++      g_inFlightSell = 0;
++      g_inFlightSince = 0;
++      return;
++   }
+ 
+-         if(!requested || !IsTradeRetcodeSuccess(retcode))
++   datetime now = TimeCurrent();
++   if(g_inFlightSince > 0 && now - g_inFlightSince >= 15)
++   {
++      LogMessage("[ENTRY_INFLIGHT_TIMEOUT] buy=" + IntegerToString(g_inFlightBuy) +
++                 " sell=" + IntegerToString(g_inFlightSell));
++      g_inFlightBuy = 0;
++      g_inFlightSell = 0;
++      g_inFlightSince = 0;
++   }
++}
++
++void SyncEntryEngineWithFlow()
++{
++   int current_flow = (int)g_structuralStableFlow;
++   int current_direction = StructuralFlowDirection();
++   int previous_direction = (g_lastSeenStructuralFlow > 0 ? 1 : g_lastSeenStructuralFlow < 0 ? -1 : 0);
++
++   if(current_flow != g_lastSeenStructuralFlow)
++   {
++      if(current_direction != previous_direction)
++      {
++         if(current_direction != 0)
+          {
+-            LogMessage("[TACTICAL_ORDER_REJECTED] retcode=" + IntegerToString((int)retcode) +
+-                       " description=" + trade.ResultRetcodeDescription());
+-            ResetTacticalOrderPendingState();
+-            SetTacticalEpisodeState(TACTICAL_STATE_ACTIVE, "ORDER_REJECTED", g_lastTacticalClosedBar);
+-            PersistTacticalEpisodeState();
+-            return true;
++            g_structuralFlowAnchorPrice = iClose(_Symbol, StructuralFlowTimeframe, 1);
++            g_structuralFirstSlotConsumed = false;
++            g_structuralResumeConfirmed = true;
++            g_structuralResumeWaitSinceBar = 0;
++            g_lastStructuralEntryPrice = 0.0;
++            g_lastStructuralEntryTime = 0;
++            g_lastStructuralEntryBar = 0;
++            LogMessage("[STRUCTURAL_FLOW_CONFIRMED] flow=" + StructuralFlowToText() +
++                       " anchor=" + DoubleToString(g_structuralFlowAnchorPrice, _Digits));
+          }
++         else
++         {
++            g_neutralEpisodeId++;
++            g_neutralPairsOpened = 0;
++            g_neutralClosedBarStreak = 0;
++            LogMessage("[NEUTRAL_EPISODE_CREATED] id=" + IntegerToString(g_neutralEpisodeId));
++         }
++         PersistEntryEngineState();
++      }
++      else if(current_direction != 0)
++         LogMessage("[STRUCTURAL_FLOW_CHANGED] flow=" + StructuralFlowToText());
++
++      g_lastSeenStructuralFlow = current_flow;
++   }
++
++   datetime structural_bar = iTime(_Symbol, StructuralFlowTimeframe, 1);
++   if(structural_bar > 0 && structural_bar != g_lastNeutralStreakBar)
++   {
++      g_lastNeutralStreakBar = structural_bar;
++
++      int closed_raw_signal = 0;
++      double closed_body_ratio = 0.0;
++      double closed_volume_strength = 0.0;
++      bool have_closed_signal = GetClosedStructuralSignal(StructuralFlowTimeframe, 1,
++                                                          closed_raw_signal,
++                                                          closed_body_ratio,
++                                                          closed_volume_strength);
++
++      if(current_direction == 0 && have_closed_signal && closed_raw_signal == 0)
++         g_neutralClosedBarStreak++;
++      else
++         g_neutralClosedBarStreak = 0;
++
++      if(!g_structuralResumeConfirmed && current_direction != 0 &&
++         structural_bar > g_structuralResumeWaitSinceBar &&
++         have_closed_signal && closed_raw_signal == current_direction)
++      {
++         g_structuralResumeConfirmed = true;
++         LogMessage("[STRUCTURAL_RESUME_CONFIRMED] bar=" + TimeToString(structural_bar, TIME_DATE | TIME_SECONDS));
++         PersistEntryEngineState();
++      }
++      else if(!g_structuralResumeConfirmed && current_direction != 0 &&
++              structural_bar > g_structuralResumeWaitSinceBar)
++         LogMessage("[STRUCTURAL_RESUME_WAIT] bar=" + TimeToString(structural_bar, TIME_DATE | TIME_SECONDS));
++   }
++}
++
++bool OpenInitialPairAdaptive()
++{
++   if(!ConsumeEntryGrant(ORDER_TYPE_BUY) || g_entryGrantRole != (int)ENTRY_ROLE_INITIAL)
++   {
++      LogMessage("[ENTRY_WITHOUT_GRANT] role=INITIAL");
++      return false;
++   }
++
++   double lot = NormalizeVolume(FixedLot);
++   if(lot <= 0.0)
++   {
++      LogMessage("[INITIAL_PAIR_BLOCKED] reason=LOTE_INVALIDO");
++      return false;
++   }
++
++   g_initialPairRequested = true;
++   g_initialBuyConfirmed = false;
++   g_initialSellConfirmed = false;
++   g_initialPairPartial = false;
++   g_initialRetryCount = 0;
++   g_initialLastAttemptTime = TimeCurrent();
++   LogMessage("[INITIAL_PAIR_REQUEST] cycle=" + IntegerToString(g_basketCycleId));
++
++   bool buy_ok = trade.Buy(lot, _Symbol, 0.0, 0.0, 0.0, "IA_FG_INITIAL_BUY");
++   uint buy_retcode = (uint)trade.ResultRetcode();
++   if(buy_ok && IsTradeRetcodeSuccess(buy_retcode))
++      RegisterEntryInFlight(ORDER_TYPE_BUY);
++   else
++      buy_ok = false;
++
++   bool sell_ok = trade.Sell(lot, _Symbol, 0.0, 0.0, 0.0, "IA_FG_INITIAL_SELL");
++   uint sell_retcode = (uint)trade.ResultRetcode();
++   if(sell_ok && IsTradeRetcodeSuccess(sell_retcode))
++      RegisterEntryInFlight(ORDER_TYPE_SELL);
++   else
++      sell_ok = false;
++
++   g_lastPairOpenTime = TimeCurrent();
++   g_lastPairCandleTime = iTime(_Symbol, PERIOD_CURRENT, 0);
++   g_lastPairMidPrice = MidPrice();
++   InvalidateMoneySnapshots();
++
++   if(buy_ok && sell_ok)
++      LogMessage("[INITIAL_PAIR_REQUEST] result=AMBAS_ENVIADAS cycle=" + IntegerToString(g_basketCycleId));
++   else if(buy_ok != sell_ok)
++   {
++      g_initialPairPartial = true;
++      LogMessage("[INITIAL_PAIR_PARTIAL] faltante=" + (buy_ok ? "SELL" : "BUY") +
++                 " retcode=" + IntegerToString((int)(buy_ok ? sell_retcode : buy_retcode)) +
++                 " descricao=" + trade.ResultRetcodeDescription());
++   }
++   else
++   {
++      g_initialPairRequested = false;
++      LogMessage("[INITIAL_PAIR_BLOCKED] reason=AMBAS_REJEITADAS retcode_buy=" + IntegerToString((int)buy_retcode) +
++                 " retcode_sell=" + IntegerToString((int)sell_retcode));
++   }
++
++   PersistEntryEngineState();
++   return (buy_ok || sell_ok);
++}
++
++void TryCompleteInitialPair()
++{
++   if(!g_initialPairPartial)
++      return;
++
++   if(g_initialRetryCount >= 1)
++   {
++      SetAdaptiveBlockReason("INITIAL_PAIR_PARTIAL", "limite de tentativas da perna ausente");
++      return;
++   }
++
++   datetime now = TimeCurrent();
++   int retry_cooldown = MathMax(5, ReopenDelaySecondsAfterClose);
++   if(g_initialLastAttemptTime > 0 && (int)(now - g_initialLastAttemptTime) < retry_cooldown)
++   {
++      SetAdaptiveBlockReason("INITIAL_PAIR_PARTIAL", "aguardando cooldown da retentativa");
++      return;
++   }
++
++   BuildEntryExposureSnapshot();
++   bool missing_buy = (!g_initialBuyConfirmed && g_exposure.open_buy[(int)ROLE_INITIAL] == 0);
++   bool missing_sell = (!g_initialSellConfirmed && g_exposure.open_sell[(int)ROLE_INITIAL] == 0);
++   if(missing_buy == missing_sell)
++   {
++      g_initialPairPartial = (missing_buy && missing_sell && g_initialPairRequested &&
++                              g_exposure.total > 0);
++      if(!g_initialPairPartial)
++         LogMessage("[INITIAL_PAIR_CONFIRMED] reconciliado cycle=" + IntegerToString(g_basketCycleId));
++      PersistEntryEngineState();
++      return;
++   }
++
++   ENUM_ORDER_TYPE missing_direction = (missing_buy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
++   int side_inflight = (missing_buy ? g_exposure.inflight_buy : g_exposure.inflight_sell);
++   if(side_inflight > 0)
++   {
++      SetAdaptiveBlockReason("INITIAL_PAIR_PARTIAL", "perna ausente em transito");
++      return;
++   }
++
++   if(g_dailyLossBlocked || g_dailyProfitBlocked || g_basketDDState == BASKET_DD_HARD)
++   {
++      SetAdaptiveBlockReason("INITIAL_PAIR_PARTIAL", "risco impede completar a perna");
++      return;
++   }
++
++   double lot = NormalizeVolume(FixedLot);
++   if(lot <= 0.0)
++      return;
++
++   g_initialRetryCount++;
++   g_initialLastAttemptTime = now;
++   g_adaptiveEntryAttemptedThisTick = true;
++
++   string missing_comment = (missing_buy ? "IA_FG_INITIAL_BUY" : "IA_FG_INITIAL_SELL");
++   bool retry_ok = (missing_buy ? trade.Buy(lot, _Symbol, 0.0, 0.0, 0.0, missing_comment)
++                                : trade.Sell(lot, _Symbol, 0.0, 0.0, 0.0, missing_comment));
++   uint retry_retcode = (uint)trade.ResultRetcode();
++   if(retry_ok && IsTradeRetcodeSuccess(retry_retcode))
++   {
++      RegisterEntryInFlight(missing_direction);
++      LogMessage("[INITIAL_PAIR_REQUEST] retentativa=" + missing_comment);
++   }
++   else
++      LogMessage("[INITIAL_PAIR_BLOCKED] retentativa_falhou=" + missing_comment +
++                 " retcode=" + IntegerToString((int)retry_retcode) +
++                 " descricao=" + trade.ResultRetcodeDescription());
++
++   InvalidateMoneySnapshots();
++   PersistEntryEngineState();
++}
++
++bool OpenNeutralPairControlled()
++{
++   if(!ConsumeEntryGrant(ORDER_TYPE_BUY) || g_entryGrantRole != (int)ENTRY_ROLE_NEUTRAL)
++   {
++      LogMessage("[ENTRY_WITHOUT_GRANT] role=NEUTRAL");
++      return false;
++   }
++
++   double lot = NormalizeVolume(FixedLot);
++   if(lot <= 0.0)
++   {
++      LogMessage("[NEUTRAL_PAIR_BLOCKED] reason=LOTE_INVALIDO");
++      return false;
++   }
++
++   g_adaptiveEntryAttemptedThisTick = true;
++   LogMessage("[NEUTRAL_PAIR_REQUEST] episodio=" + IntegerToString(g_neutralEpisodeId) +
++              " pares_previos=" + IntegerToString(g_neutralPairsOpened));
++
++   bool buy_ok = trade.Buy(lot, _Symbol, 0.0, 0.0, 0.0, "IA_FG_NEUTRAL_BUY");
++   uint buy_retcode = (uint)trade.ResultRetcode();
++   if(buy_ok && IsTradeRetcodeSuccess(buy_retcode))
++      RegisterEntryInFlight(ORDER_TYPE_BUY);
++   else
++      buy_ok = false;
++
++   bool sell_ok = trade.Sell(lot, _Symbol, 0.0, 0.0, 0.0, "IA_FG_NEUTRAL_SELL");
++   uint sell_retcode = (uint)trade.ResultRetcode();
++   if(sell_ok && IsTradeRetcodeSuccess(sell_retcode))
++      RegisterEntryInFlight(ORDER_TYPE_SELL);
++   else
++      sell_ok = false;
++
++   if(buy_ok != sell_ok)
++   {
++      LogMessage("[NEUTRAL_PAIR_BLOCKED] reason=PAR_PARCIAL rollback=" + (buy_ok ? "BUY" : "SELL"));
++      CloseNewestPositionOfType(buy_ok ? POSITION_TYPE_BUY : POSITION_TYPE_SELL);
++      InvalidateMoneySnapshots();
++      return false;
++   }
++
++   if(!buy_ok)
++   {
++      LogMessage("[NEUTRAL_PAIR_BLOCKED] reason=AMBAS_REJEITADAS retcode_buy=" + IntegerToString((int)buy_retcode) +
++                 " retcode_sell=" + IntegerToString((int)sell_retcode));
++      return false;
++   }
++
++   g_neutralPairsOpened++;
++   g_lastNeutralAuthTime = TimeCurrent();
++   g_lastPairOpenTime = TimeCurrent();
++   g_lastPairCandleTime = iTime(_Symbol, PERIOD_CURRENT, 0);
++   g_lastPairMidPrice = MidPrice();
++   InvalidateMoneySnapshots();
++   PersistEntryEngineState();
++   LogMessage("[NEUTRAL_PAIR_CONFIRMED] episodio=" + IntegerToString(g_neutralEpisodeId) +
++              " pares=" + IntegerToString(g_neutralPairsOpened));
++   if(NeutralEntryPolicy == NEUTRAL_CONTROLLED_TWO_PAIRS)
++      LogMessage("[NEUTRAL_PAIR_CONSUMED] episodio=" + IntegerToString(g_neutralEpisodeId));
++   return true;
++}
++
++void ManageTacticalEpisodeEntry()
++{
++   if(g_tacticalEpisode != TACTICAL_BUY && g_tacticalEpisode != TACTICAL_SELL)
++   {
++      SetAdaptiveBlockReason("CORRECAO ATIVA", "direcao tatica invalida");
++      LogTacticalEntryBlock("INVALID_TACTICAL_DIRECTION");
++      return;
++   }
++
++   string side = TacticalDirectionToText();
++
++   if(g_tacticalAwaitingPostRebuildClosedBar)
++   {
++      SetAdaptiveBlockReason("CORRECAO ATIVA", side + " aguardando candle pos-rebuild");
++      LogTacticalEntryBlock("POST_REBUILD_GUARD");
++      return;
++   }
+ 
++   if(g_tacticalState == TACTICAL_STATE_ORDER_PENDING)
++   {
++      CheckTacticalOrderPendingTimeout();
++      SetAdaptiveBlockReason("CORRECAO ATIVA", side + " ordem tatica pendente");
++      LogTacticalEntryBlock("ORDER_ALREADY_PENDING");
++      return;
++   }
++
++   if(g_tacticalState == TACTICAL_STATE_EXPIRED)
++   {
++      SetAdaptiveBlockReason("CORRECAO ATIVA", side + " autorizacao expirada");
++      LogTacticalEntryBlock("SIGNAL_EXPIRED");
++      return;
++   }
++
++   if(g_tacticalState == TACTICAL_STATE_CONSUMED || g_tacticalEntryCount >= TACTICAL_MAX_PROGRESSIVE_ENTRIES)
++   {
++      SetAdaptiveBlockReason("CORRECAO ATIVA", side + " tatica consumida");
++      LogTacticalEntryBlock("ALREADY_CONSUMED");
++      if(g_tacticalConsumedBlockLoggedBar != g_lastTacticalClosedBar)
++      {
++         LogMessage("[TACTICAL_BLOCK] reason=ALREADY_CONSUMED");
++         g_tacticalConsumedBlockLoggedBar = g_lastTacticalClosedBar;
++      }
++      return;
++   }
++
++   if(g_tacticalState != TACTICAL_STATE_ACTIVE)
++   {
++      SetAdaptiveBlockReason("CORRECAO ATIVA", side + " aguardando estado ativo");
++      LogTacticalEntryBlock("INTERNAL_STATE_MISMATCH");
++      return;
++   }
++
++   if(!UseTacticalCorrectionEntries)
++   {
++      SetAdaptiveBlockReason("CORRECAO ATIVA", side + " tatica desativada");
++      LogTacticalEntryBlock("TRADE_NOT_ALLOWED");
++      return;
++   }
++
++   if(g_dailyLossBlocked || g_basketDDState == BASKET_DD_HARD)
++   {
++      SetTacticalEpisodeState(TACTICAL_STATE_EXPIRED, "RISK_BLOCK", g_lastTacticalClosedBar);
++      g_tacticalExpiredThisEpisode = true;
++      PersistTacticalEpisodeState();
++      LogMessage("[TACTICAL_EXPIRED_WITHOUT_ENTRY] episode_id=" + IntegerToString(g_tacticalEpisodeSeq) +
++                 " reason=RISK_BLOCK");
++      SetAdaptiveBlockReason(g_dailyLossBlocked ? "DAILY_BLOCK" : "HARD_DD", "tatica expirada por risco");
++      return;
++   }
++
++   int tactical_period_seconds = PeriodSeconds(TacticalFlowTimeframe);
++   int signal_age_bars = 0;
++   if(tactical_period_seconds > 0 && g_tacticalActivatedClosedBar > 0 &&
++      g_lastTacticalClosedBar >= g_tacticalActivatedClosedBar)
++      signal_age_bars = (int)((g_lastTacticalClosedBar - g_tacticalActivatedClosedBar) / tactical_period_seconds);
++   if(signal_age_bars > MathMax(0, TacticalMaxEntryAgeBars))
++   {
++      SetTacticalEpisodeState(TACTICAL_STATE_EXPIRED, "ENTRY_WINDOW_EXPIRED", g_lastTacticalClosedBar);
++      g_tacticalExpiredThisEpisode = true;
++      PersistTacticalEpisodeState();
++      LogMessage("[TACTICAL_EXPIRED_WITHOUT_ENTRY] episode_id=" + IntegerToString(g_tacticalEpisodeSeq) +
++                 " age_bars=" + IntegerToString(signal_age_bars));
++      SetAdaptiveBlockReason("SIGNAL_EXPIRED", side + " janela tatica expirada");
++      return;
++   }
++
++   if(TacticalInvalidationATRBuffer > 0.0 && g_tacticalActivationAtrPoints > 0.0)
++   {
++      double invalidation_buffer = TacticalInvalidationATRBuffer * g_tacticalActivationAtrPoints * _Point;
++      bool correction_invalidated = false;
++      if(g_tacticalEpisodeStructuralDirection > 0 && g_tacticalActivationHigh > 0.0)
++         correction_invalidated = (g_tick.bid > g_tacticalActivationHigh + invalidation_buffer);
++      else if(g_tacticalEpisodeStructuralDirection < 0 && g_tacticalActivationLow > 0.0)
++         correction_invalidated = (g_tick.ask < g_tacticalActivationLow - invalidation_buffer);
++
++      if(correction_invalidated)
++      {
++         LogMessage("[TACTICAL_INVALIDATED] episode_id=" + IntegerToString(g_tacticalEpisodeSeq) +
++                    " reason=PRICE_BEYOND_ACTIVATION_EXTREME");
++         EndTacticalEpisodeReason("PRICE_INVALIDATED", true);
++         return;
++      }
++   }
++
++   if(g_tacticalEntryAuthorizedClosedBar == g_lastTacticalClosedBar)
++   {
++      SetAdaptiveBlockReason("CORRECAO ATIVA", side + " aguardando novo candle");
++      LogTacticalEntryBlock("SAME_BAR_DUPLICATE_REQUEST");
++      return;
++   }
++
++   ENUM_ORDER_TYPE tactical_order = TacticalOrderTypeForEpisode(g_tacticalEpisode);
++   string tactical_comment = TacticalOrderComment(g_tacticalEpisode);
++   double tactical_volume = NormalizeVolume(FixedLot);
++
++   string tactical_block_reason = "";
++   if(CanOpenEntryRole(ENTRY_ROLE_TACTICAL, tactical_order, tactical_block_reason))
++   {
++      LogTacticalFlowTrace("BEFORE_OPEN", "side=" + side);
++      g_tacticalEntryAuthorizedClosedBar = g_lastTacticalClosedBar;
++      g_blockOppositeStructuralPromotionBar = g_lastTacticalClosedBar;
++      g_tacticalPendingOrderType = tactical_order;
++      g_tacticalPendingComment = tactical_comment;
++      g_tacticalPendingVolume = tactical_volume;
++      g_tacticalOrderRequestTime = TimeCurrent();
++      g_tacticalOrderRequestBar = g_lastTacticalClosedBar;
++      SetTacticalEpisodeState(TACTICAL_STATE_ORDER_PENDING, "ORDER_REQUESTED", g_lastTacticalClosedBar);
++      PersistTacticalEpisodeState();
++
++      LogMessage("[TACTICAL_ORDER_REQUESTED] side=" + side +
++                 " bar=" + TimeToString(g_lastTacticalClosedBar, TIME_DATE | TIME_SECONDS) +
++                 " request=" + tactical_comment);
++
++      bool requested = OpenAdaptiveUnitPosition(tactical_order, tactical_comment);
++      uint retcode = (uint)trade.ResultRetcode();
++      g_tacticalPendingOrder = trade.ResultOrder();
++      g_tacticalPendingDeal = trade.ResultDeal();
++      LogTacticalFlowTrace("AFTER_OPEN", "result=" + (requested ? "1" : "0") + " retcode=" + IntegerToString((int)retcode));
++
++      if(!requested || !IsTradeRetcodeSuccess(retcode))
++      {
++         LogMessage("[TACTICAL_ORDER_REJECTED] retcode=" + IntegerToString((int)retcode) +
++                    " description=" + trade.ResultRetcodeDescription());
++         ResetTacticalOrderPendingState();
++         SetTacticalEpisodeState(TACTICAL_STATE_ACTIVE, "ORDER_REJECTED", g_lastTacticalClosedBar);
+          PersistTacticalEpisodeState();
+-         ConfirmTacticalEntryFromOpenPositions(tactical_order,
+-                                               tactical_comment,
+-                                               tactical_volume,
+-                                               g_tacticalOrderRequestTime);
+-         if(g_tacticalState == TACTICAL_STATE_ORDER_PENDING && g_tacticalPendingDeal > 0)
+-            ConfirmTacticalEntryFromDeal(g_tacticalPendingDeal);
+-         g_adaptiveLastAction = side + " TATICA";
+-         SetAdaptiveBlockReason("");
+-         return true;
++         return;
+       }
+ 
+-      LogTacticalEntryBlock(TacticalEntryBlockReasonFromAdaptive(g_adaptiveBlockReason));
+-      return true;
++      PersistTacticalEpisodeState();
++      ConfirmTacticalEntryFromOpenPositions(tactical_order,
++                                            tactical_comment,
++                                            tactical_volume,
++                                            g_tacticalOrderRequestTime);
++      if(g_tacticalState == TACTICAL_STATE_ORDER_PENDING && g_tacticalPendingDeal > 0)
++         ConfirmTacticalEntryFromDeal(g_tacticalPendingDeal);
++      g_adaptiveLastAction = side + " TATICA";
++      g_roleBlockReasonTactical = "";
++      SetAdaptiveBlockReason("");
++      return;
+    }
+ 
+-   int structural_direction = StructuralFlowDirection();
+-   if(structural_direction == 0)
++   g_roleBlockReasonTactical = tactical_block_reason;
++   SetAdaptiveBlockReason(tactical_block_reason, "tatica " + side);
++   LogTacticalEntryBlock(tactical_block_reason);
++}
++
++void HandleEntryEngineDealConfirmation(ulong deal_ticket)
++{
++   ENUM_DEAL_TYPE deal_type = (ENUM_DEAL_TYPE)HistoryDealGetInteger(deal_ticket, DEAL_TYPE);
++   if(deal_type == DEAL_TYPE_BUY)
++   {
++      if(g_inFlightBuy > 0)
++         g_inFlightBuy--;
++   }
++   else if(deal_type == DEAL_TYPE_SELL)
+    {
+-      if(CanOpenAdditionalPair())
++      if(g_inFlightSell > 0)
++         g_inFlightSell--;
++   }
++   if(g_inFlightBuy <= 0 && g_inFlightSell <= 0)
++      g_inFlightSince = 0;
++
++   string deal_comment = HistoryDealGetString(deal_ticket, DEAL_COMMENT);
++   ENUM_POSITION_ROLE role = GetPositionRoleByComment(deal_comment);
++
++   if(role == ROLE_INITIAL)
++   {
++      if(deal_type == DEAL_TYPE_BUY)
++         g_initialBuyConfirmed = true;
++      else if(deal_type == DEAL_TYPE_SELL)
++         g_initialSellConfirmed = true;
++
++      bool was_partial = g_initialPairPartial;
++      g_initialPairPartial = (g_initialPairRequested && (g_initialBuyConfirmed != g_initialSellConfirmed));
++      if(g_initialBuyConfirmed && g_initialSellConfirmed)
++         LogMessage("[INITIAL_PAIR_CONFIRMED] cycle=" + IntegerToString(g_basketCycleId));
++      else if(g_initialPairPartial && !was_partial)
++         LogMessage("[INITIAL_PAIR_PARTIAL] confirmada_apenas=" +
++                    (g_initialBuyConfirmed ? "BUY" : "SELL"));
++      PersistEntryEngineState();
++   }
++   else if(role == ROLE_STRUCTURAL)
++   {
++      g_structuralFirstSlotConsumed = true;
++      LogMessage("[STRUCTURAL_ENTRY_CONFIRMED] side=" + (deal_type == DEAL_TYPE_BUY ? "BUY" : "SELL") +
++                 " deal=" + IntegerToString((long)deal_ticket));
++      PersistEntryEngineState();
++   }
++   else if(role == ROLE_NEUTRAL)
++      LogMessage("[NEUTRAL_LEG_CONFIRMED] side=" + (deal_type == DEAL_TYPE_BUY ? "BUY" : "SELL") +
++                 " deal=" + IntegerToString((long)deal_ticket));
++}
++
++void PersistEntryEngineState()
++{
++   GlobalVariableSet(TacticalStateGlobalName("EEV"), 1.0);
++   GlobalVariableSet(TacticalStateGlobalName("EECY"), (double)g_basketCycleId);
++   GlobalVariableSet(TacticalStateGlobalName("EEIR"), (g_initialPairRequested ? 1.0 : 0.0));
++   GlobalVariableSet(TacticalStateGlobalName("EEIB"), (g_initialBuyConfirmed ? 1.0 : 0.0));
++   GlobalVariableSet(TacticalStateGlobalName("EEIS"), (g_initialSellConfirmed ? 1.0 : 0.0));
++   GlobalVariableSet(TacticalStateGlobalName("EEIP"), (g_initialPairPartial ? 1.0 : 0.0));
++   GlobalVariableSet(TacticalStateGlobalName("EEIC"), (double)g_initialRetryCount);
++   GlobalVariableSet(TacticalStateGlobalName("EENE"), (double)g_neutralEpisodeId);
++   GlobalVariableSet(TacticalStateGlobalName("EENP"), (double)g_neutralPairsOpened);
++   GlobalVariableSet(TacticalStateGlobalName("EENT"), (double)g_lastNeutralAuthTime);
++   GlobalVariableSet(TacticalStateGlobalName("EESB"), (g_structuralResumeConfirmed ? 1.0 : 0.0));
++   GlobalVariableSet(TacticalStateGlobalName("EESW"), (double)g_structuralResumeWaitSinceBar);
++   GlobalVariableSet(TacticalStateGlobalName("EESF"), (g_structuralFirstSlotConsumed ? 1.0 : 0.0));
++   GlobalVariableSet(TacticalStateGlobalName("EESA"), g_structuralFlowAnchorPrice);
++   GlobalVariableSet(TacticalStateGlobalName("EELP"), g_lastStructuralEntryPrice);
++   GlobalVariableSet(TacticalStateGlobalName("EELT"), (double)g_lastStructuralEntryTime);
++   GlobalVariableSet(TacticalStateGlobalName("EELB"), (double)g_lastStructuralEntryBar);
++   GlobalVariableSet(TacticalStateGlobalName("EESQ"), (double)g_tacticalEpisodeSeq);
++}
++
++void LoadEntryEngineState()
++{
++   if(!GlobalVariableCheck(TacticalStateGlobalName("EEV")))
++      return;
++
++   if(GlobalVariableCheck(TacticalStateGlobalName("EECY")))
++      g_basketCycleId = (long)GlobalVariableGet(TacticalStateGlobalName("EECY"));
++   if(GlobalVariableCheck(TacticalStateGlobalName("EEIR")))
++      g_initialPairRequested = (GlobalVariableGet(TacticalStateGlobalName("EEIR")) > 0.5);
++   if(GlobalVariableCheck(TacticalStateGlobalName("EEIB")))
++      g_initialBuyConfirmed = (GlobalVariableGet(TacticalStateGlobalName("EEIB")) > 0.5);
++   if(GlobalVariableCheck(TacticalStateGlobalName("EEIS")))
++      g_initialSellConfirmed = (GlobalVariableGet(TacticalStateGlobalName("EEIS")) > 0.5);
++   if(GlobalVariableCheck(TacticalStateGlobalName("EEIP")))
++      g_initialPairPartial = (GlobalVariableGet(TacticalStateGlobalName("EEIP")) > 0.5);
++   if(GlobalVariableCheck(TacticalStateGlobalName("EEIC")))
++      g_initialRetryCount = (int)GlobalVariableGet(TacticalStateGlobalName("EEIC"));
++   if(GlobalVariableCheck(TacticalStateGlobalName("EENE")))
++      g_neutralEpisodeId = (long)GlobalVariableGet(TacticalStateGlobalName("EENE"));
++   if(GlobalVariableCheck(TacticalStateGlobalName("EENP")))
++      g_neutralPairsOpened = (int)GlobalVariableGet(TacticalStateGlobalName("EENP"));
++   if(GlobalVariableCheck(TacticalStateGlobalName("EENT")))
++      g_lastNeutralAuthTime = (datetime)GlobalVariableGet(TacticalStateGlobalName("EENT"));
++   if(GlobalVariableCheck(TacticalStateGlobalName("EESB")))
++      g_structuralResumeConfirmed = (GlobalVariableGet(TacticalStateGlobalName("EESB")) > 0.5);
++   if(GlobalVariableCheck(TacticalStateGlobalName("EESW")))
++      g_structuralResumeWaitSinceBar = (datetime)GlobalVariableGet(TacticalStateGlobalName("EESW"));
++   if(GlobalVariableCheck(TacticalStateGlobalName("EESF")))
++      g_structuralFirstSlotConsumed = (GlobalVariableGet(TacticalStateGlobalName("EESF")) > 0.5);
++   if(GlobalVariableCheck(TacticalStateGlobalName("EESA")))
++      g_structuralFlowAnchorPrice = GlobalVariableGet(TacticalStateGlobalName("EESA"));
++   if(GlobalVariableCheck(TacticalStateGlobalName("EELP")))
++      g_lastStructuralEntryPrice = GlobalVariableGet(TacticalStateGlobalName("EELP"));
++   if(GlobalVariableCheck(TacticalStateGlobalName("EELT")))
++      g_lastStructuralEntryTime = (datetime)GlobalVariableGet(TacticalStateGlobalName("EELT"));
++   if(GlobalVariableCheck(TacticalStateGlobalName("EELB")))
++      g_lastStructuralEntryBar = (datetime)GlobalVariableGet(TacticalStateGlobalName("EELB"));
++   if(GlobalVariableCheck(TacticalStateGlobalName("EESQ")))
++      g_tacticalEpisodeSeq = (long)GlobalVariableGet(TacticalStateGlobalName("EESQ"));
++}
++
++void ReconcileEntryEngineFromAccount()
++{
++   g_inFlightBuy = 0;
++   g_inFlightSell = 0;
++   g_inFlightSince = 0;
++
++   BuildEntryExposureSnapshot();
++
++   bool has_initial_buy = (g_exposure.open_buy[(int)ROLE_INITIAL] > 0);
++   bool has_initial_sell = (g_exposure.open_sell[(int)ROLE_INITIAL] > 0);
++
++   if(has_initial_buy)
++      g_initialBuyConfirmed = true;
++   if(has_initial_sell)
++      g_initialSellConfirmed = true;
++
++   if(g_initialPairRequested)
++      g_initialPairPartial = (g_initialBuyConfirmed != g_initialSellConfirmed);
++   else
++      g_initialPairPartial = false;
++
++   int neutral_pairs_open = MathMin(g_exposure.open_buy[(int)ROLE_NEUTRAL],
++                                    g_exposure.open_sell[(int)ROLE_NEUTRAL]);
++   g_neutralPairsOpened = MathMax(g_neutralPairsOpened, neutral_pairs_open);
++
++   if(g_exposure.total_open_buy + g_exposure.total_open_sell == 0)
++   {
++      g_initialPairRequested = false;
++      g_initialBuyConfirmed = false;
++      g_initialSellConfirmed = false;
++      g_initialPairPartial = false;
++      g_initialRetryCount = 0;
++   }
++
++   LogMessage("[ENTRY_ENGINE_REBUILT] cycle=" + IntegerToString(g_basketCycleId) +
++              " ini=" + IntegerToString(g_exposure.open_buy[(int)ROLE_INITIAL]) + "/" +
++              IntegerToString(g_exposure.open_sell[(int)ROLE_INITIAL]) +
++              " neu=" + IntegerToString(g_exposure.open_buy[(int)ROLE_NEUTRAL]) + "/" +
++              IntegerToString(g_exposure.open_sell[(int)ROLE_NEUTRAL]) +
++              " str=" + IntegerToString(g_exposure.open_buy[(int)ROLE_STRUCTURAL]) + "/" +
++              IntegerToString(g_exposure.open_sell[(int)ROLE_STRUCTURAL]) +
++              " tat=" + IntegerToString(g_exposure.open_buy[(int)ROLE_TACTICAL]) + "/" +
++              IntegerToString(g_exposure.open_sell[(int)ROLE_TACTICAL]) +
++              " leg=" + IntegerToString(g_exposure.open_buy[(int)ROLE_LEGACY_ADDITIONAL]) + "/" +
++              IntegerToString(g_exposure.open_sell[(int)ROLE_LEGACY_ADDITIONAL]) +
++              " partial=" + BoolToSimNao(g_initialPairPartial));
++   PersistEntryEngineState();
++}
++
++bool ManageAsymmetricAdaptiveEntries()
++{
++   ReconcileInFlightEntries();
++   SyncEntryEngineWithFlow();
++   BuildEntryExposureSnapshot();
++
++   if(g_adaptiveEntryAttemptedThisTick)
++   {
++      if(g_tacticalState == TACTICAL_STATE_ACTIVE)
++         LogTacticalEntryBlock("ENTRY_ATTEMPTED_THIS_TICK");
++      return false;
++   }
++
++   string block_reason = "";
++
++   if(g_exposure.total == 0)
++   {
++      g_adaptiveLastAction = "AGUARDANDO";
++      g_lastAuthorizedRoleText = "NENHUM";
++      if(CanOpenEntryRole(ENTRY_ROLE_INITIAL, ORDER_TYPE_BUY, block_reason))
+       {
+          g_adaptiveEntryAttemptedThisTick = true;
+-         if(OpenBuySellPair(true))
++         g_lastAuthorizedRoleText = "INITIAL";
++         if(OpenInitialPairAdaptive())
+          {
+-            g_adaptiveLastAction = "PAR BILATERAL LATERAL";
++            g_adaptiveLastAction = "PAR INICIAL";
+             SetAdaptiveBlockReason("");
++         }
++      }
++      else
++         SetAdaptiveBlockReason(block_reason, "par inicial");
++      return true;
++   }
++
++   if(g_initialPairPartial)
++   {
++      TryCompleteInitialPair();
++      SetAdaptiveBlockReason("INITIAL_PAIR_PARTIAL");
++      return true;
++   }
++
++   if(g_tacticalEpisode != TACTICAL_NONE || g_tacticalState != TACTICAL_STATE_NONE)
++   {
++      ManageTacticalEpisodeEntry();
++      return true;
++   }
++
++   int structural_direction = StructuralFlowDirection();
++   if(structural_direction != 0)
++   {
++      ENUM_ORDER_TYPE structural_order = (structural_direction > 0 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
++      string structural_side = (structural_direction > 0 ? "BUY" : "SELL");
++      string structural_comment = (structural_direction > 0 ? "IA_FG_STRUCTURAL_BUY" : "IA_FG_STRUCTURAL_SELL");
++
++      if(CanOpenEntryRole(ENTRY_ROLE_STRUCTURAL, structural_order, block_reason))
++      {
++         g_lastAuthorizedRoleText = "STRUCTURAL " + structural_side;
++         LogMessage("[STRUCTURAL_ENTRY_REQUEST] side=" + structural_side +
++                    " flow=" + StructuralFlowToText());
++         if(OpenAdaptiveUnitPosition(structural_order, structural_comment))
++         {
++            g_lastStructuralEntryTime = TimeCurrent();
++            g_lastStructuralEntryPrice = (structural_order == ORDER_TYPE_BUY ? g_tick.ask : g_tick.bid);
++            g_lastStructuralEntryBar = iTime(_Symbol, StructuralFlowTimeframe, 1);
++            g_structuralFirstSlotConsumed = true;
++            g_roleBlockReasonStructural = "";
++            g_adaptiveLastAction = "REFORCO " + structural_side;
++            SetAdaptiveBlockReason("");
++            PersistEntryEngineState();
++            LogMessage("[IA_FG_ASYMMETRIC] reforco estrutural " + structural_side + " aberto");
+             return true;
+          }
++         return false;
+       }
+ 
+-      g_adaptiveLastAction = "AGUARDANDO";
+-      SetAdaptiveBlockReason("SEM CONFIRMACAO");
++      g_roleBlockReasonStructural = block_reason;
++      SetAdaptiveBlockReason(block_reason, "estrutural " + structural_side);
+       return false;
+    }
+ 
+-   ENUM_ORDER_TYPE structural_order = (structural_direction > 0 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
+-   string structural_side = (structural_direction > 0 ? "BUY" : "SELL");
+-   string structural_comment = (structural_direction > 0 ? "IA_FG_STRUCTURAL_BUY" : "IA_FG_STRUCTURAL_SELL");
+-
+-   if(CanOpenAdaptiveUnitEntry(structural_order) &&
+-      OpenAdaptiveUnitPosition(structural_order, structural_comment))
++   if(CanOpenEntryRole(ENTRY_ROLE_NEUTRAL, ORDER_TYPE_BUY, block_reason))
+    {
+-      g_adaptiveLastAction = "REFORCO " + structural_side;
+-      SetAdaptiveBlockReason("");
+-      LogMessage("[IA_FG_ASYMMETRIC] reforco estrutural " + structural_side + " aberto");
+-      return true;
++      g_lastAuthorizedRoleText = "NEUTRAL";
++      if(OpenNeutralPairControlled())
++      {
++         g_adaptiveLastAction = "PAR NEUTRO CONTROLADO";
++         g_roleBlockReasonNeutral = "";
++         SetAdaptiveBlockReason("");
++         return true;
++      }
++      return false;
+    }
+ 
++   g_roleBlockReasonNeutral = block_reason;
++   SetAdaptiveBlockReason(block_reason, "neutro");
++   g_adaptiveLastAction = "AGUARDANDO";
+    return false;
+ }
+ bool CanOpenNewPair()
+@@ -3015,6 +4373,12 @@
+ 
+ bool CanOpenAdditionalPair()
+ {
++   if(!IsLegacyAdditionalPairEngineAllowed())
++   {
++      LogMessage("[LEGACY_ADDITIONAL_BLOCKED] motor assimetrico ativo");
++      return false;
++   }
++
+    if(!OpenAdditionalPairsWhileBasketActive || !OpenAdditionalPairsUntilMaxPositions)
+       return false;
+ 
+@@ -3135,6 +4499,13 @@
+ 
+ bool OpenBuySellPair(bool additional_pair=false)
+ {
++   if(UseAsymmetricBilateralFlowEngine)
++   {
++      LogMessage("[LEGACY_ADDITIONAL_BLOCKED] OpenBuySellPair indisponivel no motor assimetrico" +
++                 (additional_pair ? " (par adicional)" : " (par inicial legado)"));
++      return false;
++   }
++
+    if(!Allow_BUY || !Allow_SELL)
+       return false;
+ 
+@@ -3246,6 +4617,9 @@
+ 
+ bool PlaceDynamicBuyPending()
+ {
++   if(!IsLegacyAdditionalPairEngineAllowed())
++      return false;
++
+    if(CountPendingBuyOrders() >= LimitPendingBuyOrders())
+       return false;
+ 
+@@ -3285,6 +4659,9 @@
+ 
+ bool PlaceDynamicSellPending()
+ {
++   if(!IsLegacyAdditionalPairEngineAllowed())
++      return false;
++
+    if(CountPendingSellOrders() >= LimitPendingSellOrders())
+       return false;
+ 
+@@ -4430,6 +5807,43 @@
+       "Slots livres (tetos simultaneos): BUY " + IntegerToString(free_buy_slots) + " / SELL " + IntegerToString(free_sell_slots) + "\n" +
+       "Entrada estrutural autorizada: " + structural_entry_text + "\n";
+ 
++   BuildEntryExposureSnapshot();
++   string entry_engine_block =
++      "=== MOTOR DE ENTRADAS ===\n" +
++      "Autoridade: " + (UseAsymmetricBilateralFlowEngine ? "ASSIMETRICO (CanOpenEntryRole)" : "LEGADO") + "\n" +
++      "Legacy Additional Pairs: " + (IsLegacyAdditionalPairEngineAllowed() ? "PERMITIDO (modo legado)" : "BLOQUEADO PELO MOTOR ASSIMETRICO") + "\n" +
++      "Politica neutra: " + (NeutralEntryPolicy == NEUTRAL_INITIAL_PAIR_ONLY ? "SOMENTE PAR INICIAL" :
++                             NeutralEntryPolicy == NEUTRAL_CONTROLLED_TWO_PAIRS ? "CONTROLLED_TWO_PAIRS" :
++                             "GRADUAL ATE 4/4") + "\n" +
++      "Ciclo da cesta: " + IntegerToString(g_basketCycleId) +
++      " | Par inicial: " + (g_initialPairPartial ? "PARCIAL" :
++                            (g_initialBuyConfirmed && g_initialSellConfirmed ? "CONFIRMADO" : "N/D")) + "\n" +
++      "Exposicao potencial: " + IntegerToString(g_exposure.total) + "/" + IntegerToString(MathMin(8, LimitOpenPositions())) +
++      " (abertas " + IntegerToString(g_exposure.total_open_buy + g_exposure.total_open_sell) +
++      " pend " + IntegerToString(g_exposure.total_pending_buy + g_exposure.total_pending_sell) +
++      " transito " + IntegerToString(g_exposure.inflight_buy + g_exposure.inflight_sell) + ")\n" +
++      "Reserva tatica: " + BoolToSimNao(MustReserveTacticalSlot()) +
++      " | Reserva estrutural: " + BoolToSimNao(MustReserveStructuralSlot()) + "\n" +
++      "=== EXPOSICAO POR FUNCAO (B/S) ===\n" +
++      "INI " + IntegerToString(g_exposure.open_buy[(int)ROLE_INITIAL]) + "/" + IntegerToString(g_exposure.open_sell[(int)ROLE_INITIAL]) +
++      " | NEU " + IntegerToString(g_exposure.open_buy[(int)ROLE_NEUTRAL]) + "/" + IntegerToString(g_exposure.open_sell[(int)ROLE_NEUTRAL]) +
++      " | STR " + IntegerToString(g_exposure.open_buy[(int)ROLE_STRUCTURAL]) + "/" + IntegerToString(g_exposure.open_sell[(int)ROLE_STRUCTURAL]) +
++      " | TAT " + IntegerToString(g_exposure.open_buy[(int)ROLE_TACTICAL]) + "/" + IntegerToString(g_exposure.open_sell[(int)ROLE_TACTICAL]) +
++      " | LEG " + IntegerToString(g_exposure.open_buy[(int)ROLE_LEGACY_ADDITIONAL]) + "/" + IntegerToString(g_exposure.open_sell[(int)ROLE_LEGACY_ADDITIONAL]) +
++      " | UNK " + IntegerToString(g_exposure.open_buy[(int)ROLE_UNKNOWN]) + "/" + IntegerToString(g_exposure.open_sell[(int)ROLE_UNKNOWN]) + "\n" +
++      "=== AUTORIZACAO ===\n" +
++      "Ultimo papel autorizado: " + g_lastAuthorizedRoleText + "\n" +
++      "Tatica: " + (g_roleBlockReasonTactical == "" ? "OK/N-A" : g_roleBlockReasonTactical) +
++      " | Estrutural: " + (g_roleBlockReasonStructural == "" ? "OK/N-A" : g_roleBlockReasonStructural) +
++      " | Neutra: " + (g_roleBlockReasonNeutral == "" ? "OK/N-A" : g_roleBlockReasonNeutral) + "\n" +
++      "Episodio tatico: id " + IntegerToString(g_tacticalEpisodeSeq) +
++      " estado " + TacticalEpisodeStateToText() +
++      " consumido " + BoolToSimNao(g_tacticalEntryCount > 0) +
++      " expirado " + BoolToSimNao(g_tacticalExpiredThisEpisode) + "\n" +
++      "Retomada estrutural confirmada: " + BoolToSimNao(g_structuralResumeConfirmed) +
++      " | Streak neutro: " + IntegerToString(g_neutralClosedBarStreak) +
++      " | Pares neutros: " + IntegerToString(g_neutralPairsOpened) + "\n";
++
+    string panel =
+       EA_NAME + "\n" +
+       "Simbolo: " + _Symbol + "\n" +
+@@ -4478,6 +5892,7 @@
+       "Tempo desde ultimo par: " + IntegerToString(seconds_since_pair) + "s\n" +
+       mfe_panel_block +
+       risk_panel_block +
++      entry_engine_block +
+       "Ultima acao: " + g_adaptiveLastAction + "\n" +
+       "Motivo do bloqueio adaptativo: " + adaptive_reason + "\n" +
+       "Motivo operacional atual: " + status + "\n" +
